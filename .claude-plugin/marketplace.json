@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "codex-dispatch",
+  "description": "Token-saving Claude Code -> OpenAI Codex CLI autonomous orchestration skill & deterministic gate runner.",
+  "owner": {
+    "name": "sunnykui",
+    "url": "https://github.com/sunnykui"
+  },
+  "plugins": [
+    {
+      "name": "codex-dispatch",
+      "version": "0.2.0",
+      "source": {
+        "source": "github",
+        "repo": "sunnykui/codex-dispatch"
+      },
+      "description": "Offload exploration, architecture critique, contract-based coding, and adversarial code review from Claude Code to local Codex CLI with scope allowlist & verification gates.",
+      "homepage": "https://github.com/sunnykui/codex-dispatch",
+      "license": "MIT",
+      "keywords": ["codex", "claude-code", "orchestration", "token-saver", "code-review", "architecture"]
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "name": "codex-dispatch",
+  "version": "0.2.0",
+  "description": "Zero-touch Claude Code -> OpenAI Codex CLI orchestrator: contract-driven coding, pre-coding architecture critique, executable file-allowlist gates, and token-saving receipts.",
+  "author": {
+    "name": "sunnykui",
+    "url": "https://github.com/sunnykui"
+  },
+  "homepage": "https://github.com/sunnykui/codex-dispatch",
+  "repository": "https://github.com/sunnykui/codex-dispatch",
+  "license": "MIT",
+  "skills": "./skills"
+}

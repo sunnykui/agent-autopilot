@@ -3,63 +3,68 @@ name: codex-dispatch
 description: >-
   Automatically offload codebase exploration, pre-coding architecture critique, contract-based
   implementation, test fixing, and independent adversarial review from Claude Code to local
-  OpenAI Codex CLI (`gpt-6.2-sol`, `gpt-6.2-astra`, `gpt-6.1-terra`) while conserving Claude Pro
-  tokens. Use silently by default for any non-trivial coding, refactoring, debugging, review,
-  or repo research task without requiring the user to ask for Codex.
+  OpenAI Codex CLI while conserving Claude tokens. Use silently by default for non-trivial coding,
+  refactoring, debugging, review, or repository research tasks without requiring the user to ask.
+license: MIT
+metadata:
+  version: "0.2.0"
 ---
 
-# codex-dispatch (Claude 统筹契约，Codex 自动执行)
+# codex-dispatch (Claude Architects Contracts, Codex Executes)
 
-Executable wrapper: `codex-dispatch` (installed at `~/.local/bin/codex-dispatch`, backed by `~/.claude/skills/codex-dispatch/scripts/codex_dispatch.py`).
-All prompts MUST be passed via `stdin` heredoc (`<<'EOF' ... EOF`) to eliminate shell escaping errors.
+`SKILL_DIR` is the directory containing this `SKILL.md`.
+Use `codex-dispatch` directly if available on `PATH`, or invoke `python3 "$SKILL_DIR/scripts/codex_dispatch.py"`.
+Always pass prompts via `stdin` heredoc (`<<'EOF' ... EOF`) to prevent shell quoting issues.
 
-## Automatic End-to-End Pipeline (No User Babysitting)
+Models are **auto-discovered** from the user's local Codex installation (`~/.codex/config.toml` & `~/.codex/models_cache.json`) into three adaptive slots (`workhorse`, `flagship`, `visual`). Run `codex-dispatch doctor` only if diagnosing environment setup.
 
-Run the needed stages back-to-back automatically; do NOT pause between stages to ask routine permission:
+## Autonomous End-to-End Pipeline (Zero User Babysitting)
 
-1. **Explore (`explore`)** — When repo structure, call chains, or test commands are not already in context:
+Execute the required stages back-to-back without stopping for routine intermediate confirmation:
+
+1. **Explore (`explore`)** — Map unfamiliar call chains, reusable helpers, and fast test commands (`workhorse` read-only):
    ```bash
    codex-dispatch explore -C "<workspace>" -f "src/entry.ts" <<'EOF'
-   查清订单状态流转的调用链、现有可复用的重试/幂等工具与快速单测命令。
+   Trace the order callback flow, list reusable lock/retry utilities, and report fast unit test commands.
    EOF
    ```
-2. **Architecture Critique (`critique`)** — Before coding cross-module features, refactors, schema/API changes, or thorny bug fixes, challenge your draft design with `gpt-6.2-astra` in a fresh read-only session:
+2. **Architecture Critique (`critique`)** — Before coding cross-module changes, refactors, new abstractions, or tricky bug fixes, challenge your draft design in a fresh `flagship` read-only session:
    ```bash
    codex-dispatch critique -C "<workspace>" -f "src/order,src/common" <<'EOF'
-   拟定方案：新增 OrderIdempotencyGuard 中间件，接口为 checkAndLock(key, ttl) -> Result。
-   请对照现有代码挑刺：是否已有同类组件可复用？分层与异常回滚是否有漏洞？有无更简方案？
+   Draft plan: introduce OrderIdempotencyGuard with checkAndLock(key, ttl) -> Result.
+   Check against actual repo code: can existing primitives be reused? Are there coupling or rollback flaws? Is there a cleaner design?
    EOF
    ```
-3. **Contract Implementation (`implement`)** — State **goal, reusable modules, public signatures/invariants, edge cases**, and enforce `--allow` + `--verify`. Let Codex craft clean internal code:
+3. **Contract Implementation (`implement`)** — Specify **goal, reusable modules, public signatures/invariants, edge cases**, plus `--allow` and `--verify`. Let Codex craft idiomatic internal code:
    ```bash
    codex-dispatch implement -C "<workspace>" \
      --tier std \
      --allow "src/order/**,tests/order/**" \
      --forbid "vendor/**,migrations/**" \
      --verify "pytest tests/order -q" <<'EOF'
-   目标：实现订单回调幂等保护并补齐并发重复回调单测。
-   复用：直接使用 `src/common/locks.py` 的现有锁原语，不新建重复工具类。
-   接口契约：`process_callback(event_id: str, payload: Mapping[str, Any]) -> CallbackOutcome`；重复已成功事件返回 `DUPLICATE_IGNORED`；下游失败必须释放锁允许重试。
-   边界情况：空 `event_id` 抛 `ValueError`；同一 `event_id` 并发到达只有一个执行副作用。
+   Goal: implement idempotent callback handling and concurrent duplicate unit tests.
+   Reuse: use existing lock primitives in `src/common/locks.py`; do not create duplicate helpers.
+   Contract: `process_callback(event_id: str, payload: Mapping[str, Any]) -> CallbackOutcome`; duplicate completed events return `DUPLICATE_IGNORED`; downstream failure must release lock for retry.
+   Edge cases: empty `event_id` raises `ValueError`; concurrent identical `event_id` executes side effects once.
    EOF
    ```
-   - `--tier`: `std` (`gpt-6.2-sol` medium, default) | `high` (`gpt-6.2-sol` high, cross-file) | `hard` (`gpt-6.2-astra` high, complex/tricky) | `xhigh` (`gpt-6.2-astra` xhigh, extreme concurrency/security).
-   - Parallel independent modules: add `--worktree` to isolate Git worktrees.
-4. **Independent Adversarial Review (`review`)** — For non-trivial changes, run a fresh read-only `gpt-6.2-astra` adversarial check:
+   - `--tier`: `fast` (`workhorse` low) | `std` (`workhorse` medium, default) | `high` (`workhorse` high, cross-file) | `hard` (`flagship` high, complex) | `xhigh` (`flagship` xhigh, extreme concurrency/security).
+   - Parallel independent modules: add `--worktree` to execute inside an isolated Git worktree with full scope & verify gates.
+4. **Independent Adversarial Review (`review`)** — Run a fresh `flagship` read-only skeptical check before delivery:
    ```bash
    codex-dispatch review -C "<workspace>" --base main <<'EOF'
-   重点挑刺幂等锁释放路径、部分失败回滚与越界副作用。
+   Focus on lock-release failure paths, partial rollback safety, and scope boundaries.
    EOF
    ```
-5. **Rework (`resume <task_id>`)** — If `scope_gate`, `verify_gate`, or `review` flags issues, send concise delta instructions back to the SAME `implement` `task_id` (script automatically restores `sandbox_mode`, allowlist, and upgrades rework to `gpt-6.2-astra` + `high`):
+5. **Rework (`resume <task_id>`)** — If `scope_gate`, `verify_gate`, or `review` flags material issues, send delta fix instructions to the same `implement` `task_id` (automatically restores sandbox/allowlist and upgrades rework to `flagship` + `high`):
    ```bash
    codex-dispatch resume <task_id> <<'EOF'
-   修复两处问题：1) `src/order/handler.py:84` 异常分支未释放锁；2) 还原越界修改的文件。
+   Fix: 1) release lock on exception at `src/order/handler.py:84`; 2) revert out-of-scope file edits.
    EOF
    ```
 
 ## Hard Operating Rules
 
-- **Background without polling**: For runs expected to exceed ~90s (`implement --tier high/hard`, `critique`, `review`), set Claude Bash tool `run_in_background: true`. NEVER append `&`/`nohup` or loop with `sleep`.
+- **Background without polling**: For runs likely exceeding ~90s (`implement --tier high/hard`, `critique`, `review`), set Claude Bash tool `run_in_background: true`. NEVER append `&`/`nohup` or poll with `sleep`.
 - **Read compact receipts only**: Rely on stdout receipt + targeted `git diff` hunks. Read `<run_dir>/stderr.log` or `events.jsonl` ONLY when status is `FAILED`.
-- **Two-rework cap**: If the same task still fails acceptance after 2 `resume` rounds, take over directly and finish cleanly.
+- **Two-rework cap**: After 2 failed `resume` attempts on the same task, take over directly and finish cleanly.

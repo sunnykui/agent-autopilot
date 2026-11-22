@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
-"""codex-dispatch: Deterministic, token-saving Claude -> Codex CLI orchestrator.
+"""codex-dispatch: Universal, token-saving Claude Code -> Codex CLI orchestrator.
 
-Combines the strongest patterns from:
-- oil-delegate: deterministic CLI wrapper, stdin prompt passing, JSONL session tracking
-- openai/codex-plugin-cc: XML prompt contracts & grounded adversarial review
-- cathrynlavery/codex-build: pre/post git baseline snapshot & executable file allowlist gate
-- alexzh3/codex-orchestrator: fresh-session review isolation & stateful resume escalation
-
-Zero external dependencies (Python 3.10+ stdlib only). Never uses danger-full-access.
+Key capabilities:
+- Auto-discovers installed `codex` binary (PATH, Homebrew, /usr/local/bin, macOS ChatGPT.app)
+  and adapts automatically to the account's available Codex models (`~/.codex/models_cache.json`
+  and `~/.codex/config.toml`) with zero hardcoded model lock-in.
+- Injects role-specific XML contracts (`explore`, `critique`, `implement`, `review`, `visual`).
+- Captures pre-run Git/filesystem baseline, enforces root-anchored file allowlists & forbidlists,
+  blocks unauthorized `git commit`, runs deterministic `--verify` commands safely, and supports
+  managed `--worktree` isolation plus stateful `resume` with automatic flagship escalation.
+- Zero third-party Python dependencies (Python 3.10+ standard library only).
 """
 from __future__ import annotations
 
 import argparse
 import contextlib
 import datetime as dt
-import fcntl
 import hashlib
 import json
 import os
@@ -25,30 +26,37 @@ import subprocess
 import sys
 import time
 import uuid
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Iterator
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None  # type: ignore[assignment]
+
+VERSION = "0.2.0"
 SCHEMA_VERSION = 1
-DEFAULT_TIMEOUT = 1800  # 30 minutes max per CLAUDE.md bottom line
+DEFAULT_TIMEOUT = 1800
 OUTSIDE_WS_PREFIX = "<OUTSIDE_WORKSPACE>:"
 
-ROLE_DEFAULTS: dict[str, dict[str, str]] = {
-    "explore": {"model": "gpt-6.2-sol", "effort": "low", "sandbox": "read-only"},
-    "critique": {"model": "gpt-6.2-astra", "effort": "high", "sandbox": "read-only"},
-    "implement": {"model": "gpt-6.2-sol", "effort": "medium", "sandbox": "workspace-write"},
-    "review": {"model": "gpt-6.2-astra", "effort": "high", "sandbox": "read-only"},
-    "visual": {"model": "gpt-6.1-terra", "effort": "medium", "sandbox": "read-only"},
+ROLE_SPECS: dict[str, dict[str, str]] = {
+    "explore": {"slot": "workhorse", "effort": "low", "sandbox": "read-only"},
+    "critique": {"slot": "flagship", "effort": "high", "sandbox": "read-only"},
+    "implement": {"slot": "workhorse", "effort": "medium", "sandbox": "workspace-write"},
+    "review": {"slot": "flagship", "effort": "high", "sandbox": "read-only"},
+    "visual": {"slot": "visual", "effort": "medium", "sandbox": "read-only"},
 }
 
-TIER_PRESETS: dict[str, tuple[str, str]] = {
-    "fast": ("gpt-6.2-sol", "low"),
-    "std": ("gpt-6.2-sol", "medium"),
-    "high": ("gpt-6.2-sol", "high"),
-    "hard": ("gpt-6.2-astra", "high"),
-    "xhigh": ("gpt-6.2-astra", "xhigh"),
-    "visual": ("gpt-6.1-terra", "medium"),
+TIER_SPECS: dict[str, tuple[str, str]] = {
+    "fast": ("workhorse", "low"),
+    "std": ("workhorse", "medium"),
+    "high": ("workhorse", "high"),
+    "hard": ("flagship", "high"),
+    "xhigh": ("flagship", "xhigh"),
+    "visual": ("visual", "medium"),
 }
 
+EFFORT_ORDER = ("minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 FRESH_ONLY_ROLES = {"critique", "review"}
 VALID_SANDBOXES = {"read-only", "workspace-write"}
 TRANSIENT_CACHE_GLOBS = (
@@ -63,6 +71,7 @@ TRANSIENT_CACHE_GLOBS = (
 TASK_ID_RE = re.compile(
     r"^\d{8}-\d{6}-(explore|critique|implement|review|visual)-[0-9a-f]{6}$"
 )
+TOP_MODEL_TOML_RE = re.compile(r'^\s*model\s*=\s*["\']([^"\']+)["\']\s*(?:#.*)?$')
 
 
 class DispatchError(Exception):
@@ -77,11 +86,171 @@ def now_iso() -> str:
     return now_utc().replace(microsecond=0).isoformat()
 
 
+def resolve_codex_home(explicit: str | None = None) -> Path:
+    raw = explicit or os.environ.get("CODEX_HOME")
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return (Path.home() / ".codex").resolve()
+
+
 def resolve_cache_root(explicit: str | None = None) -> Path:
     raw = explicit or os.environ.get("CODEX_DISPATCH_HOME")
     if raw:
         return Path(raw).expanduser().resolve()
-    return (Path.home() / ".cache" / "agent-work" / "codex-dispatch").resolve()
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    base = Path(xdg).expanduser() if xdg else (Path.home() / ".cache")
+    # Never use /tmp (often a small tmpfs on Linux VPS environments)
+    return (base / "agent-work" / "codex-dispatch").resolve()
+
+
+def load_user_dispatch_config() -> dict[str, Any]:
+    cfg_path_raw = os.environ.get("CODEX_DISPATCH_CONFIG")
+    cfg_path = (
+        Path(cfg_path_raw).expanduser()
+        if cfg_path_raw
+        else (Path.home() / ".config" / "codex-dispatch" / "config.json")
+    )
+    if not cfg_path.is_file():
+        return {}
+    try:
+        obj = json.loads(cfg_path.read_text(encoding="utf-8"))
+        return obj if isinstance(obj, dict) else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DispatchError(f"Invalid JSON in {cfg_path}: {exc}") from exc
+
+
+def read_codex_default_model(codex_home: Path) -> str | None:
+    cfg_toml = codex_home / "config.toml"
+    if not cfg_toml.is_file():
+        return None
+    try:
+        for line in cfg_toml.read_text(encoding="utf-8", errors="replace").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("["):
+                break  # Reached first table section; top-level keys end here
+            m = TOP_MODEL_TOML_RE.match(line)
+            if m:
+                return m.group(1).strip() or None
+    except OSError:
+        return None
+    return None
+
+
+def discover_codex_models(codex_home: Path | None = None) -> dict[str, Any]:
+    """Auto-resolve workhorse, flagship, and visual models from local Codex state & overrides."""
+    chome = codex_home or resolve_codex_home()
+    user_cfg = load_user_dispatch_config()
+    toml_default = read_codex_default_model(chome)
+
+    cache_file = chome / "models_cache.json"
+    raw_models: list[dict[str, Any]] = []
+    if cache_file.is_file():
+        with contextlib.suppress(OSError, json.JSONDecodeError):
+            parsed = json.loads(cache_file.read_text(encoding="utf-8"))
+            if isinstance(parsed, dict) and isinstance(parsed.get("models"), list):
+                raw_models = [m for m in parsed["models"] if isinstance(m, dict) and m.get("slug")]
+
+    excluded_prefixes = ("codex-auto-review",)
+    catalog: list[dict[str, Any]] = []
+    effort_map: dict[str, list[str]] = {}
+    for entry in raw_models:
+        slug = str(entry["slug"]).strip()
+        if any(slug.startswith(p) for p in excluded_prefixes):
+            continue
+        levels_raw = entry.get("supported_reasoning_levels") or []
+        efforts = [
+            str(lv.get("effort")).strip()
+            for lv in levels_raw
+            if isinstance(lv, dict) and lv.get("effort")
+        ]
+        effort_map[slug] = efforts
+        catalog.append(
+            {
+                "slug": slug,
+                "description": str(entry.get("description") or "").lower(),
+                "efforts": efforts,
+            }
+        )
+
+    def is_legacy(item: dict[str, Any]) -> bool:
+        desc = item["description"]
+        return "legacy" in desc or "previous generation" in desc
+
+    active_catalog = [c for c in catalog if not is_legacy(c)] or catalog
+
+    # 1. Workhorse model (daily coding & exploration)
+    workhorse = (
+        os.environ.get("CODEX_DISPATCH_WORKHORSE_MODEL")
+        or user_cfg.get("workhorse_model")
+        or toml_default
+    )
+    if not workhorse and active_catalog:
+        for item in active_catalog:
+            s = item["slug"]
+            if s.endswith("-sol") or "-codex" in s or s.endswith("-mini"):
+                workhorse = s
+                break
+        if not workhorse:
+            workhorse = active_catalog[0]["slug"]
+
+    # 2. Flagship model (architecture critique, thorny bugs, adversarial review, rework escalation)
+    flagship = os.environ.get("CODEX_DISPATCH_FLAGSHIP_MODEL") or user_cfg.get("flagship_model")
+    if not flagship and active_catalog:
+        for item in active_catalog:
+            s = item["slug"]
+            desc = item["description"]
+            if s.endswith("-astra") or s.endswith("-pro") or "most capable" in desc or "most demanding" in desc:
+                flagship = s
+                break
+        if not flagship:
+            # Prefer a full non-mini/non-luna/non-reserve general model if present
+            for item in active_catalog:
+                s = item["slug"]
+                if not any(tag in s for tag in ("-mini", "-luna", "reserve", "-terra")):
+                    flagship = s
+                    break
+    if not flagship:
+        flagship = workhorse
+
+    # 3. Visual model (UI screenshot verification)
+    visual = os.environ.get("CODEX_DISPATCH_VISUAL_MODEL") or user_cfg.get("visual_model")
+    if not visual and catalog:
+        for item in catalog:
+            s = item["slug"]
+            desc = item["description"]
+            if "-terra" in s or "visual" in desc:
+                visual = s
+                break
+    if not visual:
+        visual = workhorse
+
+    return {
+        "codex_home": str(chome),
+        "toml_default": toml_default,
+        "workhorse": workhorse,
+        "flagship": flagship,
+        "visual": visual,
+        "effort_map": effort_map,
+        "detected_count": len(catalog),
+    }
+
+
+def clamp_effort(model: str | None, desired: str, effort_map: dict[str, list[str]]) -> str:
+    if not model or model not in effort_map or not effort_map[model]:
+        return desired
+    supported = effort_map[model]
+    if desired in supported:
+        return desired
+    if desired in EFFORT_ORDER:
+        target_idx = EFFORT_ORDER.index(desired)
+        # Prefer closest lower-or-equal supported effort, else closest higher
+        for idx in range(target_idx - 1, -1, -1):
+            if EFFORT_ORDER[idx] in supported:
+                return EFFORT_ORDER[idx]
+        for idx in range(target_idx + 1, len(EFFORT_ORDER)):
+            if EFFORT_ORDER[idx] in supported:
+                return EFFORT_ORDER[idx]
+    return supported[0]
 
 
 def validate_task_dir(cache_root: Path, task_id: str) -> Path:
@@ -98,6 +267,9 @@ def validate_task_dir(cache_root: Path, task_id: str) -> Path:
 
 @contextlib.contextmanager
 def task_lock(run_dir: Path, *, blocking: bool = False) -> Iterator[None]:
+    if fcntl is None:
+        yield
+        return
     lock_path = run_dir / ".lock"
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
     flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
@@ -121,13 +293,25 @@ def resolve_codex_bin() -> str:
         if path.is_file() and os.access(path, os.X_OK):
             return str(path.resolve())
         raise DispatchError(f"CODEX_DISPATCH_BIN is not executable: {override}")
+
     found = shutil.which("codex")
-    if found:
+    if found and os.access(found, os.X_OK):
         return found
-    for candidate in ("/usr/local/bin/codex", str(Path.home() / ".local/bin/codex")):
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return candidate
-    raise DispatchError("Cannot find `codex` binary in PATH or standard locations.")
+
+    candidates = [
+        Path("/opt/homebrew/bin/codex"),
+        Path("/usr/local/bin/codex"),
+        Path.home() / ".local" / "bin" / "codex",
+        Path("/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"),
+        Path.home() / "Applications" / "ChatGPT.app" / "Contents" / "Resources" / "codex-cli" / "bin" / "codex",
+    ]
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate.resolve())
+
+    raise DispatchError(
+        "Cannot find `codex` CLI binary. Install via `npm i -g @openai/codex` or set CODEX_DISPATCH_BIN."
+    )
 
 
 def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
@@ -212,22 +396,18 @@ def compile_anchored_pattern(pattern: str) -> re.Pattern[str]:
             while idx + 1 < total and parts[idx + 1] == "**":
                 idx += 1
             if idx == total - 1:
-                # Trailing `/**`: matches directory itself (if prefix exists) or anything underneath
                 if regex_parts[-1] == "/":
                     regex_parts.pop()
                     regex_parts.append(r"(?:/.*)?")
                 else:
                     regex_parts.append(r".*")
             else:
-                # Leading or middle `**/`: zero or more path segments
                 regex_parts.append(r"(?:.+/)?")
             idx += 1
             continue
 
         regex_parts.append(_segment_to_regex(seg))
-        if idx < total - 1 and parts[idx + 1] != "**":
-            regex_parts.append("/")
-        elif idx < total - 1 and parts[idx + 1] == "**":
+        if idx < total - 1:
             regex_parts.append("/")
         idx += 1
 
@@ -236,7 +416,6 @@ def compile_anchored_pattern(pattern: str) -> re.Pattern[str]:
 
 
 def matches_pattern(rel_path: str, pattern: str) -> bool:
-    """Match workspace-relative POSIX path against root-anchored glob or directory prefix."""
     if rel_path.startswith(OUTSIDE_WS_PREFIX):
         return False
     path_str = normalize_rel_path(rel_path)
@@ -251,7 +430,6 @@ def check_scope(
     allow_patterns: list[str],
     forbid_patterns: list[str],
 ) -> tuple[bool, list[str]]:
-    """Verify touched files stay inside workspace and obey forbidlist + allowlist."""
     violations: list[str] = []
     for rel in touched_files:
         if rel.startswith(OUTSIDE_WS_PREFIX):
@@ -285,7 +463,6 @@ def detect_git_repo(workspace: Path) -> Path | None:
 
 
 def entry_fingerprint(path: Path) -> str:
-    """Capture type, mode bits, and content/target digest WITHOUT following leaf symlinks."""
     try:
         st = path.lstat()
     except OSError:
@@ -311,7 +488,6 @@ def entry_fingerprint(path: Path) -> str:
 
 
 def parse_porcelain_entries(output: str) -> dict[str, str]:
-    """Parse `git status --porcelain=v1 -z` into {repo_rel_path: xy_code} preserving exact names."""
     tokens = output.split("\0")
     entries: dict[str, str] = {}
     i = 0
@@ -336,7 +512,6 @@ def parse_porcelain_entries(output: str) -> dict[str, str]:
 
 
 def _repo_rel_to_workspace_rel(git_root: Path, workspace: Path, repo_rel: str) -> str:
-    """Lexically map repo-relative path to workspace-relative path WITHOUT following symlinks."""
     ws_rel_prefix = ""
     if workspace != git_root:
         try:
@@ -383,7 +558,6 @@ def capture_baseline(workspace: Path, *, include_ignored: bool = False) -> dict[
     for root, dirs, files in os.walk(workspace, followlinks=False):
         dirs[:] = [d for d in dirs if d != ".git"]
         root_path = Path(root)
-        # Also record symlinked directories themselves
         for dname in list(dirs):
             dpath = root_path / dname
             if dpath.is_symlink():
@@ -429,7 +603,6 @@ def compute_post_delta(workspace: Path, baseline: dict[str, Any]) -> dict[str, A
                 touched_repo_rel.add(rel)
         for rel, old_state in pre_states.items():
             if rel not in post_states:
-                # Reverted, staged-and-committed, or deleted dirty file
                 old_fp = old_state.split("|", 1)[1] if "|" in old_state else ""
                 cur_fp = entry_fingerprint(git_root / rel)
                 if cur_fp != old_fp or old_state[:2].strip():
@@ -676,7 +849,7 @@ def compose_resume_prompt(
 def build_codex_command(
     *,
     codex_bin: str,
-    model: str,
+    model: str | None,
     effort: str,
     sandbox: str,
     summary_path: Path,
@@ -690,14 +863,15 @@ def build_codex_command(
     commit_sha: str | None = None,
     has_prompt: bool = True,
 ) -> list[str]:
+    model_flags = ["-m", model] if model else []
+
     if session_id:
         cmd = [
             codex_bin,
             "exec",
             "resume",
             "--json",
-            "-m",
-            model,
+            *model_flags,
             "-c",
             f'model_reasoning_effort="{effort}"',
             "-c",
@@ -726,8 +900,7 @@ def build_codex_command(
             "exec",
             "review",
             "--json",
-            "-m",
-            model,
+            *model_flags,
             "-c",
             f'model_reasoning_effort="{effort}"',
             "-o",
@@ -749,8 +922,7 @@ def build_codex_command(
         "--json",
         "-s",
         sandbox,
-        "-m",
-        model,
+        *model_flags,
         "-c",
         f'model_reasoning_effort="{effort}"',
         "-o",
@@ -797,7 +969,6 @@ def parse_codex_execution(
     errors: list[str] = []
     turn_completed = False
 
-    # Split strictly on LF so U+2028/U+2029 inside JSON strings never corrupt JSONL parsing
     for line in raw_stdout.split("\n"):
         stripped = line.rstrip("\r").strip()
         if not stripped.startswith("{"):
@@ -832,7 +1003,6 @@ def parse_codex_execution(
             summary_text = summary_path.read_text(encoding="utf-8", errors="replace").strip()
         except OSError:
             summary_text = ""
-    # Only fall back to JSONL agent_message when the turn genuinely completed
     if not summary_text and turn_completed and agent_messages:
         summary_text = agent_messages[-1]
 
@@ -857,17 +1027,22 @@ def parse_codex_execution(
 
 def _terminate_process_group(proc: subprocess.Popen[str]) -> tuple[str, str]:
     pgid = proc.pid
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.killpg(pgid, signal.SIGTERM)
+    if hasattr(os, "killpg"):
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(pgid, signal.SIGTERM)
+    else:
+        proc.terminate()
     try:
         out, err = proc.communicate(timeout=4)
     except subprocess.TimeoutExpired:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(pgid, signal.SIGKILL)
+        if hasattr(os, "killpg"):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(pgid, signal.SIGKILL)
+        else:
+            proc.kill()
         try:
             out, err = proc.communicate(timeout=3)
         except subprocess.TimeoutExpired:
-            # Close pipes so detached grandchildren holding fds cannot block forever
             if proc.stdout:
                 with contextlib.suppress(OSError):
                     proc.stdout.close()
@@ -877,9 +1052,9 @@ def _terminate_process_group(proc: subprocess.Popen[str]) -> tuple[str, str]:
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=2)
             out, err = "", ""
-    # Ensure no lingering survivor in the process group
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.killpg(pgid, signal.SIGKILL)
+    if hasattr(os, "killpg"):
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(pgid, signal.SIGKILL)
     return out or "", err or ""
 
 
@@ -910,6 +1085,8 @@ def execute_process(
 
 def run_verify_command(workspace: Path, verify_cmd: str, timeout: int = 300) -> dict[str, Any]:
     t0 = time.monotonic()
+    env = dict(os.environ)
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     proc = subprocess.Popen(
         ["bash", "--noprofile", "--norc", "-c", verify_cmd],
         cwd=str(workspace),
@@ -917,6 +1094,7 @@ def run_verify_command(workspace: Path, verify_cmd: str, timeout: int = 300) -> 
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        env=env,
         start_new_session=True,
     )
     timed_out = False
@@ -940,7 +1118,6 @@ def run_verify_command(workspace: Path, verify_cmd: str, timeout: int = 300) -> 
 
 
 def filter_transient_caches(paths: list[str], forbid_patterns: list[str]) -> list[str]:
-    """Ignore benign tool bytecode/linter caches in repos lacking .gitignore unless explicitly forbidden."""
     filtered: list[str] = []
     for p in paths:
         if any(matches_pattern(p, fp) for fp in forbid_patterns):
@@ -961,7 +1138,6 @@ def evaluate_write_gates(
     verify_cmd: str | None,
     codex_ok: bool,
 ) -> dict[str, Any]:
-    """Run scope & HEAD check BEFORE verify command, then re-check delta AFTER verify command."""
     delta = compute_post_delta(exec_workspace, baseline)
     delta["touched_files"] = filter_transient_caches(delta["touched_files"], forbid_patterns)
     scope_checked = bool(allow_patterns or forbid_patterns) or any(
@@ -970,10 +1146,8 @@ def evaluate_write_gates(
     scope_ok, scope_violations = check_scope(delta["touched_files"], allow_patterns, forbid_patterns)
 
     verify_result: dict[str, Any] | None = None
-    # Security & integrity invariant: NEVER execute `--verify` if HEAD or file scope was violated!
     if codex_ok and not delta["head_changed"] and scope_ok and verify_cmd:
         verify_result = run_verify_command(exec_workspace, verify_cmd)
-        # Re-snapshot after `--verify` to ensure the test command itself didn't mutate forbidden/out-of-scope state
         delta = compute_post_delta(exec_workspace, baseline)
         delta["touched_files"] = filter_transient_caches(delta["touched_files"], forbid_patterns)
         scope_checked = bool(allow_patterns or forbid_patterns) or any(
@@ -1014,28 +1188,32 @@ def resolve_model_and_effort(
     tier: str | None,
     explicit_model: str | None,
     explicit_effort: str | None,
-) -> tuple[str, str, str]:
-    defaults = ROLE_DEFAULTS[role]
-    model = defaults["model"]
-    effort = defaults["effort"]
-    sandbox = defaults["sandbox"]
+    discovered: dict[str, Any],
+) -> tuple[str | None, str, str]:
+    spec = ROLE_SPECS[role]
+    slot = spec["slot"]
+    effort = spec["effort"]
+    sandbox = spec["sandbox"]
     if tier:
-        if tier not in TIER_PRESETS:
-            raise DispatchError(f"Unknown --tier '{tier}'. Valid: {', '.join(TIER_PRESETS)}")
-        model, effort = TIER_PRESETS[tier]
-    if explicit_model:
-        model = explicit_model
+        if tier not in TIER_SPECS:
+            raise DispatchError(f"Unknown --tier '{tier}'. Valid: {', '.join(TIER_SPECS)}")
+        slot, effort = TIER_SPECS[tier]
+
+    model: str | None = explicit_model if explicit_model else discovered.get(slot)
     if explicit_effort:
         effort = explicit_effort
+    else:
+        effort = clamp_effort(model, effort, discovered.get("effort_map") or {})
     return model, effort, sandbox
 
 
 def format_receipt(result: dict[str, Any]) -> str:
+    model_label = result.get("model") or "(codex-default)"
     lines = [
         f"=== codex-dispatch [{result['status']}] ===",
         f"task_id    : {result['task_id']}",
         f"session_id : {result.get('session_id') or 'none'}",
-        f"role/model : {result['role']} | {result['model']} (effort={result['effort']}, sandbox={result['sandbox']})",
+        f"role/model : {result['role']} | {model_label} (effort={result['effort']}, sandbox={result['sandbox']})",
         f"elapsed    : {result['elapsed_sec']}s | artifacts: {result['run_dir']}",
     ]
     if result.get("worktree_path"):
@@ -1091,7 +1269,8 @@ def cmd_dispatch_new(args: argparse.Namespace) -> int:
 
     native_review = bool(role == "review" and getattr(args, "native", False))
     has_review_target = bool(
-        role == "review" and (getattr(args, "base", None) or getattr(args, "commit", None) or getattr(args, "uncommitted", False))
+        role == "review"
+        and (getattr(args, "base", None) or getattr(args, "commit", None) or getattr(args, "uncommitted", False))
     )
     user_prompt = read_prompt_input(args, optional=(native_review or has_review_target))
 
@@ -1105,7 +1284,8 @@ def cmd_dispatch_new(args: argparse.Namespace) -> int:
     if images and role == "explore" and not args.model and not args.tier:
         role = "visual"
 
-    model, effort, sandbox = resolve_model_and_effort(role, args.tier, args.model, args.effort)
+    discovered = discover_codex_models()
+    model, effort, sandbox = resolve_model_and_effort(role, args.tier, args.model, args.effort, discovered)
     use_worktree = bool(getattr(args, "worktree", False) and sandbox == "workspace-write")
 
     cache_root = resolve_cache_root(args.state_dir)
@@ -1296,6 +1476,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
         raise DispatchError(f"Unknown task_id '{args.task_id}' (no metadata at {meta_path})")
 
     delta_text = read_prompt_input(args, optional=False)
+    discovered = discover_codex_models()
 
     with task_lock(run_dir):
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -1303,7 +1484,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
             raise DispatchError(f"Metadata task_id mismatch inside {meta_path}")
         role = meta.get("role")
         sandbox = meta.get("sandbox")
-        if role not in ROLE_DEFAULTS or sandbox not in VALID_SANDBOXES:
+        if role not in ROLE_SPECS or sandbox not in VALID_SANDBOXES:
             raise DispatchError(f"Corrupted role/sandbox metadata in {meta_path}")
         if role in FRESH_ONLY_ROLES and getattr(args, "write", False):
             raise DispatchError(
@@ -1333,19 +1514,21 @@ def cmd_resume(args: argparse.Namespace) -> int:
         is_git = bool(initial_baseline.get("is_git"))
 
         rework_num = int(meta.get("rework_count", 0)) + 1
-        model = args.model or meta["model"]
-        effort = args.effort or meta["effort"]
+        model: str | None = args.model if args.model else meta.get("model")
+        effort: str = args.effort if args.effort else str(meta.get("effort") or "medium")
         escalated = False
 
+        flagship = discovered.get("flagship")
         if (
             role == "implement"
             and not args.no_escalate
             and not args.model
             and not args.effort
-            and (model != "gpt-6.2-astra" or effort in ("low", "medium"))
+            and ((flagship and model != flagship) or effort in ("minimal", "low", "medium"))
         ):
-            model = "gpt-6.2-astra"
-            effort = "high"
+            if flagship:
+                model = flagship
+            effort = clamp_effort(model, "high", discovered.get("effort_map") or {})
             escalated = True
 
         allow_patterns = split_patterns(args.allow) if args.allow else list(meta.get("allow_patterns") or [])
@@ -1488,6 +1671,38 @@ def cmd_resume(args: argparse.Namespace) -> int:
     return 0 if status == "OK" else 1
 
 
+def cmd_doctor(args: argparse.Namespace) -> int:
+    cache_root = resolve_cache_root(args.state_dir)
+    try:
+        codex_bin = resolve_codex_bin()
+        ver_proc = subprocess.run(
+            [codex_bin, "--version"], capture_output=True, text=True, timeout=10, check=False
+        )
+        codex_version = (ver_proc.stdout or ver_proc.stderr).strip().splitlines()[0] if ver_proc.returncode == 0 else None
+    except (DispatchError, OSError, subprocess.TimeoutExpired) as exc:
+        codex_bin = None
+        codex_version = f"ERROR: {exc}"
+
+    discovered = discover_codex_models()
+    report = {
+        "version": VERSION,
+        "python": sys.version.split()[0],
+        "codex_bin": codex_bin,
+        "codex_version": codex_version,
+        "cache_root": str(cache_root),
+        "models": {
+            "workhorse": discovered["workhorse"],
+            "flagship": discovered["flagship"],
+            "visual": discovered["visual"],
+            "toml_default": discovered["toml_default"],
+            "detected_in_cache": discovered["detected_count"],
+        },
+        "ready": bool(codex_bin),
+    }
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0 if codex_bin else 1
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     cache_root = resolve_cache_root(args.state_dir)
     if args.task_id:
@@ -1514,7 +1729,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             rl = str(m.get("role") or "unknown")
             print(
                 f"{m.get('task_id') or mp.parent.name} | {st:11s} | {rl:9s} | "
-                f"{m.get('model') or '?'} ({m.get('effort') or '?'}) | rework={m.get('rework_count', 0)} | {m.get('workspace') or ''}"
+                f"{m.get('model') or 'default'} ({m.get('effort') or '?'}) | rework={m.get('rework_count', 0)} | {m.get('workspace') or ''}"
             )
         except (OSError, json.JSONDecodeError):
             continue
@@ -1556,15 +1771,15 @@ def cmd_clean(args: argparse.Namespace) -> int:
 def add_common_dispatch_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("-C", "--cd", help="Workspace root directory (defaults to current directory)")
     p.add_argument("-f", "--file", action="append", help="Verified entry file/dir paths (comma-separated or repeatable)")
-    p.add_argument("--tier", choices=list(TIER_PRESETS), help="Model/effort preset (fast|std|high|hard|xhigh|visual)")
-    p.add_argument("-m", "--model", help="Explicit Codex model override (e.g. gpt-6.2-astra, gpt-6.2-sol)")
-    p.add_argument("--effort", help="Explicit reasoning effort override (low|medium|high|xhigh|max|ultra)")
+    p.add_argument("--tier", choices=list(TIER_SPECS), help="Model/effort preset (fast|std|high|hard|xhigh|visual)")
+    p.add_argument("-m", "--model", help="Explicit Codex model override")
+    p.add_argument("--effort", help="Explicit reasoning effort override (minimal|low|medium|high|xhigh|max|ultra)")
     p.add_argument("--allow", action="append", help="Allowed write path globs/prefixes (comma-separated or repeatable)")
     p.add_argument("--forbid", action="append", help="Forbidden write path globs/prefixes")
     p.add_argument("--verify", help="Fast deterministic verification shell command to run after write task")
     p.add_argument("--worktree", action="store_true", help="Run write task in an isolated managed Git worktree")
     p.add_argument("--allow-network", action="store_true", help="Enable network inside workspace-write sandbox (requires user approval)")
-    p.add_argument("-i", "--image", action="append", help="Attach image file(s) (auto-selects gpt-6.1-terra for explore)")
+    p.add_argument("-i", "--image", action="append", help="Attach image file(s) (auto-selects visual model for explore)")
     p.add_argument("--prompt-file", help="Read prompt from file instead of stdin")
     p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="Max runtime seconds (default: 1800)")
     p.add_argument("--state-dir", help="Override artifact cache directory")
@@ -1576,16 +1791,17 @@ def add_common_dispatch_flags(p: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="codex-dispatch",
-        description="Deterministic token-saving Claude -> Codex orchestrator.",
+        description="Universal token-saving Claude Code -> Codex CLI orchestrator.",
     )
+    parser.add_argument("-V", "--version", action="version", version=f"codex-dispatch {VERSION}")
     sub = parser.add_subparsers(dest="subcommand", required=True)
 
     for role_name, help_txt in (
-        ("explore", "Read-only codebase exploration & reusable-module discovery (gpt-6.2-sol)"),
-        ("critique", "Read-only pre-coding architecture critique or root-cause diagnosis (gpt-6.2-astra)"),
+        ("explore", "Read-only codebase exploration & reusable-module discovery (workhorse model)"),
+        ("critique", "Read-only pre-coding architecture critique or root-cause diagnosis (flagship model)"),
         ("implement", "Contract-driven coding with baseline diff, allowlist gate & verify hook"),
-        ("review", "Independent read-only adversarial code review (gpt-6.2-astra)"),
-        ("visual", "Read-only visual/UI screenshot inspection (gpt-6.1-terra)"),
+        ("review", "Independent read-only adversarial code review (flagship model)"),
+        ("visual", "Read-only visual/UI screenshot inspection (visual model)"),
     ):
         sp = sub.add_parser(role_name, help=help_txt)
         sp.set_defaults(role=role_name, handler=cmd_dispatch_new)
@@ -1601,7 +1817,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_resume.add_argument("task_id", help="Task ID from previous codex-dispatch receipt")
     p_resume.add_argument("-m", "--model", help="Override model on resume")
     p_resume.add_argument("--effort", help="Override reasoning effort on resume")
-    p_resume.add_argument("--no-escalate", action="store_true", help="Keep original model instead of auto-upgrading rework to astra+high")
+    p_resume.add_argument("--no-escalate", action="store_true", help="Keep original model instead of auto-upgrading rework to flagship+high")
     p_resume.add_argument("--allow", action="append", help="Override allowed write globs")
     p_resume.add_argument("--forbid", action="append", help="Override forbidden write globs")
     p_resume.add_argument("--verify", help="Override verification command")
@@ -1614,13 +1830,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_resume.add_argument("--dry-run", action="store_true", help="Preview resume command without running")
     p_resume.add_argument("prompt", nargs="?", help="Delta rework instructions, or `-`/stdin")
 
+    p_doctor = sub.add_parser("doctor", help="Inspect detected Codex binary, resolved models, and cache path")
+    p_doctor.set_defaults(handler=cmd_doctor)
+    p_doctor.add_argument("--state-dir", help="Override artifact cache directory")
+
     p_status = sub.add_parser("status", help="List recent dispatched tasks or inspect one task_id")
     p_status.set_defaults(handler=cmd_status)
     p_status.add_argument("task_id", nargs="?", help="Optional specific task_id")
     p_status.add_argument("-n", "--limit", type=int, default=15)
     p_status.add_argument("--state-dir", help="Override artifact cache directory")
 
-    p_clean = sub.add_parser("clean", help="Remove old task directories from ~/.cache/agent-work/codex-dispatch")
+    p_clean = sub.add_parser("clean", help="Remove old task directories from artifact cache")
     p_clean.set_defaults(handler=cmd_clean)
     p_clean.add_argument("--days", type=int, default=7, help="Delete runs older than N days (default: 7)")
     p_clean.add_argument("--state-dir", help="Override artifact cache directory")
