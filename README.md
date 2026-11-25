@@ -1,8 +1,12 @@
-# codex-dispatch
+# codex-dispatch & agent-autopilot
 
-**Claude 管架构契约与验收，Codex 扛执行与对抗审查 —— 零打扰、省 Claude Token、防越界的双模型自动编程套件。**
+**双模型按需协作（`codex-dispatch`） + 24×7 全自动自进化 Issue/例行巡检自治引擎（`agent-autopilot`）。**
 
-专为 **Claude Pro ($20) + OpenAI Codex CLI** 用户打造：当你在 Claude Code 中像平时一样提业务或开发需求时，Claude 会在后台自动调度本机 Codex 完成「代码库摸底 → 动手前架构挑刺 → 契约式实现 → 文件白名单与单测门禁 → 独立对抗性审查 → 自动升档返工」，全程无需手动敲命令，大幅节省 Claude 额度并提升代码架构优雅度。
+本仓库同时提供两套 100% 兼容、零第三方 Python 依赖的自治技能：
+1. **[`skills/codex-dispatch`](skills/codex-dispatch/SKILL.md)**：交互式会话中按需桥接本机 Codex（`explore` / `critique` / `implement` / `review`），省 Claude 额度并执行文件白名单与单测门禁。
+2. **[`skills/agent-autopilot`](skills/agent-autopilot/SKILL.md)**（架构规范见 [`docs/AUTOPILOT_PLAN.md`](docs/AUTOPILOT_PLAN.md)）：面向任何代码库与定时例行任务的 24×7 无人值守自治引擎——融合「看它做的、5 秒地图、写进规矩、跨家族 AI 裁判循环清零、黄金样板填空捷径、专职分工阶梯提并发」六大方法论，内置零 Token 预检、四环 `bwrap` + Landlock 沙箱与单变异事务对账状态机。
+
+专为 **Claude + OpenAI Codex CLI** 用户打造：当你在 Claude Code 中像平时一样提业务或开发需求时，可按需调度 Codex 协作，也可将仓库或定时巡检一键接入 `agent-autopilot` 24 小时后台自进化运转。
 
 ---
 
@@ -25,9 +29,9 @@
 ### 方式一：克隆并一键安装（推荐，包含全局 CLI 包装器与免审批配置）
 
 ```bash
-git clone https://github.com/sunnykui/codex-dispatch.git
-cd codex-dispatch
-bash ./install.sh --allow-claude-permissions
+git clone https://github.com/sunnykui/agent-autopilot.git
+cd agent-autopilot
+bash ./install.sh --install-systemd-units --allow-claude-permissions
 ```
 
 确保 `~/.local/bin` 在 `PATH` 中，然后把仓库内的通用规则模板按需合入全局记忆即可实现**全程无感自动触发**：
@@ -39,14 +43,14 @@ bash ./install.sh --allow-claude-permissions
 在 Claude Code 中依次执行：
 
 ```text
-/plugin marketplace add sunnykui/codex-dispatch
-/plugin install codex-dispatch@codex-dispatch
+/plugin marketplace add sunnykui/agent-autopilot
+/plugin install agent-autopilot@agent-autopilot
 ```
 
 ### 方式三：`skills` CLI 安装
 
 ```bash
-npx skills add sunnykui/codex-dispatch
+npx skills add sunnykui/agent-autopilot
 ```
 
 ---

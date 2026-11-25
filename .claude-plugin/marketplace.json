@@ -1,23 +1,23 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
-  "name": "codex-dispatch",
-  "description": "Token-saving Claude Code -> OpenAI Codex CLI autonomous orchestration skill & deterministic gate runner.",
+  "name": "agent-autopilot",
+  "description": "24x7 self-evolving autonomous issue & routine engine (agent-autopilot) and Claude Code <-> Codex CLI orchestrator (codex-dispatch).",
   "owner": {
     "name": "sunnykui",
     "url": "https://github.com/sunnykui"
   },
   "plugins": [
     {
-      "name": "codex-dispatch",
+      "name": "agent-autopilot",
       "version": "0.2.0",
       "source": {
         "source": "github",
-        "repo": "sunnykui/codex-dispatch"
+        "repo": "sunnykui/agent-autopilot"
       },
-      "description": "Offload exploration, architecture critique, contract-based coding, and adversarial code review from Claude Code to local Codex CLI with scope allowlist & verification gates.",
-      "homepage": "https://github.com/sunnykui/codex-dispatch",
+      "description": "Universal 24x7 zero-token precheck, multi-ring bwrap/Landlock sandbox, cross-family Claude <-> Codex referee loop, and on-demand codex-dispatch.",
+      "homepage": "https://github.com/sunnykui/agent-autopilot",
       "license": "MIT",
-      "keywords": ["codex", "claude-code", "orchestration", "token-saver", "code-review", "architecture"]
+      "keywords": ["autopilot", "codex", "claude-code", "orchestration", "sandbox", "code-review"]
     }
   ]
 }

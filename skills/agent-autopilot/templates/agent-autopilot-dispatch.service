@@ -1,0 +1,10 @@
+[Unit]
+Description=Agent Autopilot Unified Zero-Token Precheck & Dispatcher
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/agent-autopilot dispatch
+TimeoutStartSec=900
+Nice=10
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin

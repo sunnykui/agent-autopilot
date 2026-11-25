@@ -1,0 +1,10 @@
+[Unit]
+Description=Agent Autopilot Unified Dispatcher Timer (Every 3 Minutes with Jitter)
+
+[Timer]
+OnCalendar=*:0/3
+RandomizedDelaySec=20s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

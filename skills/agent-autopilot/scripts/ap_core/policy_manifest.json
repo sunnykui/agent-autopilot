@@ -1,0 +1,406 @@
+{
+  "schema_version": 16,
+  "require_systemd_linger": true,
+  "merge_pr_requires_separate_merge_token": true,
+  "basenames_case_insensitive": true,
+  "anchored_case_sensitive_linux": true,
+  "forbid_literal_backslash_and_control_chars": true,
+  "default_branch_prefix": "agent/",
+  "cleanup_unit_limits": {
+    "timeout_start_sec": 10,
+    "runtime_max_sec": 60,
+    "timeout_stop_sec": 10,
+    "wrapper_sigterm_sec": 85,
+    "wrapper_kill_after_sec": 5
+  },
+  "chef_pipeline": {
+    "roles": ["scout", "writer", "referee"],
+    "cross_family_referee_map": {
+      "codex": "claude",
+      "claude": "codex"
+    },
+    "configurable_models": {
+      "claude_scout": "claude-sonnet-5-5",
+      "claude_writer": "claude-sonnet-5-5",
+      "claude_referee": "claude-fable-5-2",
+      "codex_scout": "gpt-6.2-sol",
+      "codex_writer": "gpt-6.2-sol",
+      "codex_referee": "gpt-6.2-astra",
+      "visual_inspector": "gpt-6.1-terra"
+    },
+    "enable_ui_verify_default": false,
+    "max_review_rounds": 3,
+    "exhausted_review_terminal": "needs-human",
+    "publish_requires_current_candidate_verify_and_review_receipts": true,
+    "initial_max_in_progress": 1,
+    "staircase_concurrency_steps": [1, 2, 3],
+    "staircase_min_clean_runs": 10,
+    "staircase_maturity_hours": 48,
+    "staircase_requires_human_approval": true,
+    "authoritative_policy_file": "~/.config/agent-autopilot/projects/<project_id>/WORKFLOW.md",
+    "advisory_only_dir": "~/.local/state/agent-autopilot/advisory/<project_id>/",
+    "advisory_excluded_from_referee_and_visual": true,
+    "max_pitfall_rule_chars": 200,
+    "required_fill_in_schemas": {
+      "scout": ["root_cause", "target_area", "exemplar_files", "dod_check", "ui_verify_needed", "uncertainties"],
+      "writer": ["summary_le_300_chars", "changed_files", "executed_checks", "uncertainties"],
+      "referee": ["verdict", "round_index", "defect_count", "three_col_defects", "uncertainties"]
+    },
+    "pitfall_routing_targets": {
+      "project_advisory_auto": "~/.local/state/agent-autopilot/advisory/<project_id>/PITFALLS.md",
+      "global_proposal_human_gated": "~/.local/state/agent-autopilot/proposals/<sig>/LESSONS_LEARNED.patch",
+      "executable_gate_proposal_human_gated": "~/.local/state/agent-autopilot/proposals/<sig>/gate_patch.json"
+    }
+  },
+  "host_binary_slots": {
+    "ap_sandbox_init": "Static C initializer binary (distinct inode from ap_safe_sh)",
+    "ap_safe_sh": "Static C non-blocking shell proxy client (bound to /usr/bin/{bash,sh,dash}; host shells are NEVER mounted in model_ring)",
+    "codex_cli": "Resolved host codex static-pie ELF binary",
+    "claude_cli": "Resolved host claude ELF binary (invoked with --setting-sources user --strict-mcp-config --exclude-dynamic-system-prompt-sections; dynamic loader + 0644 .so libs when dynamic_elf_libs=true)"
+  },
+  "llm_proxy_allowlist_domains": [
+    "api.anthropic.com",
+    "claude.ai",
+    "api.claude.ai",
+    "platform.claude.com",
+    "api.openai.com",
+    "chatgpt.com",
+    "auth.openai.com"
+  ],
+  "claude_permission_deny": [
+    "Read(~/.claude/**)",
+    "Edit(~/.claude/**)",
+    "Read(//home/*/.claude/**)",
+    "Edit(//home/*/.claude/**)",
+    "Read(//proc/**)",
+    "Edit(//proc/**)"
+  ],
+  "role_matrix": {
+    "codex:issue_model": {
+      "binary_mounts": {
+        "/usr/local/bin/ap-sandbox-init": "ap_sandbox_init",
+        "/usr/local/bin/codex": "codex_cli",
+        "/usr/bin/bash": "ap_safe_sh",
+        "/usr/bin/sh": "ap_safe_sh",
+        "/usr/bin/dash": "ap_safe_sh"
+      },
+      "landlock_allow_exec": [
+        "/usr/local/bin/codex",
+        "/usr/bin/bash",
+        "/usr/bin/sh",
+        "/usr/bin/dash"
+      ],
+      "dynamic_elf_libs": false,
+      "mount_tool_sock": true,
+      "readonly_worktree_dot_git": true,
+      "writable_mounts": ["sandbox_home", "shared_tmp", "shell_snapshots", "worktree", "outbox"]
+    },
+    "codex:readonly_model": {
+      "binary_mounts": {
+        "/usr/local/bin/ap-sandbox-init": "ap_sandbox_init",
+        "/usr/local/bin/codex": "codex_cli"
+      },
+      "landlock_allow_exec": [
+        "/usr/local/bin/codex"
+      ],
+      "dynamic_elf_libs": false,
+      "mount_tool_sock": false,
+      "readonly_worktree_dot_git": false,
+      "readonly_review_bundle_mount": "/ap-review-bundle",
+      "verdict_handoff_channel": "outbox_json_validated_by_host",
+      "writable_mounts": ["sandbox_home", "outbox"]
+    },
+    "claude:issue_model": {
+      "binary_mounts": {
+        "/usr/local/bin/ap-sandbox-init": "ap_sandbox_init",
+        "/usr/local/bin/claude": "claude_cli",
+        "/usr/bin/bash": "ap_safe_sh",
+        "/usr/bin/sh": "ap_safe_sh",
+        "/usr/bin/dash": "ap_safe_sh"
+      },
+      "landlock_allow_exec": [
+        "/usr/local/bin/claude",
+        "/usr/lib64/ld-linux-x86-64.so.2",
+        "/usr/bin/bash",
+        "/usr/bin/sh",
+        "/usr/bin/dash"
+      ],
+      "claude_cli_flags": ["--permission-mode", "bypassPermissions", "--setting-sources", "user", "--strict-mcp-config", "--exclude-dynamic-system-prompt-sections"],
+      "claude_tools": ["Bash", "Read", "Edit", "Write", "Glob", "Grep"],
+      "dynamic_elf_libs": true,
+      "mount_tool_sock": true,
+      "readonly_worktree_dot_git": true,
+      "writable_mounts": ["sandbox_home", "shared_tmp", "shell_snapshots", "worktree", "outbox"]
+    },
+    "claude:readonly_model": {
+      "binary_mounts": {
+        "/usr/local/bin/ap-sandbox-init": "ap_sandbox_init",
+        "/usr/local/bin/claude": "claude_cli"
+      },
+      "landlock_allow_exec": [
+        "/usr/local/bin/claude",
+        "/usr/lib64/ld-linux-x86-64.so.2"
+      ],
+      "claude_cli_flags": ["--setting-sources", "user", "--strict-mcp-config", "--exclude-dynamic-system-prompt-sections"],
+      "claude_tools": ["Read", "Glob", "Grep"],
+      "dynamic_elf_libs": true,
+      "mount_tool_sock": false,
+      "readonly_worktree_dot_git": false,
+      "readonly_review_bundle_mount": "/ap-review-bundle",
+      "verdict_handoff_channel": "stdout_json_validated_by_host",
+      "writable_mounts": ["sandbox_home", "outbox"]
+    }
+  },
+  "execution_rings": {
+    "tool_ring": {
+      "network": "none (--unshare-net)",
+      "mount_sandbox_home": false,
+      "readonly_mounts": ["/usr", "/etc/basic", "worktree/.git", "MANAGED_GITDIR", "REPO_MAIN/.git/objects", "trusted_base_cache", "shell_snapshots"],
+      "writable_mounts": ["worktree", "ephemeral_tool_cache", "shared_tmp"],
+      "cwd_policy": "realpath(req_cwd) must be inside realpath(worktree)"
+    },
+    "git_ops_ring": {
+      "network": "none (--unshare-net)",
+      "mount_sandbox_home": false,
+      "mount_repo_main_config": false,
+      "git_optional_locks": 0,
+      "sampling_mode_readonly_mounts": ["/usr", "MANAGED_GITDIR", "REPO_MAIN/.git/objects", "worktree"],
+      "sampling_mode_writable_mounts": ["run_dir/scratch-objects", "run_dir/stage_dir"],
+      "cleanup_mode_writable_mounts": ["MANAGED_GITDIR", "worktree"]
+    },
+    "verify_ring": {
+      "network": "none (--unshare-net; optional loopback-only headless browser inside verify_ring when enable_ui_verify=true)",
+      "mount_sandbox_home": false,
+      "mount_ephemeral_tool_cache": false,
+      "forbid_hardlinks_to_clean_tree": true,
+      "readonly_mounts": ["/proc", "/dev", "/usr", "/etc/basic", "CLEAN_TREE", "trusted_base_cache"],
+      "optional_ui_readonly_mounts": ["/opt/google/chrome"],
+      "writable_mounts": ["run_dir/verify-out-C"]
+    }
+  },
+  "global_hard_stop_anchored": [
+    ".autopilot/**",
+    "WORKFLOW.md",
+    "**/WORKFLOW.md",
+    "feature-map.json",
+    "**/feature-map.json",
+    "config/autopilot.json",
+    "scripts/autopilot/**",
+    "scripts/autopilot_*.py",
+    "scripts/autopilot_*.sh",
+    "scripts/issue_autopilot.py",
+    ".github/**",
+    ".gitmodules",
+    ".gitattributes",
+    "**/.gitattributes",
+    "CODEOWNERS",
+    "**/CODEOWNERS",
+    ".claude/**",
+    "**/.claude/**",
+    ".codex/**",
+    "**/.codex/**",
+    ".cursor/**",
+    "**/.cursor/**",
+    ".cursorrules",
+    "**/.cursorrules",
+    ".vscode/**",
+    "**/.vscode/**",
+    ".devcontainer/**",
+    "**/.devcontainer/**",
+    ".husky/**",
+    "**/.husky/**",
+    ".mcp.json",
+    "**/.mcp.json",
+    "CLAUDE.md",
+    "**/CLAUDE.md",
+    "AGENTS.md",
+    "**/AGENTS.md",
+    "GEMINI.md",
+    "**/GEMINI.md",
+    ".envrc",
+    "**/.envrc",
+    ".netrc",
+    "**/.netrc",
+    ".git-credentials",
+    "**/.git-credentials",
+    ".pypirc",
+    "**/.pypirc",
+    ".npmrc",
+    "**/.npmrc",
+    ".yarnrc*",
+    "**/.yarnrc*",
+    ".yarn/**",
+    "**/.yarn/**",
+    ".pnpmfile.cjs",
+    "**/.pnpmfile.cjs",
+    ".cargo/**",
+    "**/.cargo/**",
+    "prisma/**",
+    "migrations/**",
+    "**/migrations/**",
+    "apps/*/prod/**",
+    "apps/argocd/**",
+    "**/*argocd*/**",
+    ".ssh/**",
+    ".aws/**",
+    "certs/**",
+    "certificates/**",
+    "keys/**",
+    "secrets/**",
+    "**/secrets/**"
+  ],
+  "global_hard_stop_basenames": [
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "*.pub",
+    "*.p8",
+    "*.p12",
+    "*.pfx",
+    "*.crt",
+    "*.cer",
+    "*.csr",
+    "*.der",
+    "*.jks",
+    "*.keystore",
+    "*.keychain-db",
+    "*.ppk",
+    "*.p7b",
+    "*.p7c",
+    "*.pkcs8",
+    "*.jwk",
+    "*.jwks",
+    "id_rsa*",
+    "id_ecdsa*",
+    "id_ed25519*",
+    "id_dsa*",
+    "*private-key*",
+    "*private_key*",
+    "*signing-key*",
+    "*signing_key*",
+    "*api-key*",
+    "*api_key*",
+    "credentials",
+    "credentials.*",
+    "*credentials*",
+    "secrets.*",
+    "*.secrets.*"
+  ],
+  "dependency_lock_paths": [
+    "package.json",
+    "**/package.json",
+    "pnpm-lock.yaml",
+    "**/pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    "**/pnpm-workspace.yaml",
+    "package-lock.json",
+    "**/package-lock.json",
+    "yarn.lock",
+    "**/yarn.lock",
+    "bun.lockb",
+    "**/bun.lockb",
+    "Cargo.toml",
+    "**/Cargo.toml",
+    "Cargo.lock",
+    "**/Cargo.lock",
+    "pyproject.toml",
+    "**/pyproject.toml",
+    "poetry.lock",
+    "**/poetry.lock",
+    "uv.lock",
+    "**/uv.lock",
+    "requirements.txt",
+    "**/requirements.txt",
+    "requirements-*.txt",
+    "**/requirements-*.txt",
+    "go.mod",
+    "**/go.mod",
+    "go.sum",
+    "**/go.sum"
+  ],
+  "trust_tier_actions": {
+    "T1": ["push_branch", "create_draft_pr", "post_comment", "add_label"],
+    "T2": ["push_branch", "create_draft_pr", "mark_pr_ready", "post_comment", "add_label"],
+    "T3": ["push_branch", "create_draft_pr", "mark_pr_ready", "post_comment", "add_label", "merge_pr", "enqueue_pr"],
+    "T4": ["push_branch", "create_draft_pr", "mark_pr_ready", "post_comment", "add_label", "merge_pr", "enqueue_pr"]
+  },
+  "trust_tier_merge_scope": {
+    "T1": "none",
+    "T2": "none",
+    "T3": "merge_paths_only (requires frozen WORKFLOW.md merge_paths non-empty, all touched files matching merge_paths, AND live pre-send server_target_branch_constraint verification)",
+    "T4": "all_project_allowed_paths (requires passing non-empty write_scope + hard-stop + dependency-lock gates AND live pre-send server_target_branch_constraint verification)"
+  },
+  "server_target_branch_constraint": {
+    "enqueue_pr": "Re-verified immediately before send across ALL ACTIVE repository rulesets, organization rulesets, AND fully paginated classic branchProtectionRules: because GraphQL BranchProtectionRule does not expose a Merge Queue toggle, if ANY classic rule pattern could match a branch other than exact authorized_base_ref unless pattern is an exact literal branch verified via repository.mergeQueue(branch: pattern) == null (or if any source is unreadable/incomplete or enables a second Merge Queue branch), immediately cap at T2 Ready-only",
+    "merge_pr": "Requires merge_pr_requires_separate_merge_token=true and live pre-send verification that ACTIVE rulesets/classic protection enforced against the merge token identity itself (no actor/role/team/app/PR bypass; isAdminEnforced=true where classic rules apply) block merges into EVERY branch except exact authorized_base_ref; otherwise cap at T2 Ready-only"
+  },
+  "external_op_statuses": [
+    "prepared_local",
+    "aborted_pre_send",
+    "in_flight",
+    "unknown_paused",
+    "succeeded_verified",
+    "superseded_by_pr_merge",
+    "superseded_by_retry",
+    "not_executed",
+    "rolled_back_to_draft",
+    "merged_before_revoke",
+    "diverged_needs_human"
+  ],
+  "one_mutation_per_op_id": true,
+  "action_transport_map": {
+    "push_branch": "git --git-dir=<EPHEMERAL_PUSH_DIR> push --porcelain --force-with-lease=<authorized_head_ref>:<old_oid> <https_url> <C>:<authorized_head_ref> (strictly from frozen run_claims.authorized_head_ref != authorized_base_ref)",
+    "create_draft_pr": "GraphQL createPullRequest(input={repositoryId, baseRefName, headRefName, title, body, draft: true})",
+    "mark_pr_ready": "GraphQL markPullRequestReadyForReview(input={pullRequestId})",
+    "post_comment": "GraphQL addComment(input={subjectId, body}) with Ref-ID: ap-<hmac>",
+    "add_label": "GraphQL addLabelsToLabelable(input={labelableId, labelIds})",
+    "merge_pr": "GraphQL mergePullRequest(input={pullRequestId, expectedHeadOid: C, mergeMethod: <project_merge_method>})",
+    "enqueue_pr": "GraphQL enqueuePullRequest(input={pullRequestId, expectedHeadOid: C})",
+    "convert_pr_to_draft": "GraphQL convertPullRequestToDraft(input={pullRequestId})",
+    "dequeue_pr": "GraphQL dequeuePullRequest(input={id: pullRequestId})",
+    "disable_pr_automerge": "GraphQL disablePullRequestAutoMerge(input={pullRequestId})"
+  },
+  "forbidden_graphql_mutations": [
+    "enablePullRequestAutoMerge"
+  ],
+  "supervisor_admin_actions": [
+    "convert_pr_to_draft",
+    "dequeue_pr",
+    "disable_pr_automerge"
+  ],
+  "expected_raw_invalid_path_samples": [
+    "src\\evil.py",
+    "apps\\web\\index.ts",
+    "src/../secret.txt",
+    "src/bad\nname.py"
+  ],
+  "expected_hard_stop_samples": [
+    "WORKFLOW.md",
+    "docs/WORKFLOW.md",
+    "feature-map.json",
+    ".gitattributes",
+    "packages/app/.gitattributes",
+    "id_rsa",
+    "id_rsa.pub",
+    "id_rsa-backup",
+    "keys/ID_RSA.PEM",
+    "src/Deploy.KEY",
+    "nested/ID_RSA.PEM",
+    "nested/keys/id_ed25519_deploy",
+    "apps/web/.env.production",
+    "apps/web/.ENV",
+    ".github/workflows/ci.yml",
+    ".gitmodules",
+    "docs/CODEOWNERS",
+    ".claude/settings.json",
+    "packages/app/.npmrc",
+    "apps/backend/src/migrations/1700000_init.ts",
+    "config/service.credentials.json"
+  ],
+  "expected_allow_samples": [
+    "src/index.ts",
+    "apps/server/src/id_helper.ts",
+    "packages/ui/src/button.tsx"
+  ]
+}

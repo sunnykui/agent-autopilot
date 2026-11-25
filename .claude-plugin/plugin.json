@@ -1,13 +1,13 @@
 {
-  "name": "codex-dispatch",
+  "name": "agent-autopilot",
   "version": "0.2.0",
-  "description": "Zero-touch Claude Code -> OpenAI Codex CLI orchestrator: contract-driven coding, pre-coding architecture critique, executable file-allowlist gates, and token-saving receipts.",
+  "description": "24x7 self-evolving autonomous issue & routine engine (agent-autopilot) + Claude Code <-> OpenAI Codex CLI orchestrator (codex-dispatch).",
   "author": {
     "name": "sunnykui",
     "url": "https://github.com/sunnykui"
   },
-  "homepage": "https://github.com/sunnykui/codex-dispatch",
-  "repository": "https://github.com/sunnykui/codex-dispatch",
+  "homepage": "https://github.com/sunnykui/agent-autopilot",
+  "repository": "https://github.com/sunnykui/agent-autopilot",
   "license": "MIT",
   "skills": "./skills"
 }
