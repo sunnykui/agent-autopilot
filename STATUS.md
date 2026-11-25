@@ -43,9 +43,13 @@ agent-autopilot run-once --project <project_id>
 agent-autopilot veto <org/repo#number> --reason "manual review"
 agent-autopilot clear-veto <org/repo#number>
 
-# 5. 10 秒将任意新仓库接入自治体系
+# 5. 10 秒将任意新仓库或任意自定义定时任务接入自治体系
 agent-autopilot onboard --project-id <project_id> --kind issue \
   --workspace /path/to/repo --repos <org/repo> --base-ref main --tier T1
+
+agent-autopilot onboard --project-id <routine_id> --kind routine \
+  --workspace /path/to/repo --interval-sec 1800 \
+  --precheck-cmd "test -s queue.txt" --routine-prompt "处理队列并更新状态"
 
 # 6. 满 10 单 48 小时零回滚后，批准并发阶梯从 1 升到 2（最高 3）
 agent-autopilot approve-promotion <project_id>

@@ -31,6 +31,11 @@ agent-autopilot selftest --live
 agent-autopilot onboard --project-id my-app --kind issue \
   --workspace /path/to/repo --repos org/my-app --base-ref main --tier T1
 
+agent-autopilot onboard --project-id my-cron --kind routine \
+  --workspace /path/to/repo --interval-sec 1800 \
+  --precheck-cmd "python3 scripts/has_todo.py" \
+  --routine-prompt "Process pending items and update STATUS.md"
+
 # 3. Zero-LLM-token precheck probe across all projects
 agent-autopilot probe
 

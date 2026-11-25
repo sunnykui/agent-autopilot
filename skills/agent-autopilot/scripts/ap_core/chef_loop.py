@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .db import AutopilotDB
+from .dream import sync_project_pitfalls_markdown
 from .git_gate import CandidateGateResult, prepare_isolated_worktree, resolve_repo_common_objects_dir, sample_and_gate_worktree
 from .github_flow import GitHubTransport, execute_granted_op
 from .models import (
@@ -354,6 +355,7 @@ def execute_chef_issue_pipeline(
                     symptom=f"Scope gate rejected edit: {exc.violations[0] if exc.violations else exc}",
                     rule_text=f"Never modify hard-stop or out-of-scope paths ({', '.join(frozen_scope[:3])})",
                 )
+                sync_project_pitfalls_markdown(db, cfg.project_id, advisory_dir=advisory_dir)
                 if exc.is_lockfile:
                     db.mark_unit_needs_human(unit_key, f"Lockfile change requires human approval: {exc.violations}", non_veto=True)
                     return {"status": "needs-human", "reason": "lockfile_escalation", "defect_trajectory": defect_trajectory}
@@ -389,6 +391,7 @@ def execute_chef_issue_pipeline(
                     symptom=f"verify_ring DoD exited {v_rc}",
                     rule_text=f"Ensure `{dod_cmd}` passes cleanly before submitting candidate",
                 )
+                sync_project_pitfalls_markdown(db, cfg.project_id, advisory_dir=advisory_dir)
                 reserved_fail_round = db.reserve_review_round(unit_key)
                 if reserved_fail_round is None or reserved_fail_round >= max_rounds:
                     db.mark_unit_needs_human(unit_key, f"DoD failed after {max_rounds} rounds: {v_out[:240]}", non_veto=True)
@@ -458,6 +461,7 @@ def execute_chef_issue_pipeline(
                     symptom=f"{d0['location']}: {d0['failure_case']}",
                     rule_text=f"In {d0['location']}, {d0['minimal_fix']}",
                 )
+                sync_project_pitfalls_markdown(db, cfg.project_id, advisory_dir=advisory_dir)
             defect_feedback = f"<referee_defects round='{reserved_round}'>\n{json.dumps(defects, ensure_ascii=False, indent=2)}\n</referee_defects>"
     finally:
         for _g in open_gates:

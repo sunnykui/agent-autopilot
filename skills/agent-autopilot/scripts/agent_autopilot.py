@@ -1197,6 +1197,72 @@ def _execute_lark_payments_payload(cfg: WorkflowConfig, db: AutopilotDB, pending
     }
 
 
+def _execute_custom_routine_payload(cfg: WorkflowConfig, db: AutopilotDB) -> tuple[bool, dict[str, Any]]:
+    """Execute a universal custom routine via deterministic shell `routine_cmd` or sandboxed `codex exec` `routine_prompt`."""
+    from ap_core.dream import sync_project_pitfalls_markdown
+
+    ws = Path(cfg.workspace_path).expanduser().resolve()
+    routine_cmd = str(cfg.extra.get("routine_cmd") or "").strip()
+    routine_prompt = str(cfg.extra.get("routine_prompt") or cfg.prompt_body or "").strip()
+    t0 = time.monotonic()
+    if routine_cmd:
+        proc = subprocess.run(
+            ["/bin/bash", "-lc", routine_cmd],
+            cwd=str(ws) if ws.is_dir() else None,
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+        mode = "routine_cmd"
+    else:
+        codex_bin = shutil.which("codex") or "/usr/local/bin/codex"
+        proc = subprocess.run(
+            [
+                codex_bin,
+                "exec",
+                "-C",
+                str(ws),
+                "-s",
+                "workspace-write",
+                "-c",
+                "features.multi_agent=false",
+                "--skip-git-repo-check",
+                "-",
+            ],
+            input=routine_prompt,
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+        mode = "routine_prompt"
+    dur_ms = int((time.monotonic() - t0) * 1000)
+    ok = proc.returncode == 0
+    if not ok:
+        with db.immediate_tx():
+            db._conn.execute("DELETE FROM routine_cursors WHERE project_id = ?", (cfg.project_id,))
+        db.record_pitfall(
+            project_id=cfg.project_id,
+            target_area="routine",
+            symptom=f"Custom routine ({mode}) exited {proc.returncode}",
+            rule_text=sanitize_terminal_text(proc.stderr or proc.stdout or "Verify routine command/prompt prerequisites", 180),
+        )
+        sync_project_pitfalls_markdown(db, cfg.project_id)
+    with db.immediate_tx():
+        db._conn.execute(
+            "INSERT INTO run_history(run_id, project_id, unit_key, status, duration_ms, completed_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (f"run-{uuid.uuid4().hex[:12]}", cfg.project_id, f"{cfg.project_id}:routine", "succeeded" if ok else "failed", dur_ms, now_iso()),
+        )
+    return ok, {
+        "project_id": cfg.project_id,
+        "mode": mode,
+        "status": "succeeded" if ok else "failed",
+        "duration_ms": dur_ms,
+        "exit_code": proc.returncode,
+    }
+
+
 def _worker_root_env(state_root: Path) -> dict[str, str]:
     return {
         "AGENT_AUTOPILOT_STATE_DIR": str(state_root.resolve()),
@@ -1630,13 +1696,20 @@ def cmd_worker_exec(args: argparse.Namespace) -> int:
             if c_chk.returncode != 0:
                 raise AutopilotError(f"Pre-model verify_ring cargo toolchain check failed: {c_chk.stderr or c_chk.stdout}")
         secret = load_or_create_hmac_secret(sroot)
+        urow_w = db.get_unit(args.unit_key)
+        issue_num_w = int(urow_w["issue_number"]) if (urow_w and urow_w.get("issue_number")) else 0
+        rich_issue_md = (
+            gh_tr.fetch_issue_context_markdown(repo, issue_num_w, fallback_title=args.issue_title)
+            if issue_num_w > 0
+            else f"{args.unit_key}: {args.issue_title}"
+        )
         try:
             res = execute_chef_issue_pipeline(
                 db=db,
                 cfg=cfg,
                 unit_key=args.unit_key,
                 repo=repo,
-                issue_summary=f"{args.unit_key}: {args.issue_title}",
+                issue_summary=rich_issue_md,
                 claim_epoch=ce,
                 managed_gitdir=mg,
                 worktree_dir=wt_dir,
@@ -1684,7 +1757,10 @@ def cmd_routine_exec(args: argparse.Namespace) -> int:
         if not cl or cl["state"] != "active" or not verify_self_in_expected_cgroup(cl["expected_cgroup_dir"]):
             raise AutopilotError("Refusing routine-exec outside registered active cgroup")
         pending_ids = json.loads(args.pending_ids_json or "[]")
-        ok, payload = _execute_lark_payments_payload(cfg, db, pending_ids)
+        if cfg.routine_driver == "lark_payments":
+            ok, payload = _execute_lark_payments_payload(cfg, db, pending_ids)
+        else:
+            ok, payload = _execute_custom_routine_payload(cfg, db)
         with db.immediate_tx():
             if ok:
                 db._conn.execute(
@@ -1888,6 +1964,13 @@ def cmd_selftest(args: argparse.Namespace) -> int:
 def cmd_onboard(args: argparse.Namespace) -> int:
     repos = [r.strip() for r in (args.repos or "").split(",") if r.strip()]
     scope = [s.strip() for s in (args.write_scope or "").split(",") if s.strip()] or None
+    extra: dict[str, Any] = {}
+    if getattr(args, "precheck_cmd", ""):
+        extra["precheck_cmd"] = args.precheck_cmd
+    if getattr(args, "routine_cmd", ""):
+        extra["routine_cmd"] = args.routine_cmd
+    if getattr(args, "routine_prompt", ""):
+        extra["routine_prompt"] = args.routine_prompt
     res = onboard_project(
         project_id=args.project_id,
         kind=args.kind,
@@ -1900,9 +1983,13 @@ def cmd_onboard(args: argparse.Namespace) -> int:
         verify_cmd=args.verify_cmd,
         write_scope=scope,
         routine_driver=args.routine_driver,
+        delegated_cmd=getattr(args, "delegated_cmd", ""),
         token_file=args.token_file,
+        assignee=getattr(args, "assignee", "@me"),
         schedule_interval_sec=args.interval_sec,
         enabled=not args.disabled,
+        extra=extra or None,
+        prompt_body=getattr(args, "routine_prompt", ""),
         overwrite=args.overwrite,
     )
     db = AutopilotDB(default_state_root() / "autopilot.db")
@@ -2019,7 +2106,7 @@ def cmd_run_once(args: argparse.Namespace) -> int:
                     f"WORKFLOW.md for {cfg.project_id} changed or was disabled during precheck; discarding stale probe"
                 )
             db.upsert_project(fresh_cfg)
-            if fresh_cfg.kind == "routine" and fresh_cfg.routine_driver == "lark_payments":
+            if fresh_cfg.kind == "routine" and fresh_cfg.routine_driver in ("lark_payments", "custom", ""):
                 submitted = _submit_routine_worker_nonblocking(
                     cfg=fresh_cfg, db=db, state_root=sroot, pending_ids=list(probe.get("pending_ids") or [])
                 )
@@ -2202,7 +2289,7 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
 
                 if fresh_wf.kind == "routine" and fresh_wf.routine_driver == "dream":
                     executed.append({"project_id": pid, "dream": run_dream_consolidation(db, state_root=sroot)})
-                elif fresh_wf.kind == "routine" and fresh_wf.routine_driver == "lark_payments":
+                elif fresh_wf.kind == "routine" and fresh_wf.routine_driver in ("lark_payments", "custom", ""):
                     with contextlib.suppress(AutopilotError, subprocess.SubprocessError, OSError):
                         executed.append(
                             _submit_routine_worker_nonblocking(
@@ -2553,6 +2640,11 @@ def build_parser() -> argparse.ArgumentParser:
     ob.add_argument("--verify-cmd", default=None)
     ob.add_argument("--write-scope", default="")
     ob.add_argument("--routine-driver", default="")
+    ob.add_argument("--precheck-cmd", default="", help="Optional zero-token shell precheck for custom routines (exit 0 = run, non-zero = skip).")
+    ob.add_argument("--routine-cmd", default="", help="Optional shell command to run for custom routines.")
+    ob.add_argument("--routine-prompt", default="", help="Optional LLM prompt for custom routines when no --routine-cmd is set.")
+    ob.add_argument("--delegated-cmd", default="", help="Command for --kind delegated.")
+    ob.add_argument("--assignee", default="@me", help="GitHub assignee filter ('@me', username, or '*' for all open issues).")
     ob.add_argument("--token-file", default="")
     ob.add_argument("--interval-sec", type=int, default=300)
     ob.add_argument("--disabled", action="store_true")

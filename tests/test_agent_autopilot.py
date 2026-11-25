@@ -4999,6 +4999,88 @@ class TestCodeReviewHardeningInvariants(unittest.TestCase):
             finally:
                 db29.close()
 
+    def test_universal_custom_routine_full_issue_body_and_instant_pitfall_sync(self) -> None:
+        """Verify 1-command universal custom scheduled routine, full GitHub Issue body+comments fetch, and instant PITFALLS.md sync."""
+        from unittest import mock
+        import agent_autopilot as ap_cli
+        from ap_core.dream import sync_project_pitfalls_markdown
+        from ap_core.github_flow import LiveGitHubCliTransport
+        from ap_core.models import parse_workflow_file
+        from ap_core.routine_flow import probe_project_zero_token
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            croot = base / "cfg"
+            sroot = base / "state"
+            ws = base / "any_repo"
+            ws.mkdir(parents=True)
+            marker = ws / "need_sync.flag"
+
+            # 1. One-command `onboard_project` for ANY custom scheduled routine (`--precheck-cmd` + `--routine-cmd`):
+            ob_res = onboard_project(
+                project_id="any-cron",
+                kind="routine",
+                workspace_path=ws,
+                schedule_interval_sec=600,
+                extra={
+                    "precheck_cmd": "test -f need_sync.flag",
+                    "routine_cmd": "rm -f need_sync.flag && echo DONE > synced.txt",
+                },
+                config_root=croot,
+                state_root=sroot,
+                overwrite=True,
+            )
+            wf = parse_workflow_file(Path(ob_res["workflow_path"]))
+            self.assertEqual(wf.routine_driver, "custom")
+
+            db = AutopilotDB(sroot / "autopilot.db")
+            try:
+                db.upsert_project(wf)
+                # Without flag file -> zero-token precheck skips (`actionable == False`)!
+                p_idle = probe_project_zero_token(wf, db)
+                self.assertFalse(p_idle["actionable"])
+                self.assertIn("precheck_quiescent", p_idle["reason"])
+
+                # Create flag file -> zero-token precheck triggers (`actionable == True`), and custom routine executes cleanly!
+                marker.write_text("1\n", encoding="utf-8")
+                p_ready = probe_project_zero_token(wf, db)
+                self.assertTrue(p_ready["actionable"])
+                ok_run, payload = ap_cli._execute_custom_routine_payload(wf, db)
+                self.assertTrue(ok_run)
+                self.assertEqual(payload["mode"], "routine_cmd")
+                self.assertEqual((ws / "synced.txt").read_text(encoding="utf-8").strip(), "DONE")
+                self.assertFalse(marker.exists())
+
+                # 2. Instantaneous `PITFALLS.md` sync without waiting 24h for `dream`:
+                db.record_pitfall(
+                    project_id="any-cron",
+                    target_area="api",
+                    symptom="forgot timeout on requests.get",
+                    rule_text="Always pass timeout=15 on outbound HTTP calls",
+                )
+                pit_path = sync_project_pitfalls_markdown(db, "any-cron", state_root=sroot)
+                self.assertIn("Always pass timeout=15", pit_path.read_text(encoding="utf-8"))
+
+                # 3. `fetch_issue_context_markdown` formats full GitHub Issue title, labels, body, and comments:
+                tr = LiveGitHubCliTransport(token="ghp_fake_test_tok", cache_dir=base / "gh_cache", require_explicit_token=True)
+                fake_gh_json = json.dumps(
+                    {
+                        "number": 42,
+                        "title": "Fix race in session refresh",
+                        "body": "Steps to reproduce:\n1. Open 2 tabs\n2. Token refresh collides",
+                        "labels": [{"name": "P1"}, {"name": "bug"}],
+                        "comments": [{"author": {"login": "alice"}, "body": "Please guard with a mutex."}],
+                    }
+                )
+                with mock.patch("subprocess.run", return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout=fake_gh_json, stderr="")):
+                    md = tr.fetch_issue_context_markdown("org/app", 42)
+                self.assertIn("## Issue Description", md)
+                self.assertIn("Token refresh collides", md)
+                self.assertIn("@alice", md)
+                self.assertIn("Please guard with a mutex.", md)
+            finally:
+                db.close()
+
 
 if __name__ == "__main__":
     unittest.main()

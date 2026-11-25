@@ -79,11 +79,11 @@ def probe_github_issues_zero_token(cfg: WorkflowConfig, db: AutopilotDB) -> dict
             "--state",
             "open",
             "--limit",
-            "25",
+            "100",
             "--json",
             "number,title,labels,assignees,updatedAt",
         ]
-        if cfg.assignee:
+        if cfg.assignee and cfg.assignee not in ("*", "all", "ALL"):
             cmd.extend(["--assignee", cfg.assignee])
         try:
             proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=25, check=False)
@@ -261,6 +261,46 @@ def probe_delegated_zero_token(cfg: WorkflowConfig, db: AutopilotDB) -> dict[str
     return probe_github_issues_zero_token(cfg, db)
 
 
+def probe_custom_routine_zero_token(cfg: WorkflowConfig, db: AutopilotDB) -> dict[str, Any]:
+    """Universal zero-LLM-token probe for any custom scheduled routine (`--kind routine`)."""
+    if not cfg.enabled:
+        return {"actionable": False, "reason": "project_disabled"}
+    active = db._conn.execute(
+        "SELECT COUNT(*) AS c FROM run_claims WHERE project_id = ? AND state IN ('active', 'reclaiming')",
+        (cfg.project_id,),
+    ).fetchone()["c"]
+    if int(active) > 0:
+        return {"actionable": False, "reason": "already_running_in_autopilot"}
+    if cfg.max_per_day > 0:
+        day_start = dt.datetime.now(dt.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        today_cnt = db._conn.execute(
+            "SELECT COUNT(*) AS c FROM run_claims WHERE project_id = ? AND created_at >= ?",
+            (cfg.project_id, day_start),
+        ).fetchone()["c"]
+        if int(today_cnt) >= cfg.max_per_day:
+            return {"actionable": False, "reason": f"daily_cap_reached:{today_cnt}/{cfg.max_per_day}"}
+
+    precheck_cmd = str(cfg.extra.get("precheck_cmd") or "").strip()
+    if not precheck_cmd:
+        return {"actionable": True, "reason": "scheduled_interval_due"}
+
+    ws = Path(cfg.workspace_path).expanduser().resolve()
+    try:
+        proc = subprocess.run(
+            ["/bin/bash", "-lc", precheck_cmd],
+            cwd=str(ws) if ws.is_dir() else None,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        return {"actionable": False, "reason": f"precheck_error:{sanitize_terminal_text(str(exc), 160)}"}
+    if proc.returncode == 0:
+        return {"actionable": True, "reason": "precheck_cmd_matched"}
+    return {"actionable": False, "reason": f"precheck_quiescent:rc={proc.returncode}"}
+
+
 def probe_project_zero_token(cfg: WorkflowConfig, db: AutopilotDB) -> dict[str, Any]:
     """Dispatch zero-token precheck for any project kind without waking any LLM."""
     if cfg.kind == "issue":
@@ -277,4 +317,6 @@ def probe_project_zero_token(cfg: WorkflowConfig, db: AutopilotDB) -> dict[str, 
                 "actionable": int(cnt) > 0 or int(hist) > 0,
                 "reason": f"pitfalls={cnt},unmatured_runs={hist}",
             }
+        if cfg.routine_driver in ("custom", ""):
+            return probe_custom_routine_zero_token(cfg, db)
     return {"actionable": False, "reason": f"unknown_driver:{cfg.kind}/{cfg.routine_driver}"}

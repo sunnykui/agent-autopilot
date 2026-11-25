@@ -1063,6 +1063,50 @@ class LiveGitHubCliTransport:
         login = proc.stdout.strip() if proc.returncode == 0 else ""
         return login or None
 
+    def fetch_issue_context_markdown(self, repo: str, issue_number: int, *, fallback_title: str = "", max_chars: int = 24000) -> str:
+        """Fetch full GitHub Issue title, labels, body, and recent comments before entering isolated model_ring."""
+        try:
+            proc = subprocess.run(
+                [
+                    "gh",
+                    "issue",
+                    "view",
+                    str(int(issue_number)),
+                    "--repo",
+                    repo,
+                    "--json",
+                    "number,title,body,labels,comments",
+                ],
+                env=self._gh_env(),
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            if proc.returncode != 0:
+                return f"{repo}#{issue_number}: {fallback_title}".strip()
+            data = json.loads(proc.stdout or "{}")
+            title = str(data.get("title") or fallback_title or "")
+            labels = ", ".join(str(l.get("name") or "") for l in (data.get("labels") or []) if l.get("name"))
+            body = str(data.get("body") or "").strip()
+            comments_raw = list(data.get("comments") or [])[-12:]
+            c_lines = []
+            for idx, c in enumerate(comments_raw, 1):
+                author = str((c.get("author") or {}).get("login") or "commenter")
+                cbody = str(c.get("body") or "").strip()
+                if cbody:
+                    c_lines.append(f"[Comment #{idx} by @{author}]\n{cbody[:2000]}")
+            assembled = f"# {repo}#{issue_number}: {title}\n"
+            if labels:
+                assembled += f"Labels: {labels}\n"
+            if body:
+                assembled += f"\n## Issue Description\n{body}\n"
+            if c_lines:
+                assembled += "\n## Recent Discussion\n" + "\n\n".join(c_lines) + "\n"
+            return assembled[:max_chars]
+        except Exception:
+            return f"{repo}#{issue_number}: {fallback_title}".strip()
+
     def _graphql(self, query: str, variables: dict[str, Any], *, use_merge_token: bool = False) -> dict[str, Any]:
         cmd = ["gh", "api", "graphql", "-f", f"query={query}"]
         for k, v in variables.items():

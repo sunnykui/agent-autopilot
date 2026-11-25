@@ -11,6 +11,33 @@ from .db import AutopilotDB
 from .models import POLICY_MANIFEST, default_state_root, ensure_secure_dir, now_iso, now_utc, sanitize_terminal_text
 
 
+def sync_project_pitfalls_markdown(
+    db: AutopilotDB,
+    project_id: str,
+    *,
+    state_root: Path | None = None,
+    advisory_dir: Path | None = None,
+) -> Path:
+    """Immediately refresh `PITFALLS.md` from SQLite so the very next issue run inherits newly learned pitfalls!"""
+    max_chars = int(POLICY_MANIFEST["chef_pipeline"]["max_pitfall_rule_chars"])
+    rows = db._conn.execute(
+        "SELECT * FROM pitfalls WHERE project_id = ? ORDER BY hits DESC, updated_at DESC LIMIT 50",
+        (project_id,),
+    ).fetchall()
+    adv_dir = ensure_secure_dir(advisory_dir if advisory_dir is not None else ((state_root or default_state_root()) / "advisory" / project_id), 0o700)
+    pit_md = adv_dir / "PITFALLS.md"
+    lines = [
+        f"# {project_id} Pitfall Rules (Advisory — Excluded from Referee & Visual)",
+        "",
+    ]
+    for r in rows:
+        sym = sanitize_terminal_text(r["symptom"], max_chars)
+        rul = sanitize_terminal_text(r["rule_text"], max_chars)
+        lines.append(f"- [{r['target_area']}] {sym} -> {rul} (hits={r['hits']})")
+    pit_md.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return pit_md
+
+
 def run_dream_consolidation(
     db: AutopilotDB,
     *,
