@@ -1908,10 +1908,10 @@ class TestCodeReviewHardeningInvariants(unittest.TestCase):
                 tbc_mal = prepare_trusted_base_cache(managed_gitdir=mg_mal, base_sha=mal_sha, cache_root=base / "mal_cache")
                 self.assertIsNotNone(tbc_mal)
 
-            # 8. Nested Rust workspace (`expert-trajectory/Cargo.toml` without root `Cargo.toml`) gets `--manifest-path`!
+            # 8. Nested Rust workspace (`rust-subcrate/Cargo.toml` without root `Cargo.toml`) gets `--manifest-path`!
             nested_ws = base / "nested_rust_ws"
-            (nested_ws / "expert-trajectory").mkdir(parents=True)
-            (nested_ws / "expert-trajectory" / "Cargo.toml").write_text('[package]\nname="et"\nversion="0.1.0"\n', encoding="utf-8")
+            (nested_ws / "rust-subcrate").mkdir(parents=True)
+            (nested_ws / "rust-subcrate" / "Cargo.toml").write_text('[package]\nname="et"\nversion="0.1.0"\n', encoding="utf-8")
             ob_nested = onboard_project(
                 project_id="nested-rs",
                 kind="issue",
@@ -1921,7 +1921,7 @@ class TestCodeReviewHardeningInvariants(unittest.TestCase):
                 state_root=base / "st_n",
             )
             wf_nested = parse_workflow_file(Path(ob_nested["workflow_path"]))
-            self.assertEqual(wf_nested.verify_cmd, "cargo check --manifest-path expert-trajectory/Cargo.toml")
+            self.assertEqual(wf_nested.verify_cmd, "cargo check --manifest-path rust-subcrate/Cargo.toml")
 
             db8 = AutopilotDB(base / "r8.db")
             try:
@@ -2217,11 +2217,11 @@ class TestCodeReviewHardeningInvariants(unittest.TestCase):
             finally:
                 db9.close()
 
-            # 6. Root Cargo workspace with `expert-trajectory/` member preserves `expert-trajectory/**` in `write_scope`!
+            # 6. Root Cargo workspace with `rust-subcrate/` member preserves `rust-subcrate/**` in `write_scope`!
             ws_cargo_root = base / "ws_cargo_root"
-            (ws_cargo_root / "expert-trajectory" / "src").mkdir(parents=True)
-            (ws_cargo_root / "Cargo.toml").write_text('[workspace]\nmembers = ["expert-trajectory"]\n', encoding="utf-8")
-            (ws_cargo_root / "expert-trajectory" / "Cargo.toml").write_text('[package]\nname="et"\nversion="0.1.0"\n', encoding="utf-8")
+            (ws_cargo_root / "rust-subcrate" / "src").mkdir(parents=True)
+            (ws_cargo_root / "Cargo.toml").write_text('[workspace]\nmembers = ["rust-subcrate"]\n', encoding="utf-8")
+            (ws_cargo_root / "rust-subcrate" / "Cargo.toml").write_text('[package]\nname="et"\nversion="0.1.0"\n', encoding="utf-8")
             ob_ws_rs = onboard_project(
                 project_id="ws-rs",
                 kind="issue",
@@ -2232,8 +2232,8 @@ class TestCodeReviewHardeningInvariants(unittest.TestCase):
             )
             wf_ws_rs = parse_workflow_file(Path(ob_ws_rs["workflow_path"]))
             self.assertEqual(wf_ws_rs.verify_cmd, "cargo check")
-            self.assertIn("expert-trajectory/**", wf_ws_rs.write_scope)
-            check_autopilot_scope(["expert-trajectory/src/lib.rs"], wf_ws_rs.write_scope)
+            self.assertIn("rust-subcrate/**", wf_ws_rs.write_scope)
+            check_autopilot_scope(["rust-subcrate/src/lib.rs"], wf_ws_rs.write_scope)
 
     def test_round10_all_codex_closures(self) -> None:
         """Regression suite covering all 5 Round-10 Codex Astra findings."""
@@ -5078,6 +5078,230 @@ class TestCodeReviewHardeningInvariants(unittest.TestCase):
                 self.assertIn("Token refresh collides", md)
                 self.assertIn("@alice", md)
                 self.assertIn("Please guard with a mutex.", md)
+            finally:
+                db.close()
+
+    def test_universal_require_labels_toolchains_and_verify_env(self) -> None:
+        """Verify universal require_labels, delegated precheck_cmd, stateless SDK discovery, ro_workspace_deps, and AP_TOUCHED_FILES."""
+        from unittest import mock
+        from ap_core.chef_loop import run_verify_ring_command
+        from ap_core.models import ensure_secure_dir, parse_workflow_file
+        from ap_core.onboard import onboard_project
+        from ap_core.routine_flow import probe_project_zero_token
+        from ap_core.sandbox import build_execution_ring_bwrap, cleanup_workspace_node_modules_mountpoints
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            ws = ensure_secure_dir(base / "repo", 0o700)
+            ensure_secure_dir(ws / "scripts", 0o700)
+            (ws / "scripts" / "check.sh").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            croot = ensure_secure_dir(base / "cfg", 0o700)
+            sroot = ensure_secure_dir(base / "state", 0o700)
+
+            # 1. Universal `require_labels` via `onboard_project` -> `WORKFLOW.md` -> `probe_project_zero_token`:
+            ob = onboard_project(
+                project_id="univ-proj",
+                kind="issue",
+                workspace_path=ws,
+                repos=["org/univ"],
+                require_labels=["agent:auto"],
+                config_root=croot,
+                state_root=sroot,
+                overwrite=True,
+            )
+            wf = parse_workflow_file(Path(ob["workflow_path"]))
+            self.assertEqual(wf.require_labels, ("agent:auto",))
+            self.assertEqual(wf.verify_cmd, "bash scripts/check.sh")
+
+            db = AutopilotDB(sroot / "autopilot.db")
+            try:
+                db.upsert_project(wf)
+                captured_cmds: list[list[str]] = []
+
+                def _fake_gh_list(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+                    captured_cmds.append(list(cmd))
+                    payload = json.dumps(
+                        [
+                            {"number": 10, "title": "Manual issue", "labels": [{"name": "bug"}], "assignees": [], "updatedAt": "2026-01-01T00:00:00Z"},
+                            {"number": 11, "title": "Auto issue", "labels": [{"name": "bug"}, {"name": "agent:auto"}], "assignees": [], "updatedAt": "2026-01-01T00:00:00Z"},
+                        ]
+                    )
+                    return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=payload, stderr="")
+
+                with mock.patch("subprocess.run", side_effect=_fake_gh_list):
+                    prb = probe_project_zero_token(wf, db)
+                self.assertTrue(prb["actionable"])
+                self.assertEqual([c["number"] for c in prb["candidates"]], [11])
+                self.assertIn("--label", captured_cmds[0])
+                self.assertIn("agent:auto", captured_cmds[0])
+
+                # 2. Universal delegated `extra.precheck_cmd` when no open GitHub issues exist:
+                del_ob = onboard_project(
+                    project_id="univ-del",
+                    kind="delegated",
+                    workspace_path=ws,
+                    repos=["org/univ"],
+                    require_labels=["agent:auto"],
+                    extra={"precheck_cmd": "test -f pending_continuation.flag"},
+                    config_root=croot,
+                    state_root=sroot,
+                    overwrite=True,
+                )
+                wf_del = parse_workflow_file(Path(del_ob["workflow_path"]))
+                db.upsert_project(wf_del)
+                real_sub_run = subprocess.run
+
+                def _fake_del_sub(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+                    if cmd and cmd[0] == "gh":
+                        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="[]", stderr="")
+                    return real_sub_run(cmd, **kwargs)
+
+                with mock.patch("subprocess.run", side_effect=_fake_del_sub):
+                    self.assertFalse(probe_project_zero_token(wf_del, db)["actionable"])
+                    (ws / "pending_continuation.flag").write_text("1\n", encoding="utf-8")
+                    del_ready = probe_project_zero_token(wf_del, db)
+                    self.assertTrue(del_ready["actionable"])
+                    self.assertEqual(del_ready["reason"], "delegated_precheck_matched")
+
+                # 3. Universal `AP_TOUCHED_FILES` + `extra_verify_env` + `ro_workspace_deps`:
+                ct = ensure_secure_dir(base / "ct", 0o700)
+                ensure_secure_dir(ct / "apps" / "web", 0o700)
+                (ct / "apps" / "web" / "index.ts").write_text("export const x = 1;\n", encoding="utf-8")
+                vo = base / "vo"
+                rc_v, _, out_v = run_verify_ring_command(
+                    clean_tree_dir=ct,
+                    verify_out_dir=vo,
+                    dod_cmd='printf "TOUCHED=%s|TZ=%s" "$AP_TOUCHED_FILES" "$TZ"',
+                    use_bwrap=False,
+                    touched_paths=("apps/web/index.ts",),
+                    extra_verify_env={"TZ": "UTC"},
+                )
+                self.assertEqual(rc_v, 0)
+                self.assertIn("TOUCHED=apps/web/index.ts|TZ=UTC", out_v)
+
+                ensure_secure_dir(ws / "apps" / "web" / "node_modules", 0o700)
+                wt_t = ensure_secure_dir(base / "wt_t", 0o700)
+                ensure_secure_dir(wt_t / "apps" / "web", 0o700)
+                (wt_t / ".git").write_text("gitdir: /tmp/fake\n", encoding="utf-8")
+                r_fds: list[int] = []
+                try:
+                    t_argv = build_execution_ring_bwrap(
+                        ring_kind="tool_ring",
+                        inner_cmd=["/bin/true"],
+                        cwd=wt_t,
+                        worktree=wt_t,
+                        ephemeral_tool_cache=ensure_secure_dir(base / "eph", 0o700),
+                        shared_tmp=ensure_secure_dir(base / "stmp", 0o700),
+                        retain_fds=r_fds,
+                        repo_main_dir=ws,
+                        ro_workspace_deps=("apps/web/node_modules",),
+                    )
+                    self.assertIn("--ro-bind-fd", t_argv)
+                    self.assertTrue((wt_t / "apps" / "web" / "node_modules").is_dir())
+                finally:
+                    for fd_x in r_fds:
+                        os.close(fd_x)
+                cleanup_workspace_node_modules_mountpoints(None, wt_t, extra_rel_mounts=("apps/web/node_modules",))
+                self.assertFalse((wt_t / "apps" / "web" / "node_modules").exists())
+
+                # 4. Round-2 adversarial closures: scalar `require_labels`, overlap rejection, non-SDK dir exclusion, semantic Go sort, reserved env guard:
+                from ap_core.models import PolicyFreezeError
+                from ap_core.sandbox import discover_host_stateless_toolchains
+
+                scalar_wf = base / "scalar_wf.md"
+                scalar_wf.write_text(
+                    '---\n{"project_id":"sc-p","kind":"issue","enabled":true,"repos":["o/r"],"workspace_path":"/tmp","write_scope":["src/**"],"require_labels":"agent:auto"}\n---\n# body\n',
+                    encoding="utf-8",
+                )
+                self.assertEqual(parse_workflow_file(scalar_wf).require_labels, ("agent:auto",))
+
+                bad_overlap_wf = base / "overlap_wf.md"
+                bad_overlap_wf.write_text(
+                    '---\n{"project_id":"ov-p","kind":"issue","enabled":true,"repos":["o/r"],"workspace_path":"/tmp","write_scope":["src/**"],"require_labels":["agent:blocked"]}\n---\n# body\n',
+                    encoding="utf-8",
+                )
+                with self.assertRaises(PolicyFreezeError):
+                    parse_workflow_file(bad_overlap_wf)
+
+                fake_h = ensure_secure_dir(base / "fake_home_sdk", 0o700)
+                ensure_secure_dir(fake_h / ".local" / "gopass", 0o700)
+                ensure_secure_dir(fake_h / ".local" / "google-cloud-sdk", 0o700)
+                ensure_secure_dir(fake_h / ".local" / "node_modules", 0o700)
+                go19 = ensure_secure_dir(fake_h / ".local" / "go1.9", 0o700)
+                ensure_secure_dir(go19 / "bin", 0o700)
+                ensure_secure_dir(go19 / "src" / "runtime", 0o700)
+                (go19 / "bin" / "go").write_text("#!/bin/sh\n", encoding="utf-8")
+                (go19 / "VERSION").write_text("go1.9.7\n", encoding="utf-8")
+                go121 = ensure_secure_dir(fake_h / ".local" / "go1.21", 0o700)
+                ensure_secure_dir(go121 / "bin", 0o700)
+                ensure_secure_dir(go121 / "src" / "runtime", 0o700)
+                (go121 / "bin" / "go").write_text("#!/bin/sh\n", encoding="utf-8")
+                (go121 / "VERSION").write_text("go1.21.5\n", encoding="utf-8")
+                ro_d, _, picked_go = discover_host_stateless_toolchains(fake_h)
+                self.assertEqual(picked_go, go121.resolve())
+                for forbidden_d in ("gopass", "google-cloud-sdk", "node_modules"):
+                    self.assertNotIn((fake_h / ".local" / forbidden_d).resolve(), ro_d)
+
+                rc_v2, _, out_v2 = run_verify_ring_command(
+                    clean_tree_dir=ct,
+                    verify_out_dir=base / "vo2",
+                    dod_cmd='printf "T=%s|P=%s" "$AP_TOUCHED_FILES" "$LD_PRELOAD"',
+                    use_bwrap=False,
+                    touched_paths=("apps/web/index.ts",),
+                    extra_verify_env={"AP_TOUCHED_FILES": "SPOOFED", "LD_PRELOAD": "/evil.so", "PATH": "/bad"},
+                )
+                self.assertEqual(rc_v2, 0)
+                self.assertIn("T=apps/web/index.ts|P=", out_v2)
+
+                # 5. Go `GOPRIVATE=*.corp.com` element-prefix matching + `replace` + `go.sum` + `vendor/` subtree exclusion:
+                from ap_core.git_gate import prepare_trusted_base_cache_fd
+
+                go_repo = ensure_secure_dir(base / "go_priv_repo", 0o700)
+                subprocess.run(["git", "-C", str(go_repo), "init", "-q"], check=True)
+                subprocess.run(["git", "-C", str(go_repo), "config", "user.email", "t@example.com"], check=True)
+                subprocess.run(["git", "-C", str(go_repo), "config", "user.name", "t"], check=True)
+                (go_repo / "go.mod").write_text("module example.com/app\n\ngo 1.21\n\nrequire git.corp.com/team/pkg v1.0.0\n", encoding="utf-8")
+                (go_repo / "go.sum").write_text("git.corp.com/team/pkg v1.0.0 h1:abc=\n", encoding="utf-8")
+                subprocess.run(["git", "-C", str(go_repo), "add", "."], check=True)
+                subprocess.run(["git", "-C", str(go_repo), "commit", "-q", "-m", "init"], check=True)
+                g_sha = subprocess.run(["git", "-C", str(go_repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+                g_mg = ensure_managed_bare_repo(go_repo, ensure_secure_dir(base / "g_mg", 0o700) / "managed.git")
+                with mock.patch.dict(os.environ, {"GOPRIVATE": "*.corp.com"}):
+                    with self.assertRaises(AutopilotError) as g_ctx:
+                        prepare_trusted_base_cache_fd(managed_gitdir=g_mg, base_sha=g_sha, cache_root=ensure_secure_dir(base / "g_cache", 0o700))
+                    self.assertIn("git.corp.com/team/pkg", str(g_ctx.exception))
+
+                # Also verify GOENV-persisted GOPRIVATE (when os.environ lacks GOPRIVATE) AND fail-closed when `go env -json` fails:
+                goenv_file = base / "go.env"
+                goenv_file.write_text("GOPRIVATE=*.corp.com\n", encoding="utf-8")
+                env_no_gp = {k: v for k, v in os.environ.items() if k not in ("GOPRIVATE", "GONOPROXY")}
+                env_no_gp["GOENV"] = str(goenv_file)
+                with mock.patch.dict(os.environ, env_no_gp, clear=True):
+                    with self.assertRaises(AutopilotError) as ge_ctx:
+                        prepare_trusted_base_cache_fd(managed_gitdir=g_mg, base_sha=g_sha, cache_root=ensure_secure_dir(base / "g_cache2", 0o700))
+                    self.assertIn("git.corp.com/team/pkg", str(ge_ctx.exception))
+
+                env_bad_goenv = {k: v for k, v in os.environ.items() if k not in ("GOPRIVATE", "GONOPROXY")}
+                env_bad_goenv["GOENV"] = str(base / "nonexistent-go.env")
+                with mock.patch.dict(os.environ, env_bad_goenv, clear=True):
+                    with mock.patch("ap_core.sandbox.run_isolated_deps_prefetch") as mock_pf:
+                        with self.assertRaises(AutopilotError) as gmiss_ctx:
+                            prepare_trusted_base_cache_fd(managed_gitdir=g_mg, base_sha=g_sha, cache_root=ensure_secure_dir(base / "g_cache_miss", 0o700))
+                        self.assertIn("Explicit GOENV file", str(gmiss_ctx.exception))
+                        mock_pf.assert_not_called()
+
+                real_run_gp = subprocess.run
+
+                def _fail_go_env(cmd: Any, *a: Any, **kw: Any) -> Any:
+                    if isinstance(cmd, list) and len(cmd) >= 3 and cmd[1:3] == ["env", "-json"]:
+                        return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="broken go env")
+                    return real_run_gp(cmd, *a, **kw)
+
+                with mock.patch.dict(os.environ, {k: v for k, v in os.environ.items() if k not in ("GOPRIVATE", "GONOPROXY")}, clear=True):
+                    with mock.patch("subprocess.run", side_effect=_fail_go_env):
+                        with self.assertRaises(AutopilotError) as gf_ctx:
+                            prepare_trusted_base_cache_fd(managed_gitdir=g_mg, base_sha=g_sha, cache_root=ensure_secure_dir(base / "g_cache3", 0o700))
+                        self.assertIn("go env -json failed", str(gf_ctx.exception))
             finally:
                 db.close()
 

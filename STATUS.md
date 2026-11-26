@@ -1,6 +1,6 @@
 # `agent-autopilot` 交接状态与通用运维手册（`STATUS.md`）
 
-更新时间：2026-11-24（`America/Los_Angeles`）
+更新时间：2026-11-25（`America/Los_Angeles`）
 仓库：`sunnykui/agent-autopilot`
 
 ---
@@ -9,8 +9,9 @@
 
 1. **双模型对抗性审查全部 `APPROVE`**：
    - 架构规范（[`docs/AUTOPILOT_PLAN.md`](docs/AUTOPILOT_PLAN.md) v7.8）：Claude Fable 5.2 + Codex GPT-6.2 Astra 双 `APPROVE`。
-   - 全量代码实现审查（30 轮增量对抗挑刺）：Claude Fable 5.2 / Sonnet 5.5 + Codex GPT-6.2 Astra 双 `APPROVE`（0 个 P0/P1 阻塞项）。
-   - 自动化验证：`python3 -B -m unittest discover -s tests -p "test_*.py"` **41/41 全部通过**，`agent-autopilot selftest --live` **通过**（`schema_version = 16`）。
+   - 全量代码实现审查（30+ 轮增量对抗挑刺）：Claude Fable 5.2 / Sonnet 5.5 + Codex GPT-6.2 Astra 双 `APPROVE`（0 个 P0/P1 阻塞项）。
+   - 通用试点增强（2026-11-25）：新增全项目通用的 `--require-labels` 标签准入过滤、无状态多语言 SDK 自动发现（Node / Go / Rust / Terraform / uv，零版本号硬编码）、`go.sum` 离线 `GOMODCACHE` 预取、`ro_workspace_deps` 受控只读依赖挂载、`AP_TOUCHED_FILES` 干净树改动集注入，以及 `delegated` 模式只读断网 `bwrap` 续做预检。
+   - 自动化验证：`python3 -B -m unittest discover -s tests -p "test_*.py"` **43/43 全部通过**，`agent-autopilot selftest --live` **通过**（`schema_version = 16`）。
 2. **零个人/业务敏感硬编码**：
    - 仓库内源码与文档已彻底剥离个人邮箱、内部仓库名、宿主机用户路径及任何凭据；
    - 各业务仓库、邮箱地址、忽略发件人列表与专用 Token 路径全部隔离在宿主机本机目录 `~/.config/agent-autopilot/`（`0600`）与 `~/.local/state/agent-autopilot/`（`0700`，本机实例台账见 `~/.local/state/agent-autopilot/HOST_STATUS.md`）。

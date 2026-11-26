@@ -201,6 +201,30 @@ def _make_memfd_with_bytes(name: str, data: bytes) -> int:
             os.close(mfd)
 
 
+def _project_codex_auth_for_sandbox(raw_auth: Any) -> dict[str, Any]:
+    """Project Codex CLI `auth.json` satisfying Rust `TokenData` serde schema while stripping real `refresh_token`."""
+    from .models import now_iso
+
+    if not isinstance(raw_auth, dict):
+        return {}
+    toks = raw_auth.get("tokens")
+    if isinstance(toks, dict) and toks.get("access_token"):
+        return {
+            "auth_mode": raw_auth.get("auth_mode") or "chatgpt",
+            "OPENAI_API_KEY": None,
+            "tokens": {
+                "id_token": str(toks.get("id_token") or ""),
+                "access_token": toks["access_token"],
+                "refresh_token": "sandbox-norefresh",
+                **({"account_id": toks["account_id"]} if toks.get("account_id") else {}),
+            },
+            "last_refresh": now_iso().replace("+00:00", "Z"),
+        }
+    if isinstance(raw_auth.get("OPENAI_API_KEY"), str) and raw_auth["OPENAI_API_KEY"].strip():
+        return {"auth_mode": "apikey", "OPENAI_API_KEY": raw_auth["OPENAI_API_KEY"].strip()}
+    return {}
+
+
 def prepare_sandbox_home_memfds(
     family: str,
     *,
@@ -261,16 +285,7 @@ def prepare_sandbox_home_memfds(
                     with contextlib.suppress(OSError):
                         fcntl.flock(lfd, fcntl.LOCK_UN)
                     os.close(lfd)
-                projected_codex: dict[str, Any] = {}
-                if isinstance(raw_auth, dict):
-                    toks = raw_auth.get("tokens")
-                    if isinstance(toks, dict) and toks.get("access_token"):
-                        projected_codex["tokens"] = {
-                            "access_token": toks["access_token"],
-                            **({"account_id": toks["account_id"]} if toks.get("account_id") else {}),
-                        }
-                        if raw_auth.get("auth_mode"):
-                            projected_codex["auth_mode"] = raw_auth["auth_mode"]
+                projected_codex = _project_codex_auth_for_sandbox(raw_auth)
                 if projected_codex:
                     out["/home/sandbox/.codex/auth.json"] = _make_memfd_with_bytes(
                         "ap_codex_auth", (json.dumps(projected_codex, indent=2) + "\n").encode("utf-8")
@@ -441,20 +456,7 @@ def prepare_sandbox_home_fd(
                     with contextlib.suppress(OSError):
                         fcntl.flock(lfd, fcntl.LOCK_UN)
                     os.close(lfd)
-                projected_codex: dict[str, Any] = {}
-                if isinstance(raw_auth, dict):
-                    toks = raw_auth.get("tokens")
-                    if isinstance(toks, dict) and toks.get("access_token"):
-                        projected_codex["tokens"] = {
-                            "access_token": toks["access_token"],
-                            **(
-                                {"account_id": toks["account_id"]}
-                                if toks.get("account_id")
-                                else {}
-                            ),
-                        }
-                        if raw_auth.get("auth_mode"):
-                            projected_codex["auth_mode"] = raw_auth["auth_mode"]
+                projected_codex = _project_codex_auth_for_sandbox(raw_auth)
                 if projected_codex:
                     f_dev, f_ino, f_tok_x = _write_registered_secret_file_at_dirfd(
                         sub_fd,
@@ -1123,7 +1125,7 @@ def open_verified_trusted_base_cache_fd(
                 full_p = rp / entry_name
                 st = os.lstat(full_p)
                 if stat.S_ISLNK(st.st_mode):
-                    if entry_name in ("node_modules", "cargo_home", ".ready"):
+                    if entry_name in ("node_modules", "cargo_home", "go_mod_cache", ".ready"):
                         raise SandboxError(f"Refusing symlinked {entry_name!r} inside trusted_base_cache: {full_p}")
                     raw_target = os.readlink(full_p)
                     if os.path.isabs(raw_target):
@@ -1267,26 +1269,96 @@ def prepare_workspace_node_modules_bind_args(
                 os.close(owned_tbc_fd)
 
 
-def cleanup_workspace_node_modules_mountpoints(trusted_base_cache: Path | None, target_tree: Path) -> None:
-    """Remove empty host node_modules mountpoint directories (via O_NOFOLLOW) before Git worktree tree sampling."""
-    if trusted_base_cache is None or not trusted_base_cache.is_dir() or not target_tree.is_dir():
+def prepare_ro_workspace_dep_bind_args(
+    repo_main: Path | None,
+    rel_deps: tuple[str, ...] | list[str],
+    target_tree: Path,
+    *,
+    target_fd: int | None = None,
+    container_target_root: Path | None = None,
+    retain_fds: list[int] | None = None,
+) -> list[str]:
+    """Mount operator-declared read-only workspace dependency dirs via `O_NOFOLLOW` + `--ro-bind-fd` (zero path TOCTOU)."""
+    if not repo_main or not rel_deps:
+        return []
+    if retain_fds is None:
+        raise SandboxError("retain_fds list is required whenever ro_workspace_deps are mounted")
+    if repo_main.is_symlink() or not repo_main.is_dir():
+        return []
+    tgt_real = target_tree.resolve() if target_fd is None else None
+    eff_container_root = container_target_root if container_target_root is not None else tgt_real
+    assert eff_container_root is not None
+    bind_args: list[str] = []
+    for raw_rel in rel_deps:
+        rel = Path(str(raw_rel).strip().strip("/"))
+        if not str(rel) or str(rel) == "." or ".." in rel.parts:
+            continue
+        src_fd = _open_nofollow_subdir_fd(repo_main.resolve(), rel)
+        if src_fd is None:
+            continue
+        pkg_fd: int | None = None
+        transferred = False
+        try:
+            parent_rel = rel.parent
+            leaf = rel.name
+            if target_fd is not None:
+                pkg_fd = _open_nofollow_from_base_fd(target_fd, parent_rel)
+            else:
+                assert tgt_real is not None
+                pkg_fd = _open_nofollow_subdir_fd(tgt_real, parent_rel)
+            if pkg_fd is None:
+                continue
+            try:
+                st = os.stat(leaf, dir_fd=pkg_fd, follow_symlinks=False)
+                if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+                    raise SandboxError(f"Refusing symlink/non-dir ro_workspace_deps mountpoint at {rel}")
+            except FileNotFoundError:
+                os.mkdir(leaf, 0o755, dir_fd=pkg_fd)
+            dst_fd = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=pkg_fd)
+            os.close(dst_fd)
+            retain_fds.append(src_fd)
+            transferred = True
+            bind_args.extend(["--ro-bind-fd", str(src_fd), str(eff_container_root / rel)])
+        finally:
+            if pkg_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(pkg_fd)
+            if not transferred:
+                with contextlib.suppress(OSError):
+                    os.close(src_fd)
+    return bind_args
+
+
+def cleanup_workspace_node_modules_mountpoints(
+    trusted_base_cache: Path | None,
+    target_tree: Path,
+    *,
+    extra_rel_mounts: tuple[str, ...] | list[str] = (),
+) -> None:
+    """Remove empty host node_modules / ro_workspace_deps mountpoint directories (via O_NOFOLLOW) before Git tree sampling."""
+    if not target_tree.is_dir():
         return
-    tbc_real = trusted_base_cache.resolve()
     tgt_real = target_tree.resolve()
-    rel_list: list[Path] = []
-    for root, dirs, _ in os.walk(tbc_real, followlinks=False):
-        rp = Path(root)
-        if "node_modules" in dirs:
-            dirs.remove("node_modules")
-            rel_list.append(rp.relative_to(tbc_real))
-    for rel in sorted(rel_list, key=lambda r: len(r.parts), reverse=True):
+    rel_targets: list[tuple[Path, str]] = []
+    if trusted_base_cache is not None and trusted_base_cache.is_dir():
+        tbc_real = trusted_base_cache.resolve()
+        for root, dirs, _ in os.walk(tbc_real, followlinks=False):
+            rp = Path(root)
+            if "node_modules" in dirs:
+                dirs.remove("node_modules")
+                rel_targets.append((rp.relative_to(tbc_real), "node_modules"))
+    for raw_rel in extra_rel_mounts:
+        rel = Path(str(raw_rel).strip().strip("/"))
+        if str(rel) and str(rel) != "." and ".." not in rel.parts:
+            rel_targets.append((rel.parent, rel.name))
+    for parent_rel, leaf in sorted(rel_targets, key=lambda item: len(item[0].parts), reverse=True):
         with contextlib.suppress(SandboxError, OSError):
-            pkg_fd = _open_nofollow_subdir_fd(tgt_real, rel)
+            pkg_fd = _open_nofollow_subdir_fd(tgt_real, parent_rel)
             if pkg_fd is not None:
                 try:
-                    st = os.stat("node_modules", dir_fd=pkg_fd, follow_symlinks=False)
+                    st = os.stat(leaf, dir_fd=pkg_fd, follow_symlinks=False)
                     if stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode):
-                        os.rmdir("node_modules", dir_fd=pkg_fd)
+                        os.rmdir(leaf, dir_fd=pkg_fd)
                 finally:
                     os.close(pkg_fd)
 
@@ -1389,6 +1461,98 @@ def copy_clean_tree_no_hardlinks(clean_tree: Path, verify_out_dir: Path) -> tupl
         os.close(ct_fd)
 
 
+def _parse_go_sdk_version(sdk_dir: Path) -> tuple[int, int, int] | None:
+    """Extract semantic `(major, minor, patch)` from validated Go SDK `VERSION` file or directory name."""
+    raw = ""
+    ver_file = sdk_dir / "VERSION"
+    if ver_file.is_file() and not ver_file.is_symlink():
+        with contextlib.suppress(OSError):
+            raw = ver_file.read_text(encoding="utf-8", errors="replace").splitlines()[0].strip()
+    if not raw:
+        raw = sdk_dir.name
+    m = re.search(r"go(\d+)\.(\d+)(?:\.(\d+))?", raw)
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3) or "0"))
+
+
+def _host_go_arch_tag() -> str:
+    import platform as _plat
+
+    mach = _plat.machine().lower()
+    if mach in ("x86_64", "amd64"):
+        return "amd64"
+    if mach in ("aarch64", "arm64"):
+        return "arm64"
+    return mach
+
+
+def discover_host_stateless_toolchains(hhome: Path | None = None) -> tuple[list[Path], list[Path], Path | None]:
+    """Validate SDK layout & arch BEFORE adding to `ro_dirs`; sort Go toolchains semantically (never mounting non-SDK dirs)."""
+    base = hhome or Path.home()
+    ro_dirs: list[Path] = []
+    tail_bins: list[Path] = []
+    seen: set[Path] = set()
+    go_arch = _host_go_arch_tag()
+
+    def _register_ro(real: Path) -> None:
+        if real not in seen:
+            seen.add(real)
+            ro_dirs.append(real)
+
+    # Preserve `.is_dir()` + `.resolve()` for corepack/cargo/rustup (supports symlinked rustup/cargo roots):
+    for fixed in (base / ".cache" / "node" / "corepack", base / ".cargo" / "bin", base / ".rustup"):
+        if fixed.is_dir():
+            _register_ro(fixed.resolve())
+
+    node_name_re = re.compile(r"^(?:node(?:-?v?\d[\d.]*)?|v?\d+\.\d+\.\d+)$")
+    for parent_dir in (base / ".local", base / ".nvm" / "versions" / "node"):
+        if not parent_dir.is_dir():
+            continue
+        for nd in sorted(parent_dir.iterdir()):
+            if not node_name_re.fullmatch(nd.name) or not nd.is_dir():
+                continue
+            real_nd = nd.resolve()
+            if (real_nd / "bin" / "node").is_file() and (real_nd / "lib" / "node_modules" / "npm").is_dir():
+                _register_ro(real_nd)
+                tail_bins.append(real_nd / "bin")
+
+    go_candidates: list[tuple[tuple[int, int, int], Path]] = []
+    local_dir = base / ".local"
+    go_local_re = re.compile(r"^go(?:\d[\d.]*)?$")
+    if local_dir.is_dir():
+        for gd in sorted(local_dir.iterdir()):
+            if not go_local_re.fullmatch(gd.name) or not gd.is_dir():
+                continue
+            real_gd = gd.resolve()
+            ver = _parse_go_sdk_version(real_gd)
+            if ver is not None and (real_gd / "bin" / "go").is_file() and (real_gd / "src" / "runtime").is_dir():
+                _register_ro(real_gd)
+                go_candidates.append((ver, real_gd))
+
+    tc_parent = base / "go" / "pkg" / "mod" / "golang.org"
+    tc_re = re.compile(rf"^toolchain@.*-go\d[\d.]*\.linux-{re.escape(go_arch)}$")
+    if tc_parent.is_dir() and not tc_parent.is_symlink():
+        for tc in sorted(tc_parent.iterdir()):
+            if not tc_re.fullmatch(tc.name) or not tc.is_dir() or tc.is_symlink():
+                continue
+            real_tc = tc.resolve()
+            ver_tc = _parse_go_sdk_version(real_tc)
+            if ver_tc is not None and (real_tc / "bin" / "go").is_file() and (real_tc / "src" / "runtime").is_dir():
+                _register_ro(real_tc)
+                go_candidates.append((ver_tc, real_tc))
+
+    go_candidates.sort(key=lambda item: item[0])
+    go_root = go_candidates[-1][1] if go_candidates else None
+    return ro_dirs, tail_bins, go_root
+
+
+def resolve_host_go_toolchain_root(hhome: Path | None = None) -> Path | None:
+    """Resolve highest semantic Go compiler distribution on host generically."""
+    _, _, go_root = discover_host_stateless_toolchains(hhome)
+    return go_root
+
+
 def build_execution_ring_bwrap(
     *,
     ring_kind: str,  # tool_ring | git_ops_ring | verify_ring
@@ -1413,10 +1577,12 @@ def build_execution_ring_bwrap(
     clean_tree_fd: int | None = None,
     verify_out_fd: int | None = None,
     trusted_base_cache_fd: int | None = None,
+    repo_main_dir: Path | None = None,
+    ro_workspace_deps: tuple[str, ...] | list[str] = (),
 ) -> list[str]:
     """Assemble network-isolated, credential-free execution rings (tool_ring, git_ops_ring, verify_ring)."""
-    if (clean_tree_fd is not None or verify_out_fd is not None or trusted_base_cache_fd is not None) and retain_fds is None:
-        raise SandboxError("retain_fds list is required whenever clean_tree_fd, verify_out_fd, or trusted_base_cache_fd is passed")
+    if (clean_tree_fd is not None or verify_out_fd is not None or trusted_base_cache_fd is not None or bool(ro_workspace_deps)) and retain_fds is None:
+        raise SandboxError("retain_fds list is required whenever clean_tree_fd, verify_out_fd, trusted_base_cache_fd, or ro_workspace_deps is passed")
     if ring_kind not in ("tool_ring", "git_ops_ring", "verify_ring"):
         raise SandboxError(f"Unknown execution ring_kind: {ring_kind!r}")
 
@@ -1461,21 +1627,18 @@ def build_execution_ring_bwrap(
         hhome = Path.home()
         # NEVER mount shared cross-project package/source caches (~/.cargo/registry, ~/.cargo/git, ~/.local/share/pnpm);
         # mount ONLY stateless toolchain binaries (corepack, cargo/bin, rustup) + project's own trusted_base_cache!
-        for ro_tc in (
-            hhome / ".cache" / "node" / "corepack",
-            hhome / ".cargo" / "bin",
-            hhome / ".rustup",
-        ):
-            if ro_tc.is_dir():
-                tc_real = str(ro_tc.resolve())
-                argv.extend(["--ro-bind", tc_real, tc_real])
+        ro_tcs, tail_node_bins, go_tc_root = discover_host_stateless_toolchains(hhome)
+        for tc_real in ro_tcs:
+            argv.extend(["--ro-bind", str(tc_real), str(tc_real)])
         if (hhome / ".rustup").is_dir():
             argv.extend(["--setenv", "RUSTUP_HOME", str((hhome / ".rustup").resolve())])
         if (hhome / ".cargo" / "bin").is_dir():
             path_dirs.insert(0, str((hhome / ".cargo" / "bin").resolve()))
+        for nb in tail_node_bins:
+            path_dirs.append(str(nb))
         shim_dir = ensure_secure_dir(Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}") / "ap-toolchain-shims", 0o700)
         argv.extend(["--dir", "/ap-toolchain-bin"])
-        for tool_name in ("pnpm", "kustomize"):
+        for tool_name in ("pnpm", "kustomize", "terraform", "uv"):
             cand_tool = hhome / ".local" / "bin" / tool_name
             if cand_tool.exists():
                 real_tool = cand_tool.resolve()
@@ -1487,6 +1650,14 @@ def build_execution_ring_bwrap(
                     argv.extend(["--ro-bind", str(pnpm_wrap), "/ap-toolchain-bin/pnpm"])
                 else:
                     argv.extend(["--symlink", str(real_tool), f"/ap-toolchain-bin/{tool_name}"])
+        if go_tc_root is not None:
+            argv.extend([
+                "--symlink", str(go_tc_root / "bin" / "go"), "/ap-toolchain-bin/go",
+                "--setenv", "GOROOT", str(go_tc_root),
+                "--setenv", "GOTOOLCHAIN", "local",
+            ])
+            if (go_tc_root / "bin" / "gofmt").is_file():
+                argv.extend(["--symlink", str(go_tc_root / "bin" / "gofmt"), "/ap-toolchain-bin/gofmt"])
         path_dirs.insert(0, "/ap-toolchain-bin")
 
     if ring_kind == "tool_ring":
@@ -1561,6 +1732,12 @@ def build_execution_ring_bwrap(
                         "--setenv", "CARGO_NET_OFFLINE", "true",
                         "--setenv", "CARGO_TARGET_DIR", "/tmp/ap-cargo-target",
                     ])
+                if (tbc_pin / "go_mod_cache").is_dir():
+                    argv.extend([
+                        "--setenv", "GOMODCACHE", str(tbc_mount_dest / "go_mod_cache"),
+                        "--setenv", "GOPROXY", "off",
+                        "--setenv", "GOSUMDB", "off",
+                    ])
             elif trusted_base_cache is not None:
                 tbc_real = verify_trusted_base_cache_integrity(trusted_base_cache)
                 argv.extend(["--ro-bind", str(tbc_real), str(tbc_real)])
@@ -1573,6 +1750,23 @@ def build_execution_ring_bwrap(
                         "--setenv", "CARGO_NET_OFFLINE", "true",
                         "--setenv", "CARGO_TARGET_DIR", "/tmp/ap-cargo-target",
                     ])
+                if (tbc_real / "go_mod_cache").is_dir():
+                    argv.extend([
+                        "--setenv", "GOMODCACHE", str(tbc_real / "go_mod_cache"),
+                        "--setenv", "GOPROXY", "off",
+                        "--setenv", "GOSUMDB", "off",
+                    ])
+        if ro_workspace_deps and repo_main_dir is not None:
+            argv.extend(
+                prepare_ro_workspace_dep_bind_args(
+                    repo_main_dir,
+                    ro_workspace_deps,
+                    wt_real,
+                    target_fd=wt_fd_tool,
+                    container_target_root=wt_real if wt_fd_tool is not None else None,
+                    retain_fds=retain_fds,
+                )
+            )
         if shell_snapshots and shell_snapshots.exists():
             argv.extend(["--ro-bind", str(shell_snapshots.resolve()), "/ap-shell-snapshots"])
         argv.extend(["--bind", str(ephemeral_tool_cache.resolve()), "/ap-tool-cache"])
@@ -1666,6 +1860,23 @@ def build_execution_ring_bwrap(
                         "--setenv", "CARGO_NET_OFFLINE", "true",
                         "--setenv", "CARGO_TARGET_DIR", "/ap-verify-work/.ap-cargo-target",
                     ])
+                if (tbc_pin / "go_mod_cache").is_dir():
+                    argv.extend([
+                        "--setenv", "GOMODCACHE", str(tbc_mount_dest / "go_mod_cache"),
+                        "--setenv", "GOPROXY", "off",
+                        "--setenv", "GOSUMDB", "off",
+                    ])
+            if ro_workspace_deps and repo_main_dir is not None:
+                argv.extend(
+                    prepare_ro_workspace_dep_bind_args(
+                        repo_main_dir,
+                        ro_workspace_deps,
+                        vo_container,
+                        target_fd=vo_fd,
+                        container_target_root=vo_container,
+                        retain_fds=retain_fds,
+                    )
+                )
         else:
             if not skip_clean_tree_copy:
                 ct_real, vo_real = copy_clean_tree_no_hardlinks(clean_tree, verify_out_dir)
@@ -1695,6 +1906,22 @@ def build_execution_ring_bwrap(
                         "--setenv", "CARGO_NET_OFFLINE", "true",
                         "--setenv", "CARGO_TARGET_DIR", str(vo_real / ".ap-cargo-target"),
                     ])
+                if (tbc_real / "go_mod_cache").is_dir():
+                    argv.extend([
+                        "--setenv", "GOMODCACHE", str(tbc_real / "go_mod_cache"),
+                        "--setenv", "GOPROXY", "off",
+                        "--setenv", "GOSUMDB", "off",
+                    ])
+            if ro_workspace_deps and repo_main_dir is not None:
+                argv.extend(
+                    prepare_ro_workspace_dep_bind_args(
+                        repo_main_dir,
+                        ro_workspace_deps,
+                        vo_real,
+                        container_target_root=vo_real,
+                        retain_fds=retain_fds,
+                    )
+                )
         if enable_ui_verify and Path("/opt/google/chrome").exists():
             argv.extend(["--ro-bind", "/opt/google/chrome", "/opt/google/chrome"])
         argv.extend(["--setenv", "HOME", "/tmp", "--setenv", "CI", "1"])
@@ -1712,6 +1939,8 @@ _PREFETCH_REGISTRY_DOMAINS: frozenset[str] = frozenset(
         "index.crates.io",
         "static.crates.io",
         "crates.io",
+        "proxy.golang.org",
+        "sum.golang.org",
     }
 )
 
@@ -1820,14 +2049,11 @@ def build_deps_prefetch_bwrap(
 
     path_dirs = ["/usr/local/bin", "/usr/bin", "/bin"]
     hhome = Path.home()
-    for ro_tc in (
-        hhome / ".cache" / "node" / "corepack",
-        hhome / ".cargo" / "bin",
-        hhome / ".rustup",
-    ):
-        if ro_tc.is_dir():
-            tc_real = str(ro_tc.resolve())
-            argv.extend(["--ro-bind", tc_real, tc_real])
+    ro_tcs_pf, tail_node_pf, go_tc_pf = discover_host_stateless_toolchains(hhome)
+    for tc_real in ro_tcs_pf:
+        argv.extend(["--ro-bind", str(tc_real), str(tc_real)])
+    for nb_pf in tail_node_pf:
+        path_dirs.append(str(nb_pf))
     if (hhome / ".rustup").is_dir():
         argv.extend(["--setenv", "RUSTUP_HOME", str((hhome / ".rustup").resolve())])
     if (hhome / ".cargo" / "bin").is_dir():
@@ -1846,6 +2072,12 @@ def build_deps_prefetch_bwrap(
             argv.extend(["--ro-bind", str(pnpm_wrap), "/ap-toolchain-bin/pnpm"])
         else:
             argv.extend(["--symlink", str(real_pnpm), "/ap-toolchain-bin/pnpm"])
+    if go_tc_pf is not None:
+        argv.extend([
+            "--symlink", str(go_tc_pf / "bin" / "go"), "/ap-toolchain-bin/go",
+            "--setenv", "GOROOT", str(go_tc_pf),
+            "--setenv", "GOTOOLCHAIN", "local",
+        ])
     path_dirs.insert(0, "/ap-toolchain-bin")
 
     if stage_fd is not None and retain_fds is not None:
@@ -2540,6 +2772,9 @@ def run_optional_ui_verify(
     timeout_sec: int = 90,
     clean_tree_fd: int | None = None,
     trusted_base_cache_fd: int | None = None,
+    extra_env: dict[str, str] | None = None,
+    repo_main_dir: Path | None = None,
+    ro_workspace_deps: tuple[str, ...] | list[str] = (),
 ) -> dict[str, Any]:
     """Execute DoD + loopback server + headless Chrome DOM/HTTP check & screenshot inside ONE offline verify_ring."""
     chrome_bin = Path("/opt/google/chrome/chrome")
@@ -2584,6 +2819,9 @@ def run_optional_ui_verify(
             retain_fds=retain_fds,
             clean_tree_fd=clean_tree_fd,
             trusted_base_cache_fd=trusted_base_cache_fd,
+            extra_env=extra_env,
+            repo_main_dir=repo_main_dir,
+            ro_workspace_deps=ro_workspace_deps,
         )
         sep_idx = argv.index("--")
         argv = [*argv[:sep_idx], "--bind-fd", str(ui_art_fd), "/ap-ui-artifacts", *argv[sep_idx:]]

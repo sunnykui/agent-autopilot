@@ -126,6 +126,41 @@ def collect_referee_verdict(turn: ModelTurnResult, *, referee_family: str, expec
     return validate_referee_output(parsed, expected_round=expected_round)
 
 
+_RESERVED_VERIFY_ENV_PREFIXES: tuple[str, ...] = ("LD_", "AP_", "CARGO_", "GO", "RUST", "GIT_")
+_RESERVED_VERIFY_ENV_KEYS: frozenset[str] = frozenset({"PATH", "HOME", "SHELL", "USER", "LOGNAME", "IFS", "BASH_ENV", "ENV"})
+
+
+def _build_safe_verify_env(
+    touched_paths: tuple[str, ...],
+    extra_verify_env: dict[str, str] | None,
+) -> dict[str, str]:
+    merged: dict[str, str] = {}
+    if extra_verify_env:
+        for raw_k, raw_v in extra_verify_env.items():
+            k = str(raw_k or "").strip()
+            if not k or raw_v is None:
+                continue
+            k_up = k.upper()
+            if k_up in _RESERVED_VERIFY_ENV_KEYS or any(k_up.startswith(pfx) for pfx in _RESERVED_VERIFY_ENV_PREFIXES):
+                continue
+            merged[k] = str(raw_v)
+    kept: list[str] = []
+    used_bytes = 0
+    truncated = False
+    for p in touched_paths:
+        if "\n" in p or "\r" in p or "\x00" in p:
+            continue
+        enc_len = len(p.encode("utf-8")) + 1
+        if used_bytes + enc_len > 32768:
+            truncated = True
+            break
+        kept.append(p)
+        used_bytes += enc_len
+    merged["AP_TOUCHED_FILES"] = "\n".join(kept)
+    merged["AP_TOUCHED_FILES_TRUNCATED"] = "1" if truncated else "0"
+    return merged
+
+
 def run_verify_ring_command(
     *,
     clean_tree_dir: Path,
@@ -137,8 +172,13 @@ def run_verify_ring_command(
     trusted_base_cache: Path | None = None,
     clean_tree_fd: int | None = None,
     trusted_base_cache_fd: int | None = None,
+    touched_paths: tuple[str, ...] = (),
+    extra_verify_env: dict[str, str] | None = None,
+    repo_main_dir: Path | None = None,
+    ro_workspace_deps: tuple[str, ...] = (),
 ) -> tuple[int, bool, str]:
     """Run executable DoD (+ optional loopback UI check in the SAME verify_ring namespace)."""
+    merged_extra_env = _build_safe_verify_env(touched_paths, extra_verify_env)
     if enable_ui_verify and ui_verify_url:
         ui_res = run_optional_ui_verify(
             clean_tree_dir=clean_tree_dir,
@@ -148,6 +188,9 @@ def run_verify_ring_command(
             trusted_base_cache=trusted_base_cache,
             clean_tree_fd=clean_tree_fd,
             trusted_base_cache_fd=trusted_base_cache_fd,
+            extra_env=merged_extra_env,
+            repo_main_dir=repo_main_dir,
+            ro_workspace_deps=ro_workspace_deps,
         )
         if not ui_res["ok"]:
             return 1, False, f"UI/DoD verification failed: {ui_res}"
@@ -171,6 +214,9 @@ def run_verify_ring_command(
                 retain_fds=retain_fds,
                 clean_tree_fd=clean_tree_fd,
                 trusted_base_cache_fd=trusted_base_cache_fd,
+                extra_env=merged_extra_env,
+                repo_main_dir=repo_main_dir,
+                ro_workspace_deps=ro_workspace_deps,
             )
             proc = subprocess.run(
                 argv,
@@ -201,6 +247,7 @@ def run_verify_ring_command(
                 "HOME": str(vo_exec),
                 "LANG": "C.UTF-8",
                 "CI": "1",
+                **merged_extra_env,
             }
             proc = subprocess.run(
                 ["/bin/bash", "-lc", dod_cmd],
@@ -271,28 +318,32 @@ def execute_chef_issue_pipeline(
     )
     advisory_ctx = load_advisory_context_for_scout_or_writer(advisory_dir)
 
+    ro_ws_deps = tuple(str(x).strip() for x in (cfg.extra.get("ro_workspace_deps") or []) if str(x).strip())
     scout_prompt = (
         f"{advisory_ctx}\n\n<issue>\n{issue_summary}\n</issue>\n"
         "Output JSON matching required_fill_in_schemas.scout: "
         '{"root_cause":"...","target_area":"...","exemplar_files":[...],"dod_check":"...","ui_verify_needed":false,"uncertainties":[...]}'
     )
-    scout_turn = model_runner.run_scout(
-        family=writer_family,
-        model=scout_model,
-        worktree=wt,
-        prompt=scout_prompt,
-        run_dir=run_dir,
-        managed_gitdir=managed_gitdir,
-        repo_main_objects=main_obj,
-        trusted_base_cache=trusted_base_cache,
-    )
+    try:
+        scout_turn = model_runner.run_scout(
+            family=writer_family,
+            model=scout_model,
+            worktree=wt,
+            prompt=scout_prompt,
+            run_dir=run_dir,
+            managed_gitdir=managed_gitdir,
+            repo_main_objects=main_obj,
+            trusted_base_cache=trusted_base_cache,
+        )
+    finally:
+        cleanup_workspace_node_modules_mountpoints(trusted_base_cache, wt, extra_rel_mounts=ro_ws_deps)
     if scout_turn.exit_code != 0:
         combined = scout_turn.raw_stdout + ("\n" + scout_turn.raw_stderr if scout_turn.raw_stderr else "")
         wake = parse_quota_reset(combined)
         if wake:
             db.mark_unit_waiting_quota(unit_key, wake, "scout_quota_window")
             raise QuotaExhaustedError("Scout hit quota window", wake_at_iso=wake, family=writer_family)
-        raise AutopilotError(f"Scout failed: {sanitize_terminal_text(combined, 500)}")
+        raise AutopilotError(f"Scout failed: {sanitize_terminal_text(combined[-1200:], 800)}")
     scout_data = validate_scout_output(extract_json_object(scout_turn.raw_stdout))
     dod_cmd = cfg.verify_cmd or str(scout_data["dod_check"])
     target_area = str(scout_data["target_area"] or "general")
@@ -314,25 +365,27 @@ def execute_chef_issue_pipeline(
                 f"<issue>\n{issue_summary}\n</issue>\n{defect_feedback}\n"
                 "Output JSON matching required_fill_in_schemas.writer (summary <= 300 chars)."
             )
-            w_turn = model_runner.run_writer(
-                family=writer_family,
-                model=writer_model,
-                worktree=wt,
-                prompt=writer_prompt,
-                run_dir=run_dir,
-                managed_gitdir=managed_gitdir,
-                repo_main_objects=main_obj,
-                trusted_base_cache=trusted_base_cache,
-            )
+            try:
+                w_turn = model_runner.run_writer(
+                    family=writer_family,
+                    model=writer_model,
+                    worktree=wt,
+                    prompt=writer_prompt,
+                    run_dir=run_dir,
+                    managed_gitdir=managed_gitdir,
+                    repo_main_objects=main_obj,
+                    trusted_base_cache=trusted_base_cache,
+                )
+            finally:
+                cleanup_workspace_node_modules_mountpoints(trusted_base_cache, wt, extra_rel_mounts=ro_ws_deps)
             if w_turn.exit_code != 0:
                 combined = w_turn.raw_stdout + ("\n" + w_turn.raw_stderr if w_turn.raw_stderr else "")
                 wake = parse_quota_reset(combined)
                 if wake:
                     db.mark_unit_waiting_quota(unit_key, wake, "writer_quota_window")
                     raise QuotaExhaustedError("Writer hit quota window", wake_at_iso=wake, family=writer_family)
-                raise AutopilotError(f"Writer failed: {sanitize_terminal_text(combined, 500)}")
+                raise AutopilotError(f"Writer failed: {sanitize_terminal_text(combined[-1200:], 800)}")
             writer_data = validate_writer_output(extract_json_object(w_turn.raw_stdout))
-            cleanup_workspace_node_modules_mountpoints(trusted_base_cache, wt)
 
             try:
                 gate = sample_and_gate_worktree(
@@ -374,6 +427,10 @@ def execute_chef_issue_pipeline(
                 trusted_base_cache=trusted_base_cache,
                 clean_tree_fd=gate.clean_tree_fd,
                 trusted_base_cache_fd=trusted_base_cache_fd,
+                touched_paths=gate.touched_paths,
+                extra_verify_env=dict(cfg.extra.get("verify_env") or {}) if isinstance(cfg.extra.get("verify_env"), dict) else None,
+                repo_main_dir=repo_main,
+                ro_workspace_deps=ro_ws_deps,
             )
             db.record_verify_receipt(
                 unit_key=unit_key,

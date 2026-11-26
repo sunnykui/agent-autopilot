@@ -22,7 +22,12 @@ _KNOWN_MAIL_NOISE = frozenset(
 )
 
 
-def probe_github_issues_zero_token(cfg: WorkflowConfig, db: AutopilotDB) -> dict[str, Any]:
+def probe_github_issues_zero_token(
+    cfg: WorkflowConfig,
+    db: AutopilotDB,
+    *,
+    extra_require_labels: tuple[str, ...] = (),
+) -> dict[str, Any]:
     """Zero-LLM-token probe for actionable GitHub issues across project repos."""
     if not cfg.enabled:
         return {"actionable": False, "reason": "project_disabled", "candidates": []}
@@ -68,6 +73,14 @@ def probe_github_issues_zero_token(cfg: WorkflowConfig, db: AutopilotDB) -> dict
     repo_errors: dict[str, str] = {}
     skip_set = {s.lower() for s in cfg.skip_labels}
     prio_set = {s.lower() for s in cfg.priority_labels}
+    req_labels_ordered: list[str] = []
+    seen_req: set[str] = set()
+    for raw_r in (*cfg.require_labels, *extra_require_labels):
+        clean_r = str(raw_r or "").strip()
+        if clean_r and clean_r.lower() not in seen_req:
+            seen_req.add(clean_r.lower())
+            req_labels_ordered.append(clean_r)
+    req_set = set(seen_req)
 
     for repo in cfg.repos:
         cmd = [
@@ -85,6 +98,8 @@ def probe_github_issues_zero_token(cfg: WorkflowConfig, db: AutopilotDB) -> dict
         ]
         if cfg.assignee and cfg.assignee not in ("*", "all", "ALL"):
             cmd.extend(["--assignee", cfg.assignee])
+        for req_lbl in req_labels_ordered:
+            cmd.extend(["--label", req_lbl])
         try:
             proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=25, check=False)
         except (subprocess.SubprocessError, OSError) as exc:
@@ -102,6 +117,8 @@ def probe_github_issues_zero_token(cfg: WorkflowConfig, db: AutopilotDB) -> dict
             num = int(item["number"])
             ukey = f"{repo}#{num}"
             lbls = {str(l.get("name") or "").lower() for l in (item.get("labels") or [])}
+            if req_set and not req_set.issubset(lbls):
+                continue
             if lbls & skip_set:
                 continue
             existing = db.get_unit(ukey)
@@ -242,23 +259,185 @@ def probe_lark_payments_zero_token(cfg: WorkflowConfig, db: AutopilotDB) -> dict
     }
 
 
+def _resolve_verified_git_metadata_fds(ws_real: Path) -> list[tuple[int, str]]:
+    """Open verified linked-worktree gitdir/commondir fds ONLY when proven to be genuine Git metadata directories."""
+    from .models import open_dir_nofollow
+
+    dot_git = ws_real / ".git"
+    if not dot_git.is_file() or dot_git.is_symlink():
+        return []
+    txt = dot_git.read_text(encoding="utf-8", errors="replace").strip()
+    if not txt.startswith("gitdir:"):
+        return []
+    raw_gd = txt[len("gitdir:") :].strip()
+    gd = (ws_real / raw_gd).resolve() if not os.path.isabs(raw_gd) else Path(raw_gd).resolve()
+    opened: list[tuple[int, str]] = []
+    try:
+        gd_fd = open_dir_nofollow(gd, create=False)
+        gd_pin = Path(f"/proc/{os.getpid()}/fd/{gd_fd}")
+        gd_real_str = os.readlink(f"/proc/self/fd/{gd_fd}")
+        gitdir_back = gd_pin / "gitdir"
+        if not (gd_pin / "HEAD").is_file() or not gitdir_back.is_file() or gitdir_back.is_symlink():
+            os.close(gd_fd)
+            raise AutopilotError(f"Linked worktree gitdir {gd} lacks HEAD/gitdir backpointer; refusing precheck mount")
+        reg_back = Path(os.path.normpath(gitdir_back.read_text(encoding="utf-8", errors="replace").strip()))
+        exp_back = Path(os.path.normpath(str(ws_real / ".git")))
+        if reg_back != exp_back:
+            os.close(gd_fd)
+            raise AutopilotError(f"Linked worktree gitdir backpointer {reg_back} != {exp_back}; refusing foreign gitdir mount")
+        opened.append((gd_fd, gd_real_str))
+        comm = gd_pin / "commondir"
+        if not comm.is_file() or comm.is_symlink():
+            raise AutopilotError(f"Linked worktree gitdir {gd} missing regular commondir file; refusing precheck mount")
+        rel_c = comm.read_text(encoding="utf-8", errors="replace").strip()
+        cd = (Path(gd_real_str) / rel_c).resolve() if not os.path.isabs(rel_c) else Path(rel_c).resolve()
+        if str(cd) == gd_real_str:
+            raise AutopilotError(f"Linked worktree commondir {cd} self-references gitdir; refusing precheck mount")
+        cd_fd = open_dir_nofollow(cd, create=False)
+        cd_pin = Path(f"/proc/{os.getpid()}/fd/{cd_fd}")
+        cd_real_str = os.readlink(f"/proc/self/fd/{cd_fd}")
+        exp_wt_parent = str(Path(cd_real_str) / "worktrees")
+        if not (
+            (cd_pin / "objects").is_dir()
+            and (cd_pin / "refs").is_dir()
+            and (cd_pin / "HEAD").is_file()
+            and str(Path(gd_real_str).parent) == exp_wt_parent
+        ):
+            os.close(cd_fd)
+            raise AutopilotError(f"Linked worktree commondir {cd} does not own {gd_real_str}; refusing precheck mount")
+        opened.append((cd_fd, cd_real_str))
+        return opened
+    except BaseException:
+        for fd_c, _ in opened:
+            try:
+                os.close(fd_c)
+            except OSError:
+                pass
+        raise
+
+
+def _run_readonly_credential_free_precheck(ws: Path, precheck_cmd: str, *, timeout: int = 30) -> subprocess.CompletedProcess[str]:
+    """Execute `precheck_cmd` strictly inside a credential-free, `--unshare-net`, read-only `bwrap` sandbox (fail-closed without `bwrap`)."""
+    import contextlib as _ctx
+    import shutil as _shutil
+    from .models import open_dir_nofollow
+
+    bwrap_bin = _shutil.which("bwrap")
+    if not bwrap_bin:
+        raise AutopilotError("delegated_precheck_requires_bwrap")
+
+    ws_fd = open_dir_nofollow(ws.resolve(), create=False)
+    retain_fds: list[int] = [ws_fd]
+    try:
+        ws_dest = os.readlink(f"/proc/self/fd/{ws_fd}")
+        git_meta_fds = _resolve_verified_git_metadata_fds(Path(ws_dest))
+        for gfd, _ in git_meta_fds:
+            retain_fds.append(gfd)
+        argv: list[str] = [
+            bwrap_bin,
+            "--die-with-parent",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--unshare-net",
+            "--new-session",
+            "--clearenv",
+            "--proc", "/proc",
+            "--dev", "/dev",
+            "--ro-bind", "/usr", "/usr",
+            "--symlink", "usr/bin", "/bin",
+            "--symlink", "usr/lib", "/lib",
+            "--symlink", "usr/lib64", "/lib64",
+            "--tmpfs", "/tmp",
+            "--ro-bind-fd", str(ws_fd), ws_dest,
+        ]
+        for gfd, gdest in git_meta_fds:
+            argv.extend(["--ro-bind-fd", str(gfd), gdest])
+        argv.extend(
+            [
+                "--chdir", ws_dest,
+                "--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin",
+                "--setenv", "HOME", "/tmp",
+                "--setenv", "LANG", "C.UTF-8",
+                "--",
+                "/bin/bash",
+                "-c",
+                precheck_cmd,
+            ]
+        )
+        return subprocess.run(argv, capture_output=True, text=True, pass_fds=tuple(retain_fds), timeout=timeout, start_new_session=True, check=False)
+    finally:
+        for _rfd in retain_fds:
+            with _ctx.suppress(OSError):
+                os.close(_rfd)
+
+
 def probe_delegated_zero_token(cfg: WorkflowConfig, db: AutopilotDB) -> dict[str, Any]:
-    """Zero-token probe for delegated repo runners with optional dedicated token requirement."""
+    """Universal zero-token probe for delegated runners (`require_labels` + WIP/daily caps + isolated `extra.precheck_cmd`)."""
     if not cfg.enabled:
-        return {"actionable": False, "reason": "project_disabled"}
+        return {"actionable": False, "reason": "project_disabled", "candidates": []}
+    prow = db.get_project_row(cfg.project_id)
+    if prow is not None and not int(prow["enabled"]):
+        return {"actionable": False, "reason": "project_disabled_in_db", "candidates": []}
+
+    cap = (
+        (int(prow["max_in_progress"]) if int(prow["current_step_idx"]) > 0 else min(cfg.max_in_progress, int(prow["max_in_progress"])))
+        if prow is not None
+        else cfg.max_in_progress
+    )
+    active_cnt = db._conn.execute(
+        "SELECT COUNT(*) AS c FROM run_claims WHERE project_id = ? AND state IN ('active', 'reclaiming')",
+        (cfg.project_id,),
+    ).fetchone()["c"]
+    if int(active_cnt) >= cap:
+        return {"actionable": False, "reason": f"wip_limit_reached:{active_cnt}/{cap}", "candidates": []}
+    if cfg.max_per_day > 0:
+        day_start = dt.datetime.now(dt.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        today_cnt = db._conn.execute(
+            "SELECT COUNT(*) AS c FROM run_claims WHERE project_id = ? AND created_at >= ?",
+            (cfg.project_id, day_start),
+        ).fetchone()["c"]
+        if int(today_cnt) >= cfg.max_per_day:
+            return {"actionable": False, "reason": f"daily_cap_reached:{today_cnt}/{cfg.max_per_day}", "candidates": []}
+
     if cfg.token_file:
         try:
             read_nonempty_token_file(cfg.token_file)
         except AutopilotError:
-            return {"actionable": False, "reason": f"waiting_dedicated_token:{Path(cfg.token_file).expanduser()}"}
+            return {"actionable": False, "reason": f"waiting_dedicated_token:{Path(cfg.token_file).expanduser()}", "candidates": []}
 
+    if not cfg.workspace_path or not Path(cfg.workspace_path).expanduser().is_dir():
+        return {"actionable": False, "reason": "delegated_workspace_missing", "candidates": []}
     ws = Path(cfg.workspace_path).expanduser().resolve()
-    ap_cfg = ws / "config" / "autopilot.json"
-    if ap_cfg.is_file():
-        raw = json.loads(ap_cfg.read_text(encoding="utf-8"))
-        if not (raw.get("runner") or {}).get("enabled", False):
-            return {"actionable": False, "reason": "delegated_runner_disabled_in_repo_config"}
-    return probe_github_issues_zero_token(cfg, db)
+
+    # Respect optional generic runner opt-out file if declared by repo or WORKFLOW.md `extra.runner_config_rel`:
+    cfg_rel = str(cfg.extra.get("runner_config_rel") or "config/autopilot.json").strip()
+    ap_cfg = ws / cfg_rel if cfg_rel and ".." not in Path(cfg_rel).parts else None
+    repo_req_labels: tuple[str, ...] = ()
+    if ap_cfg is not None and ap_cfg.is_file() and not ap_cfg.is_symlink():
+        try:
+            raw = json.loads(ap_cfg.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                if isinstance(raw.get("runner"), dict) and not raw["runner"].get("enabled", False):
+                    return {"actionable": False, "reason": "delegated_runner_disabled_in_repo_config", "candidates": []}
+                if not cfg.require_labels and isinstance(raw.get("require_labels"), list):
+                    repo_req_labels = tuple(str(x).strip() for x in raw["require_labels"] if str(x).strip())
+        except (OSError, json.JSONDecodeError):
+            return {"actionable": False, "reason": "delegated_repo_config_invalid", "candidates": []}
+
+    res = probe_github_issues_zero_token(cfg, db, extra_require_labels=repo_req_labels)
+    if res.get("actionable") or res.get("blocked_units"):
+        return res
+
+    precheck_cmd = str(cfg.extra.get("precheck_cmd") or "").strip()
+    if precheck_cmd:
+        try:
+            proc = _run_readonly_credential_free_precheck(ws, precheck_cmd, timeout=30)
+        except (subprocess.SubprocessError, OSError, AutopilotError) as exc:
+            return {"actionable": False, "reason": f"delegated_precheck_error:{sanitize_terminal_text(str(exc), 160)}", "candidates": []}
+        if proc.returncode == 0:
+            return {"actionable": True, "reason": "delegated_precheck_matched", "candidates": []}
+    return res
 
 
 def probe_custom_routine_zero_token(cfg: WorkflowConfig, db: AutopilotDB) -> dict[str, Any]:

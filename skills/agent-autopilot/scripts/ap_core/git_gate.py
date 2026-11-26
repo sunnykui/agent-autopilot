@@ -553,9 +553,18 @@ def prepare_trusted_base_cache_fd(*, managed_gitdir: Path, base_sha: str, cache_
     except (subprocess.SubprocessError, OSError) as exc:
         raise AutopilotError(f"Failed to list tree {base_sha} for trusted_base_cache: {exc}") from exc
     all_paths = [p.decode("utf-8", errors="strict") for p in ls_tree.stdout.split(b"\x00") if p]
-    has_pnpm = "pnpm-lock.yaml" in all_paths
+    all_paths_set = set(all_paths)
+    has_pnpm = "pnpm-lock.yaml" in all_paths_set
     cargo_locks = sorted(p for p in all_paths if p == "Cargo.lock" or p.endswith("/Cargo.lock"))
-    if not has_pnpm and not cargo_locks:
+    go_sums = sorted(
+        p
+        for p in all_paths
+        if (p == "go.sum" or p.endswith("/go.sum"))
+        and "/vendor/" not in f"/{p}"
+        and (f"{p[:-6]}go.mod" in all_paths_set)
+        and (f"{p[:-6]}vendor/modules.txt" not in all_paths_set)
+    )
+    if not has_pnpm and not cargo_locks and not go_sums:
         return None, None
 
     pnpm_prefix: list[str] = []
@@ -571,6 +580,23 @@ def prepare_trusted_base_cache_fd(*, managed_gitdir: Path, base_sha: str, cache_
         if not Path(cargo_bin).is_file():
             raise AutopilotError(f"Repository at {base_sha} requires Cargo.lock cache, but cargo toolchain is missing")
 
+    go_bin = ""
+    go_in_ring_bin = ""
+    if go_sums:
+        from .sandbox import resolve_host_go_toolchain_root
+
+        go_tc = resolve_host_go_toolchain_root()
+        if go_tc is not None and (go_tc / "bin" / "go").is_file():
+            go_bin = str(go_tc / "bin" / "go")
+            go_in_ring_bin = "/ap-toolchain-bin/go"
+        else:
+            sys_go = shutil.which("go") or ""
+            if sys_go and Path(sys_go).resolve().is_file() and str(Path(sys_go).resolve()).startswith("/usr/"):
+                go_bin = str(Path(sys_go).resolve())
+                go_in_ring_bin = go_bin
+        if not go_bin or not go_in_ring_bin:
+            raise AutopilotError(f"Repository at {base_sha} requires go.sum cache, but Go toolchain is missing")
+
     manifest_paths = sorted(
         p for p in all_paths
         if p in ("pnpm-lock.yaml", "pnpm-workspace.yaml")
@@ -581,6 +607,10 @@ def prepare_trusted_base_cache_fd(*, managed_gitdir: Path, base_sha: str, cache_
         or p.endswith("/Cargo.lock")
         or p == "Cargo.toml"
         or p.endswith("/Cargo.toml")
+        or p == "go.sum"
+        or p.endswith("/go.sum")
+        or p == "go.mod"
+        or p.endswith("/go.mod")
     )
     hasher = hashlib.sha256()
     blobs: list[tuple[str, bytes]] = []
@@ -614,6 +644,10 @@ def prepare_trusted_base_cache_fd(*, managed_gitdir: Path, base_sha: str, cache_
             if cargo_locks:
                 st_ch = os.stat("cargo_home", dir_fd=cfd, follow_symlinks=False)
                 if not stat.S_ISDIR(st_ch.st_mode) or stat.S_ISLNK(st_ch.st_mode):
+                    return False
+            if go_sums:
+                st_gm = os.stat("go_mod_cache", dir_fd=cfd, follow_symlinks=False)
+                if not stat.S_ISDIR(st_gm.st_mode) or stat.S_ISLNK(st_gm.st_mode):
                     return False
             vfd, _ = open_verified_trusted_base_cache_fd(None, source_tbc_fd=cfd)
             os.close(vfd)
@@ -872,6 +906,155 @@ def prepare_trusted_base_cache_fd(*, managed_gitdir: Path, base_sha: str, cache_
                         os.unlink(cred_name, dir_fd=ch_fd)
             finally:
                 os.close(ch_fd)
+
+        if go_sums:
+            try:
+                os.mkdir("go_mod_cache", 0o700, dir_fd=stage_fd)
+            except FileExistsError as exc:
+                raise AutopilotError("Untrusted prior prefetch stage already created go_mod_cache in stage_dir") from exc
+            gm_init_fd = os.open("go_mod_cache", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=stage_fd)
+            try:
+                os.fchmod(gm_init_fd, 0o700)
+                go_mod_dir = Path(os.readlink(f"/proc/self/fd/{gm_init_fd}"))
+            finally:
+                os.close(gm_init_fd)
+
+            if cargo_tree_fd is None:
+                try:
+                    tree_rev_g = subprocess.run(
+                        ["git", "rev-parse", "--verify", f"{base_sha}^{{tree}}"],
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        check=True,
+                    )
+                except (subprocess.SubprocessError, OSError) as exc:
+                    raise AutopilotError(f"Failed to resolve base tree OID for {base_sha}: {exc}") from exc
+                cargo_tree_pin, cargo_tree_fd = export_verified_clean_tree(
+                    managed_gitdir=managed_gitdir,
+                    tree_oid=tree_rev_g.stdout.strip(),
+                    clean_tree_dir=cargo_tree_tmp,
+                    retain_fd=True,
+                )
+            go_tree_dest = Path(os.readlink(f"/proc/self/fd/{cargo_tree_fd}"))
+            import fnmatch as _fnmatch
+
+            def _matches_go_prefix_pattern(mod_path: str, pat: str) -> bool:
+                """Match Go `module.MatchPrefixPatterns` segment-by-segment (`*` never crosses `/`)."""
+                p_segs = [seg for seg in pat.strip().strip("/").split("/") if seg]
+                m_segs = [seg for seg in mod_path.strip().strip("/").split("/") if seg]
+                if not p_segs or len(m_segs) < len(p_segs):
+                    return False
+                return all(_fnmatch.fnmatchcase(ms, ps) for ms, ps in zip(m_segs[: len(p_segs)], p_segs))
+
+            goprivate_env = os.environ.get("GOPRIVATE", "").strip()
+            gonoproxy_env = os.environ.get("GONOPROXY", "").strip()
+            raw_goenv = os.environ.get("GOENV", "")
+            if raw_goenv and raw_goenv != "off":
+                try:
+                    with open(raw_goenv, "rb"):
+                        pass
+                except OSError as exc:
+                    raise AutopilotError(f"Explicit GOENV file {raw_goenv!r} is missing or unreadable: {exc}") from exc
+            if not goprivate_env or not gonoproxy_env:
+                try:
+                    ge_proc = subprocess.run(
+                        [go_bin, "env", "-json", "GOPRIVATE", "GONOPROXY"],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        check=False,
+                    )
+                    if ge_proc.returncode != 0:
+                        raise AutopilotError(f"go env -json failed (rc={ge_proc.returncode}): {ge_proc.stderr.strip()}")
+                    ge_json = json.loads(ge_proc.stdout or "{}")
+                    if not isinstance(ge_json, dict) or not isinstance(ge_json.get("GOPRIVATE"), str) or not isinstance(ge_json.get("GONOPROXY"), str):
+                        raise AutopilotError("go env -json returned malformed GOPRIVATE/GONOPROXY payload")
+                except (subprocess.SubprocessError, OSError, json.JSONDecodeError) as exc:
+                    raise AutopilotError(f"Failed to query Go GOPRIVATE/GONOPROXY policy before public proxy prefetch: {exc}") from exc
+                if not goprivate_env and ge_json["GOPRIVATE"].strip():
+                    goprivate_env = ge_json["GOPRIVATE"].strip()
+                if not gonoproxy_env and ge_json["GONOPROXY"].strip():
+                    gonoproxy_env = ge_json["GONOPROXY"].strip()
+            private_pats = [pat.strip() for pat in (goprivate_env + "," + gonoproxy_env).split(",") if pat.strip()]
+            for gsum_rel in go_sums:
+                gmod_parent = (cargo_tree_pin / gsum_rel).parent
+                gmod_file = gmod_parent / "go.mod"
+                gsum_file = cargo_tree_pin / gsum_rel
+                if not gmod_file.is_file() or (gmod_parent / "vendor" / "modules.txt").is_file():
+                    continue
+                if private_pats:
+                    mod_candidates: set[str] = set()
+                    # Use `go mod edit -json` offline to parse exact Go module syntax (including `go*` & slashless domains!):
+                    edit_proc = subprocess.run(
+                        [go_bin, "mod", "edit", "-json", str(gmod_file)],
+                        env={"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/tmp", "GOPROXY": "off", "GOTOOLCHAIN": "local"},
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
+                        check=False,
+                    )
+                    if edit_proc.returncode == 0:
+                        gmod_json = json.loads(edit_proc.stdout or "{}")
+                        for req_item in gmod_json.get("Require") or []:
+                            if isinstance(req_item, dict) and req_item.get("Path"):
+                                mod_candidates.add(str(req_item["Path"]))
+                        for rep_item in gmod_json.get("Replace") or []:
+                            if isinstance(rep_item, dict):
+                                new_t = rep_item.get("New") or {}
+                                np = str(new_t.get("Path") or "").strip()
+                                if np and not np.startswith((".", "/")):
+                                    mod_candidates.add(np)
+                    else:
+                        for raw_ln in gmod_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                            ln = raw_ln.split("//", 1)[0].strip()
+                            toks = ln.split()
+                            if not toks or toks[0] in ("module", "go", "toolchain", "exclude", "retract", ")"):
+                                continue
+                            if "=>" in ln:
+                                rhs = ln.split("=>", 1)[1].strip().split()
+                                if rhs and not rhs[0].startswith((".", "/")):
+                                    mod_candidates.add(rhs[0].strip('"'))
+                            cand_t = toks[1] if (toks[0] in ("require", "replace") and len(toks) >= 2 and toks[1] != "(") else toks[0]
+                            if cand_t not in ("(", "require", "replace") and not cand_t.startswith((".", "/")):
+                                mod_candidates.add(cand_t.strip('"'))
+                    if gsum_file.is_file():
+                        for sln in gsum_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                            stoks = sln.strip().split()
+                            if stoks:
+                                mod_candidates.add(stoks[0])
+                    for cand_mod in sorted(mod_candidates):
+                        if any(_matches_go_prefix_pattern(cand_mod, pat) for pat in private_pats):
+                            raise AutopilotError(
+                                f"Refusing public proxy prefetch for private Go module {cand_mod!r} in {gsum_rel} (vendor modules or disable GOPRIVATE)"
+                            )
+                try:
+                    go_dl_env = {
+                        "GOMODCACHE": str(go_mod_dir),
+                        "GOPROXY": "https://proxy.golang.org",
+                        "GOSUMDB": "sum.golang.org",
+                        "GOFLAGS": "-modcacherw",
+                    }
+                    if goprivate_env:
+                        go_dl_env["GOPRIVATE"] = goprivate_env
+                    if gonoproxy_env:
+                        go_dl_env["GONOPROXY"] = gonoproxy_env
+                    gproc = run_isolated_deps_prefetch(
+                        inner_cmd=[go_in_ring_bin, "mod", "download", "-modcacherw"],
+                        cwd=gmod_parent,
+                        stage_dir=stage_pin,
+                        ro_source_tree=cargo_tree_pin,
+                        stage_fd=stage_fd,
+                        ro_source_tree_fd=cargo_tree_fd,
+                        extra_env=go_dl_env,
+                        timeout=300,
+                    )
+                except (subprocess.SubprocessError, OSError) as exc:
+                    raise AutopilotError(f"go mod download execution failed: {exc}") from exc
+                if gproc.returncode != 0:
+                    detail = (gproc.stderr or gproc.stdout or "")[-400:]
+                    raise AutopilotError(f"Failed to materialize go.sum cache for {gsum_rel}: {detail}")
 
         verify_trusted_base_cache_integrity(stage_pin)
         try:

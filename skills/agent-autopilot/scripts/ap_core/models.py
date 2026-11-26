@@ -875,6 +875,7 @@ class WorkflowConfig:
     token_file: str = ""
     merge_token_file: str = ""
     assignee: str = "@me"
+    require_labels: tuple[str, ...] = ()
     skip_labels: tuple[str, ...] = ("needs-decision", "agent:needs-human", "agent:blocked")
     priority_labels: tuple[str, ...] = ("P0", "P1")
     extra: dict[str, Any] = field(default_factory=dict)
@@ -937,6 +938,16 @@ def _parse_simple_frontmatter(raw_fm: str) -> dict[str, Any]:
     return result
 
 
+def _coerce_label_tuple(raw: Any, field_name: str) -> tuple[str, ...]:
+    if raw is None:
+        return ()
+    if isinstance(raw, str):
+        return tuple(p.strip() for p in raw.split(",") if p.strip())
+    if isinstance(raw, (list, tuple)):
+        return tuple(str(x).strip() for x in raw if str(x).strip())
+    raise PolicyFreezeError(f"{field_name} must be a list of strings or comma-separated string")
+
+
 def parse_workflow_file(path: Path) -> WorkflowConfig:
     if not path.is_file():
         raise PolicyFreezeError(f"Authoritative WORKFLOW.md not found: {path}")
@@ -979,6 +990,20 @@ def parse_workflow_file(path: Path) -> WorkflowConfig:
     if max_in_progress < 1 or max_in_progress > max(POLICY_MANIFEST["chef_pipeline"]["staircase_concurrency_steps"]):
         raise PolicyFreezeError(f"max_in_progress={max_in_progress} out of bounds [1..3]")
 
+    raw_req_src = fm["require_labels"] if "require_labels" in fm else (fm.get("extra") or {}).get("require_labels")
+    req_labels = _coerce_label_tuple(raw_req_src, "require_labels")
+    skip_labels = _coerce_label_tuple(
+        fm["skip_labels"] if "skip_labels" in fm else ["needs-decision", "agent:needs-human", "agent:blocked"],
+        "skip_labels",
+    )
+    prio_labels = _coerce_label_tuple(
+        fm["priority_labels"] if "priority_labels" in fm else ["P0", "P1"],
+        "priority_labels",
+    )
+    overlap_lbls = {r.lower() for r in req_labels} & {s.lower() for s in skip_labels}
+    if overlap_lbls:
+        raise PolicyFreezeError(f"require_labels and skip_labels cannot overlap in {path}: {sorted(overlap_lbls)}")
+
     return WorkflowConfig(
         project_id=project_id,
         kind=kind,
@@ -1003,8 +1028,9 @@ def parse_workflow_file(path: Path) -> WorkflowConfig:
         token_file=str(fm.get("token_file") or "").strip(),
         merge_token_file=str(fm.get("merge_token_file") or "").strip(),
         assignee=str(fm.get("assignee") or "@me").strip(),
-        skip_labels=tuple(str(x).strip() for x in (fm.get("skip_labels") or ["needs-decision", "agent:needs-human", "agent:blocked"])),
-        priority_labels=tuple(str(x).strip() for x in (fm.get("priority_labels") or ["P0", "P1"])),
+        require_labels=req_labels,
+        skip_labels=skip_labels,
+        priority_labels=prio_labels,
         extra=dict(fm.get("extra") or {}),
         prompt_body=body_text,
         policy_version=policy_version,

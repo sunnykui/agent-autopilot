@@ -256,6 +256,8 @@ class LiveSandboxedModelRunner:
         db: AutopilotDB | None = None,
         claim_epoch: int | None = None,
         trusted_base_cache_fd: int | None = None,
+        repo_main_dir: Path | None = None,
+        ro_workspace_deps: tuple[str, ...] = (),
     ) -> None:
         self.host_binaries = host_binaries
         self.cache_root = cache_root
@@ -263,6 +265,8 @@ class LiveSandboxedModelRunner:
         self.db = db
         self.claim_epoch = claim_epoch
         self.trusted_base_cache_fd = trusted_base_cache_fd
+        self.repo_main_dir = repo_main_dir
+        self.ro_workspace_deps = ro_workspace_deps
 
     def _exec_role(
         self,
@@ -315,6 +319,8 @@ class LiveSandboxedModelRunner:
                             shell_snapshots=snaps,
                             retain_fds=t_fds,
                             trusted_base_cache_fd=self.trusted_base_cache_fd,
+                            repo_main_dir=self.repo_main_dir,
+                            ro_workspace_deps=self.ro_workspace_deps,
                         )
                         return t_argv, t_fds
                     except BaseException:
@@ -1633,6 +1639,7 @@ def cmd_worker_exec(args: argparse.Namespace) -> int:
                 f"Worker GitHub identity {actual_login!r} mismatches claim bound_gh_login {bound_login_w!r}"
             )
         tbc, tbc_fd = prepare_trusted_base_cache_fd(managed_gitdir=mg, base_sha=str(cl["base_sha"]), cache_root=pinned_rc)
+        ro_ws_deps_w = tuple(str(x).strip() for x in (cfg.extra.get("ro_workspace_deps") or []) if str(x).strip())
         runner = LiveSandboxedModelRunner(
             bins,
             default_cache_root(),
@@ -1640,6 +1647,8 @@ def cmd_worker_exec(args: argparse.Namespace) -> int:
             db=db,
             claim_epoch=ce,
             trusted_base_cache_fd=tbc_fd,
+            repo_main_dir=ws,
+            ro_workspace_deps=ro_ws_deps_w,
         )
         if tbc_fd is not None and (pinned_proc_fd_path(tbc_fd) / "cargo_home").is_dir():
             # Pre-model toolchain smoke check: retain `ct_smoke_fd` and `vo_smoke_fd` open (`skip_clean_tree_copy=True`), empty via fd, and ONLY `os.rmdir` empty shells!
@@ -1964,6 +1973,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
 def cmd_onboard(args: argparse.Namespace) -> int:
     repos = [r.strip() for r in (args.repos or "").split(",") if r.strip()]
     scope = [s.strip() for s in (args.write_scope or "").split(",") if s.strip()] or None
+    req_lbls = [s.strip() for s in (getattr(args, "require_labels", "") or "").split(",") if s.strip()] or None
     extra: dict[str, Any] = {}
     if getattr(args, "precheck_cmd", ""):
         extra["precheck_cmd"] = args.precheck_cmd
@@ -1986,6 +1996,7 @@ def cmd_onboard(args: argparse.Namespace) -> int:
         delegated_cmd=getattr(args, "delegated_cmd", ""),
         token_file=args.token_file,
         assignee=getattr(args, "assignee", "@me"),
+        require_labels=req_lbls,
         schedule_interval_sec=args.interval_sec,
         enabled=not args.disabled,
         extra=extra or None,
@@ -2645,6 +2656,7 @@ def build_parser() -> argparse.ArgumentParser:
     ob.add_argument("--routine-prompt", default="", help="Optional LLM prompt for custom routines when no --routine-cmd is set.")
     ob.add_argument("--delegated-cmd", default="", help="Command for --kind delegated.")
     ob.add_argument("--assignee", default="@me", help="GitHub assignee filter ('@me', username, or '*' for all open issues).")
+    ob.add_argument("--require-labels", default="", help="Optional comma-separated required labels (e.g. 'agent:auto').")
     ob.add_argument("--token-file", default="")
     ob.add_argument("--interval-sec", type=int, default=300)
     ob.add_argument("--disabled", action="store_true")

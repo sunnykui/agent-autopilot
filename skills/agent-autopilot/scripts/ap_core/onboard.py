@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shlex
 import shutil
 from pathlib import Path
 from typing import Any
@@ -24,7 +25,7 @@ def _discover_exemplar_files(repo_dir: Path, max_files: int = 8) -> dict[str, li
     buckets: dict[str, list[str]] = {}
     if not repo_dir.is_dir():
         return buckets
-    candidates_roots = ["apps", "packages", "src", "skills", "expert-trajectory"]
+    candidates_roots = ["apps", "packages", "services", "crates", "src", "skills", "lib"]
     for root_name in candidates_roots:
         rpath = repo_dir / root_name
         if not rpath.is_dir():
@@ -58,34 +59,42 @@ def _infer_repo_defaults(repo_dir: Path) -> tuple[str, list[str], str]:
     if pkg_json.is_file():
         pkg = json.loads(pkg_json.read_text(encoding="utf-8"))
         scripts = pkg.get("scripts") or {}
-        if "本项目不要测试" in agents_txt:
-            # Strict repo no-test policy declared in AGENTS.md: rely on typecheck + lint + format:check
+        if "no tests allowed" in agents_txt.lower():
+            # Repo policy explicitly forbids unit tests in AGENTS.md: rely on static typecheck + lint + format:check
             parts = [
                 "pnpm run typecheck" if "typecheck" in scripts else "",
                 "pnpm run lint" if "lint" in scripts else "",
                 "pnpm run format:check" if "format:check" in scripts else "",
             ]
             vcmd = " && ".join(p for p in parts if p)
+            scopes = [d + "/**" for d in ("apps", "packages", "dashboard", "src", "docs") if (repo_dir / d).is_dir()]
             return (
                 vcmd or "pnpm -r --parallel typecheck",
-                ["apps/**", "packages/**", "dashboard/**", "docs/**"],
-                "IRON LAW from AGENTS.md: NO tests allowed; NO hand-written migrations; NO foreign keys.",
+                scopes or ["src/**"],
+                "AGENTS.md declares no-test policy; static typecheck/lint gates enforced.",
             )
         if "test" in scripts and "typecheck" in scripts:
-            return ("pnpm run typecheck && pnpm test", ["apps/**", "packages/**", "src/**"], "Node/TS workspace.")
+            scopes = [d + "/**" for d in ("apps", "packages", "services", "src", "skills") if (repo_dir / d).is_dir()]
+            return ("pnpm run typecheck && pnpm test", scopes or ["apps/**", "packages/**", "src/**"], "Node/TS workspace.")
         if "typecheck" in scripts:
-            return ("pnpm run typecheck", ["apps/**", "packages/**", "src/**"], "Node/TS workspace.")
+            scopes = [d + "/**" for d in ("apps", "packages", "services", "src", "skills") if (repo_dir / d).is_dir()]
+            return ("pnpm run typecheck", scopes or ["apps/**", "packages/**", "src/**"], "Node/TS workspace.")
+    nested_cargos = sorted(p for p in repo_dir.glob("*/Cargo.toml") if not p.parent.name.startswith("."))
     if (repo_dir / "Cargo.toml").is_file():
-        rust_scopes = ["src/**", "crates/**"]
-        if (repo_dir / "expert-trajectory").is_dir():
-            rust_scopes.insert(0, "expert-trajectory/**")
-        return ("cargo check", rust_scopes, "Rust workspace.")
-    if (repo_dir / "expert-trajectory" / "Cargo.toml").is_file():
+        member_scopes = [f"{p.parent.name}/**" for p in nested_cargos if p.parent.name not in ("src", "crates", "target")]
+        base_rs = [d + "/**" for d in ("src", "crates") if (repo_dir / d).is_dir()] or ["src/**", "crates/**"]
+        return ("cargo check", [*member_scopes, *base_rs], "Rust workspace.")
+    if nested_cargos:
+        first_rel = nested_cargos[0].relative_to(repo_dir)
+        sub_name = first_rel.parts[0]
         return (
-            "cargo check --manifest-path expert-trajectory/Cargo.toml",
-            ["expert-trajectory/**", "src/**"],
-            "Nested Rust workspace (expert-trajectory/Cargo.toml).",
+            f"cargo check --manifest-path {shlex.quote(first_rel.as_posix())}",
+            [f"{sub_name}/**", "src/**"],
+            f"Nested Rust workspace ({first_rel.as_posix()}).",
         )
+    if (repo_dir / "scripts" / "check.sh").is_file():
+        scopes = [d + "/**" for d in ("apps", "clusters", "scripts", "tests", "docs") if (repo_dir / d).is_dir()]
+        return ("bash scripts/check.sh", scopes or ["scripts/**", "tests/**"], "Repo gate via scripts/check.sh.")
     return ("python3 -B -m unittest discover -s tests -p 'test_*.py'", ["src/**", "skills/**", "tests/**"], "Python workspace.")
 
 
@@ -105,6 +114,7 @@ def onboard_project(
     delegated_cmd: str = "",
     token_file: str = "",
     assignee: str = "@me",
+    require_labels: list[str] | None = None,
     schedule_interval_sec: int = 300,
     enabled: bool = True,
     extra: dict[str, Any] | None = None,
@@ -150,6 +160,7 @@ def onboard_project(
         delegated_cmd=delegated_cmd,
         token_file=token_file,
         assignee=assignee,
+        require_labels=tuple(str(x).strip() for x in (require_labels or []) if str(x).strip()),
         extra=dict(extra or {}),
         prompt_body=default_body,
     )
