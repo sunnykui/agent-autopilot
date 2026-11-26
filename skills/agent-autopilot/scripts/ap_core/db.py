@@ -11,6 +11,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterator
 
+from .host_guard import HEAVY_UNIT_KINDS, count_global_heavy_claims, load_global_limits
 from .models import (
     ACTION_TYPES,
     CANDIDATE_BOUND_WORKER_ACTIONS,
@@ -1008,6 +1009,11 @@ class AutopilotDB:
             ).fetchone()["c"]
             if int(active_claims) >= cap:
                 raise AutopilotError(f"WIP limit reached for {cfg.project_id}: {active_claims}/{cap}")
+            if cfg.kind in HEAVY_UNIT_KINDS:
+                g_cap = load_global_limits().max_global_in_progress
+                g_active = count_global_heavy_claims(self._conn)
+                if g_active >= g_cap:
+                    raise AutopilotError(f"Global WIP limit reached across projects: {g_active}/{g_cap}")
 
             if cfg.max_per_day > 0:
                 day_start_iso = now_utc().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()

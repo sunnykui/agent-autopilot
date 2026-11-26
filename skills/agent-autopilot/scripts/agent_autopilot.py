@@ -62,6 +62,12 @@ from ap_core.models import (  # noqa: E402
     read_nonempty_token_file,
     sanitize_terminal_text,
 )
+from ap_core.host_guard import (  # noqa: E402
+    HEAVY_UNIT_KINDS,
+    count_global_heavy_claims,
+    load_global_limits,
+    sample_host_pressure,
+)
 from ap_core.onboard import import_legacy_autopilot_state, onboard_project  # noqa: E402
 from ap_core.routine_flow import delegated_precheck_cooldown_active, probe_project_zero_token  # noqa: E402
 from ap_core.sandbox import (  # noqa: E402
@@ -2223,6 +2229,39 @@ def cmd_run_once(args: argparse.Namespace) -> int:
             db2.close()
 
 
+def _host_admission_gate(db_ro: AutopilotDB, wfs: dict[str, WorkflowConfig]) -> dict[str, Any]:
+    """Zero-token gate for heavy (issue/delegated) workers: machine-wide WIP cap, then CPU steal / load backoff.
+
+    A non-empty `hold_reason` is an ordinary wait (re-evaluated on the next dispatch tick), never a needs-human block.
+    """
+    limits = load_global_limits()
+    g_active = count_global_heavy_claims(db_ro._conn)
+    gate: dict[str, Any] = {
+        "max_global_in_progress": limits.max_global_in_progress,
+        "global_heavy_active": g_active,
+        "hold_reason": "",
+    }
+    if not any(w.enabled and w.kind in HEAVY_UNIT_KINDS for w in wfs.values()):
+        return gate
+    if g_active >= limits.max_global_in_progress:
+        gate["hold_reason"] = f"global_wip_limit_reached:{g_active}/{limits.max_global_in_progress}"
+        return gate
+    hp = sample_host_pressure(limits)
+    gate["host_pressure"] = hp
+    if hp["pressured"]:
+        gate["hold_reason"] = "waiting_host_capacity:" + ",".join(hp["reasons"])
+    return gate
+
+
+def _record_host_gate(state_root: Path, gate: dict[str, Any]) -> None:
+    """Persist the latest gate verdict for `top`/operators; best-effort, never fails dispatch."""
+    rec = dict(gate, checked_at=now_iso(), waiting=bool(gate.get("hold_reason")))
+    tmp = state_root / f".host_gate.json.{os.getpid()}.tmp"
+    with contextlib.suppress(OSError):
+        tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, state_root / "host_gate.json")
+
+
 def cmd_dispatch(args: argparse.Namespace) -> int:
     sroot = default_state_root()
     wfs = {w.project_id: w for w in load_all_workflows()}
@@ -2232,8 +2271,12 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
         try:
             now_ts = time.time()
             plan: list[dict[str, Any]] = []
+            gate_ro = _host_admission_gate(db_ro, wfs)
             for pid, wf in sorted(wfs.items()):
                 if not wf.enabled:
+                    continue
+                if wf.kind in HEAVY_UNIT_KINDS and gate_ro["hold_reason"]:
+                    plan.append({"project_id": pid, "actionable": False, "reason": gate_ro["hold_reason"]})
                     continue
                 if wf.kind == "routine" and wf.schedule_interval_sec > 180:
                     crow = db_ro._conn.execute("SELECT last_full_run_ts FROM routine_cursors WHERE project_id = ?", (pid,)).fetchone()
@@ -2241,7 +2284,7 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
                         plan.append({"project_id": pid, "actionable": False, "reason": "within_schedule_interval"})
                         continue
                 plan.append({"project_id": pid, **probe_project_zero_token(wf, db_ro)})
-            print(json.dumps({"dry_run": True, "dispatcher_epoch": db_ro.get_dispatcher_epoch(), "probe_plan": plan}, ensure_ascii=False, indent=2))
+            print(json.dumps({"dry_run": True, "dispatcher_epoch": db_ro.get_dispatcher_epoch(), "host_gate": gate_ro, "probe_plan": plan}, ensure_ascii=False, indent=2))
             return 0
         finally:
             db_ro.close()
@@ -2266,8 +2309,14 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
     now_ts = time.time()
     db_ro_p = AutopilotDB(sroot / "autopilot.db", readonly=True)
     try:
+        host_gate = _host_admission_gate(db_ro_p, wfs)
+        _record_host_gate(sroot, host_gate)
         for pid, wf in sorted(wfs.items()):
             if not wf.enabled:
+                continue
+            if wf.kind in HEAVY_UNIT_KINDS and host_gate["hold_reason"]:
+                # Ordinary wait: skip probe/prefetch/claim this tick; the next timer tick re-samples and resumes.
+                plan.append({"project_id": pid, "actionable": False, "reason": host_gate["hold_reason"]})
                 continue
             if wf.kind == "routine" and wf.schedule_interval_sec > 180:
                 crow = db_ro_p._conn.execute("SELECT last_full_run_ts FROM routine_cursors WHERE project_id = ?", (pid,)).fetchone()
@@ -2397,6 +2446,7 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
                         "dispatcher_epoch": disp_epoch,
                         "dry_run": False,
                         "recovery": rec,
+                        "host_gate": host_gate,
                         "probe_plan": plan,
                         "executed": executed,
                     },

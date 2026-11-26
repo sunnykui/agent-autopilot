@@ -14,9 +14,12 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+# Legacy state-machine suites claim across many projects at once; the host-wide heavy cap has its own tests below.
+os.environ.setdefault("AGENT_AUTOPILOT_MAX_GLOBAL_IN_PROGRESS", "1000")
 AP_SCRIPTS = REPO_ROOT / "skills" / "agent-autopilot" / "scripts"
 if str(AP_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(AP_SCRIPTS))
@@ -5870,6 +5873,195 @@ class TestCodeReviewHardeningInvariants(unittest.TestCase):
                     self.assertEqual([c["number"] for c in r_new["candidates"]], [42])
             finally:
                 dbd.close()
+
+
+class TestHostComputeGuards(unittest.TestCase):
+    """Machine-wide heavy worker cap, CPU steal / load backoff, Nice and toolchain fan-out caps (burstable hosts)."""
+
+    def setUp(self) -> None:
+        self._td = tempfile.TemporaryDirectory()
+        self.base = Path(self._td.name)
+        self.cfg_dir = self.base / "cfg"
+        self.cfg_dir.mkdir()
+        self._env = unittest.mock.patch.dict(os.environ, {"AGENT_AUTOPILOT_CONFIG_DIR": str(self.cfg_dir)})
+        self._env.start()
+        for k in ("AGENT_AUTOPILOT_MAX_GLOBAL_IN_PROGRESS", "AGENT_AUTOPILOT_HOST_MAX_STEAL_PCT", "AGENT_AUTOPILOT_HOST_MAX_LOAD1"):
+            os.environ.pop(k, None)
+
+    def tearDown(self) -> None:
+        self._env.stop()
+        self._td.cleanup()
+
+    def _cfg(self, pid: str, kind: str = "issue") -> WorkflowConfig:
+        return WorkflowConfig(
+            project_id=pid, kind=kind, enabled=True, repos=("o/r",), workspace_path=str(self.base),
+            trust_tier="T2", write_scope=("src/**",), max_in_progress=2,
+        )
+
+    def _claim(self, db: AutopilotDB, cfg: WorkflowConfig, n: int) -> int:
+        slot = f"{cfg.project_id}:slot-{n}"
+        db.upsert_project(cfg)
+        db.ensure_lease_slots(cfg.project_id, [slot], self.base / "locks")
+        ukey = f"{cfg.project_id}#{n}"
+        db.ensure_work_unit(unit_key=ukey, project_id=cfg.project_id, repo="o/r", issue_number=n)
+        return db.claim_and_reserve(
+            unit_key=ukey, cfg=cfg, slot_keys=[slot], worker_unit_name=f"u{n}.service",
+            expected_cgroup_dir=f"/cg/nonexistent_{n}", base_sha="0000000", authorized_head_ref=f"agent/{n}",
+        )
+
+    def test_global_cap_blocks_second_heavy_project_but_not_routines(self) -> None:
+        from ap_core.host_guard import count_global_heavy_claims, load_global_limits
+
+        self.assertEqual(load_global_limits().max_global_in_progress, 1)
+        db = AutopilotDB(self.base / "a.db")
+        try:
+            self._claim(db, self._cfg("p1"), 1)
+            with self.assertRaises(AutopilotError) as ctx:
+                self._claim(db, self._cfg("p2"), 2)
+            self.assertIn("Global WIP limit", str(ctx.exception))
+            with self.assertRaises(AutopilotError):
+                self._claim(db, self._cfg("p3", kind="delegated"), 3)
+            # Routines are lightweight and stay exempt from the heavy-worker cap.
+            self._claim(db, self._cfg("r1", kind="routine"), 4)
+            self.assertEqual(count_global_heavy_claims(db._conn), 1)
+            # Operator override via <config>/global.json raises the cap.
+            (self.cfg_dir / "global.json").write_text(json.dumps({"max_global_in_progress": 2}), encoding="utf-8")
+            self._claim(db, self._cfg("p2"), 5)
+            self.assertEqual(count_global_heavy_claims(db._conn), 2)
+            # A claim stuck in `reclaiming` (worker already dead, cleanup retained for inspection) frees its global slot.
+            (self.cfg_dir / "global.json").unlink()
+            first = db._conn.execute("SELECT claim_epoch FROM run_claims WHERE unit_key = 'p1#1'").fetchone()[0]
+            second = db._conn.execute("SELECT claim_epoch FROM run_claims WHERE unit_key = 'p2#5'").fetchone()[0]
+            db.begin_reclaim_claim(int(first))
+            db.begin_reclaim_claim(int(second))
+            self.assertEqual(count_global_heavy_claims(db._conn), 0)
+            self._claim(db, self._cfg("p7"), 7)
+        finally:
+            db.close()
+
+    def test_global_limits_malformed_values_fall_back_to_safe_defaults(self) -> None:
+        from ap_core.host_guard import load_global_limits
+
+        (self.cfg_dir / "global.json").write_text(
+            json.dumps({"max_global_in_progress": 0, "host_max_steal_pct": "x", "host_max_load1": -1}), encoding="utf-8"
+        )
+        lim = load_global_limits()
+        self.assertEqual((lim.max_global_in_progress, lim.max_steal_pct, lim.max_load1), (1, 15.0, 4.0))
+        (self.cfg_dir / "global.json").write_text("{not json", encoding="utf-8")
+        self.assertEqual(load_global_limits().max_global_in_progress, 1)
+        with unittest.mock.patch.dict(os.environ, {"AGENT_AUTOPILOT_MAX_GLOBAL_IN_PROGRESS": "3"}):
+            self.assertEqual(load_global_limits().max_global_in_progress, 3)
+
+    def _pressure(self, steal_delta: int, load1: str) -> dict:
+        from ap_core.host_guard import GlobalLimits, sample_host_pressure
+
+        stat = self.base / "stat"
+        loadavg = self.base / "loadavg"
+        # user nice system idle iowait irq softirq steal guest guest_nice
+        stat.write_text("cpu  1000 0 100 5000 0 0 0 100 0 0\ncpu0 1 2 3\n", encoding="ascii")
+        loadavg.write_text(f"{load1} 1.00 1.00 1/100 12345\n", encoding="ascii")
+
+        def _advance(_sec: float) -> None:
+            # 100 elapsed jiffies, `steal_delta` of them stolen by the hypervisor.
+            stat.write_text(
+                f"cpu  {1000 + 100 - steal_delta} 0 100 5000 0 0 0 {100 + steal_delta} 0 0\n", encoding="ascii"
+            )
+
+        return sample_host_pressure(GlobalLimits(), stat_path=stat, loadavg_path=loadavg, sleep=_advance)
+
+    def test_steal_and_load_backoff_thresholds(self) -> None:
+        calm = self._pressure(steal_delta=2, load1="1.50")
+        self.assertFalse(calm["pressured"], calm)
+        self.assertEqual(calm["steal_pct"], 2.0)
+        stolen = self._pressure(steal_delta=60, load1="1.50")
+        self.assertTrue(stolen["pressured"])
+        self.assertTrue(any(r.startswith("cpu_steal_pct:60.0") for r in stolen["reasons"]), stolen)
+        loaded = self._pressure(steal_delta=0, load1="14.90")
+        self.assertTrue(loaded["pressured"])
+        self.assertEqual(loaded["reasons"], ["load1:14.9>4.0"])
+        # Unreadable metrics fail open (global cap still bounds concurrency).
+        from ap_core.host_guard import GlobalLimits, sample_host_pressure
+
+        blind = sample_host_pressure(GlobalLimits(), stat_path=self.base / "nope", loadavg_path=self.base / "nope2", sleep=lambda _s: None)
+        self.assertFalse(blind["pressured"])
+
+    def test_dispatch_gate_holds_heavy_projects_as_ordinary_wait(self) -> None:
+        import agent_autopilot as ap_cli
+
+        wfs = {"p1": self._cfg("p1"), "r1": self._cfg("r1", kind="routine")}
+        db = AutopilotDB(self.base / "g.db")
+        try:
+            hot = {"pressured": True, "reasons": ["cpu_steal_pct:59.0>15.0"], "steal_pct": 59.0, "load1": 15.0}
+            with unittest.mock.patch.object(ap_cli, "sample_host_pressure", return_value=hot) as sp:
+                gate = ap_cli._host_admission_gate(db, wfs)
+            sp.assert_called_once()
+            self.assertEqual(gate["hold_reason"], "waiting_host_capacity:cpu_steal_pct:59.0>15.0")
+            ap_cli._record_host_gate(self.base, gate)
+            rec = json.loads((self.base / "host_gate.json").read_text(encoding="utf-8"))
+            self.assertTrue(rec["waiting"])
+
+            calm = {"pressured": False, "reasons": [], "steal_pct": 0.0, "load1": 0.5}
+            with unittest.mock.patch.object(ap_cli, "sample_host_pressure", return_value=calm):
+                self.assertEqual(ap_cli._host_admission_gate(db, wfs)["hold_reason"], "")
+
+            # Global slot already taken -> hold WITHOUT spending the 1s steal sample.
+            self._claim(db, self._cfg("p1"), 1)
+            with unittest.mock.patch.object(ap_cli, "sample_host_pressure") as sp2:
+                gate2 = ap_cli._host_admission_gate(db, wfs)
+            sp2.assert_not_called()
+            self.assertEqual(gate2["hold_reason"], "global_wip_limit_reached:1/1")
+
+            # Routine-only fleets never sample or hold.
+            with unittest.mock.patch.object(ap_cli, "sample_host_pressure") as sp3:
+                self.assertEqual(ap_cli._host_admission_gate(db, {"r1": wfs["r1"]})["hold_reason"], "")
+            sp3.assert_not_called()
+        finally:
+            db.close()
+
+    def test_transient_units_are_niced_and_rings_cap_fanout(self) -> None:
+        import ap_core.sandbox as sbx
+
+        captured: list[list[str]] = []
+
+        def _fake_run(argv, *a, **kw):
+            captured.append(list(argv))
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+        with unittest.mock.patch.object(sbx.subprocess, "run", side_effect=_fake_run):
+            spawn_transient_unit_under_flock(unit_name="ap-x", cmd=["/bin/true"], wait=False, unit_kind="worker")
+        argv = captured[0]
+        self.assertIn("--slice=app-autopilot.slice", argv)
+        self.assertEqual(argv[argv.index("Nice=15") - 1], "-p")
+
+        ct = self.base / "ct"
+        vo = self.base / "vo"
+        ct.mkdir()
+        vo.mkdir()
+        v_argv = build_execution_ring_bwrap(
+            ring_kind="verify_ring", inner_cmd=["/bin/true"], cwd=vo, clean_tree=ct, verify_out_dir=vo,
+            extra_env={"GOMAXPROCS": "1"},
+        )
+
+        def _envs(av: list[str]) -> dict[str, list[str]]:
+            out: dict[str, list[str]] = {}
+            for i, tok in enumerate(av[: av.index("--")]):
+                if tok == "--setenv":
+                    out.setdefault(av[i + 1], []).append(av[i + 2])
+            return out
+
+        env_v = _envs(v_argv)
+        self.assertEqual(env_v["GOMAXPROCS"], ["1"], "explicit verify_env MUST override the default fan-out cap")
+        self.assertEqual(env_v["RAYON_NUM_THREADS"], ["2"])
+        self.assertEqual(env_v["UV_THREADPOOL_SIZE"], ["2"])
+        self.assertEqual(env_v["PLAYWRIGHT_WORKERS"], ["1"])
+
+    def test_slice_template_stays_below_burst_baseline(self) -> None:
+        tpl = (REPO_ROOT / "skills" / "agent-autopilot" / "templates" / "app-autopilot.slice").read_text(encoding="utf-8")
+        kv = dict(ln.split("=", 1) for ln in tpl.splitlines() if "=" in ln and not ln.startswith("#"))
+        self.assertEqual(kv["CPUWeight"], "10")
+        self.assertLess(int(kv["CPUQuota"].rstrip("%")), 160, "4 vCPU burstable baseline is 160%")
+        self.assertEqual((kv["IOWeight"], kv["MemoryHigh"], kv["MemoryMax"]), ("20", "6G", "8G"))
+        self.assertIn("templates/app-autopilot.slice", (REPO_ROOT / "install.sh").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

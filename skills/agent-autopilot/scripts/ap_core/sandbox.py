@@ -19,7 +19,11 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+from .host_guard import CPU_FANOUT_LIMIT_ENV
 from .models import POLICY_MANIFEST, SandboxError, ensure_secure_dir, sanitize_terminal_text
+
+# Background transient units yield CPU to interactive sessions inside their slice (slice-level CPUQuota is the hard cap).
+BACKGROUND_UNIT_NICE = 15
 
 _CONNECT_LINE_RE = re.compile(r"^CONNECT\s+([A-Za-z0-9._-]+):(\d+)\s+HTTP/1\.[01]$", re.IGNORECASE)
 _IP_LITERAL_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$|^\[.*\]$")
@@ -1950,6 +1954,12 @@ def build_execution_ring_bwrap(
         argv.extend(["--setenv", "HOME", "/tmp", "--setenv", "CI", "1"])
 
     argv.extend(["--setenv", "PATH", ":".join(path_dirs), "--setenv", "LANG", "C.UTF-8"])
+    if ring_kind in ("tool_ring", "verify_ring"):
+        # Cap toolchain-internal process/thread pools (go test, rayon, libuv, playwright) on small burstable hosts;
+        # explicit extra_env below (e.g. WORKFLOW verify_env) is emitted later and therefore still wins.
+        for k, v in CPU_FANOUT_LIMIT_ENV.items():
+            if k not in (extra_env or {}):
+                argv.extend(["--setenv", k, v])
     for k, v in (extra_env or {}).items():
         argv.extend(["--setenv", k, v])
     argv.extend(["--", *inner_cmd])
@@ -2634,6 +2644,8 @@ def spawn_transient_unit_under_flock(
         f"RuntimeMaxSec={limits['runtime_max_sec']}s",
         "-p",
         f"TimeoutStopSec={limits['timeout_stop_sec']}s",
+        "-p",
+        f"Nice={BACKGROUND_UNIT_NICE}",
     ]
     for k, v in (extra_env or {}).items():
         sd_args.extend([f"--setenv={k}={v}"])
