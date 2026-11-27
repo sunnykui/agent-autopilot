@@ -14,9 +14,12 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+# Legacy state-machine suites claim across many projects at once; the host-wide heavy cap has its own tests below.
+os.environ.setdefault("AGENT_AUTOPILOT_MAX_GLOBAL_IN_PROGRESS", "1000")
 AP_SCRIPTS = REPO_ROOT / "skills" / "agent-autopilot" / "scripts"
 if str(AP_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(AP_SCRIPTS))
@@ -1047,6 +1050,125 @@ class TestChefPipelineDreamAndQuota(unittest.TestCase):
 
 
 class TestCodeReviewHardeningInvariants(unittest.TestCase):
+    def test_scope_violation_feedback_and_hard_stop_escalation(self) -> None:
+        """Out-of-scope edits become writer feedback (one round); protected paths escalate to a human without retries."""
+
+        class _ScopeRunner(_ScriptedChefRunner):
+            def __init__(self, extra_rel: str, schedule: list[int]) -> None:
+                super().__init__(schedule, use_outbox=False)
+                self.extra_rel = extra_rel
+                self.writer_prompts: list[str] = []
+
+            def run_writer(self, **kw: Any) -> ModelTurnResult:
+                self.writer_prompts.append(kw["prompt"])
+                res = super().run_writer(**kw)
+                extra = kw["worktree"] / self.extra_rel
+                if self._round == 1:
+                    extra.parent.mkdir(parents=True, exist_ok=True)
+                    extra.write_text("stray\n", encoding="utf-8")
+                elif extra.exists():
+                    extra.unlink()
+                return res
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo_main = base / "repo"
+            base_sha = _init_git_repo(repo_main)
+            sroot = base / "state"
+            db = AutopilotDB(sroot / "autopilot.db")
+            try:
+                cfg = WorkflowConfig(
+                    project_id="demo", kind="issue", enabled=True, repos=("org/demo",), workspace_path=str(repo_main),
+                    trust_tier="T2", writer_family="codex", write_scope=("src/**",),
+                )
+                db.upsert_project(cfg)
+                db.ensure_lease_slots("demo", ["s1"], sroot / "locks")
+                mg = ensure_managed_bare_repo(repo_main, base / "mg.git")
+
+                def _run(num: int, runner: _ScopeRunner) -> dict[str, Any]:
+                    ukey = f"org/demo#{num}"
+                    db.ensure_work_unit(unit_key=ukey, project_id="demo", repo="org/demo", issue_number=num)
+                    ce = db.claim_and_reserve(
+                        unit_key=ukey, cfg=cfg, slot_keys=["s1"], worker_unit_name=f"w{num}.service",
+                        expected_cgroup_dir=f"/cg/{num}", base_sha=base_sha, authorized_head_ref=f"agent/issue-{num}",
+                        bound_gh_login="autopilot-bot", ephemeral_token_file="/tmp/ap-test.tok",
+                    )
+                    try:
+                        return execute_chef_issue_pipeline(
+                            db=db, cfg=cfg, unit_key=ukey, repo="org/demo", issue_summary=f"#{num} Fix calc.add",
+                            claim_epoch=ce, managed_gitdir=mg, worktree_dir=base / f"wt{num}", repo_main=repo_main,
+                            run_dir=base / f"run{num}", advisory_dir=sroot / "advisory" / "demo", model_runner=runner,
+                            gh_transport=FakeGitHubTransport(), hmac_secret=b"test-secret",
+                        )
+                    finally:
+                        db.begin_reclaim_claim(ce)
+                        db.finish_reclaim_leases_free(ce, cleanup_rc=0, unit_terminated=True, worktree_clean=True)
+
+                # File name mentions the hard-stop token on purpose: it must still be treated as plain out-of-scope feedback.
+                r_scope = _ScopeRunner("docs/global_hard_stop.md", [9, 0])
+                res_scope = _run(20, r_scope)
+                self.assertEqual(res_scope["status"], "published")
+                self.assertEqual(len(r_scope.writer_prompts), 2)
+                self.assertIn("<scope_violation", r_scope.writer_prompts[1])
+                self.assertIn("docs/global_hard_stop.md", r_scope.writer_prompts[1])
+
+                r_hard = _ScopeRunner(".github/workflows/ci.yml", [0, 0])
+                res_hard = _run(21, r_hard)
+                self.assertEqual(res_hard["reason"], "hard_stop_paths")
+                self.assertEqual(len(r_hard.writer_prompts), 1)
+                self.assertEqual(db.get_unit("org/demo#21")["terminal_state"], "needs-human")
+
+                # Writer that never changes anything: one feedback round per attempt, then escalate with its explanation.
+                class _NoopRunner(_ScopeRunner):
+                    def run_writer(self, **kw: Any) -> ModelTurnResult:
+                        self.writer_prompts.append(kw["prompt"])
+                        self._round += 1
+                        return ModelTurnResult(raw_stdout=json.dumps({
+                            "summary_le_300_chars": "Vendor procurement pending; nothing to change in repo",
+                            "changed_files": [], "executed_checks": [], "uncertainties": ["needs vendor contract"],
+                        }))
+
+                r_noop = _NoopRunner("unused", [0, 0, 0])
+                res_noop = _run(22, r_noop)
+                self.assertEqual(res_noop["reason"], "empty_candidate")
+                self.assertEqual(len(r_noop.writer_prompts), 3)
+                self.assertIn("<empty_candidate", r_noop.writer_prompts[1])
+                self.assertIn("Vendor procurement pending", db.get_unit("org/demo#22")["last_error"])
+            finally:
+                db.close()
+
+    def test_claude_elf_stage_dir_is_resolved_for_bwrap(self) -> None:
+        """Pinned /proc/self/fd run dirs must be resolved before handing ELF library sources to bwrap."""
+        from ap_core.models import ensure_secure_dir, pinned_proc_fd_path
+        from ap_core.sandbox import build_model_ring_bwrap
+
+        bins = {k: v for k, v in __import__("agent_autopilot").resolve_host_binaries().items()}
+        if "claude_cli" not in bins:
+            self.skipTest("claude CLI not installed")
+        with tempfile.TemporaryDirectory() as td:
+            real_run = ensure_secure_dir(Path(td) / "run", 0o700)
+            fd = os.open(str(real_run), os.O_RDONLY | os.O_DIRECTORY)
+            retain: list[int] = []
+            try:
+                pinned = pinned_proc_fd_path(fd)
+                argv = build_model_ring_bwrap(
+                    role_key="claude:readonly_model", host_binaries=bins, sandbox_home=pinned / "sbh",
+                    outbox_dir=pinned / "obox", proxy_sock=None, inner_cmd=["/usr/local/bin/claude", "--version"],
+                    elf_lib_stage_dir=pinned / "elf_libs_stage",
+                    review_bundle_dir=ensure_secure_dir(real_run / "bundle", 0o700),
+                    retain_fds=retain,
+                )
+                path_srcs = [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "--ro-bind"]
+                self.assertFalse([s for s in path_srcs if "elf_libs_stage" in s or s.startswith("/proc/")], path_srcs)
+                fd_binds = [(argv[i + 1], argv[i + 2]) for i, a in enumerate(argv[:-2]) if a == "--ro-bind-fd" and argv[i + 2].startswith("/usr/lib")]
+                self.assertTrue(fd_binds, "staged ELF libraries must be bound by inode-pinned fds")
+                for fd_s, _tgt in fd_binds:
+                    self.assertIn(int(fd_s), retain, "every staged-library fd must be retained for pass_fds")
+            finally:
+                for rfd in retain:
+                    os.close(rfd)
+                os.close(fd)
+
     def test_multithread_tx_isolation_oneshot_grant_timeout_safety_t3_paths_and_claude_elf(self) -> None:
         from unittest import mock
         from ap_core.git_gate import resolve_repo_common_objects_dir
@@ -5304,6 +5426,642 @@ class TestCodeReviewHardeningInvariants(unittest.TestCase):
                         self.assertIn("go env -json failed", str(gf_ctx.exception))
             finally:
                 db.close()
+
+    def test_multi_slot_parallel_dispatch_and_force_promotion(self) -> None:
+        """Multi-slot issue submission binds distinct slots (slot-1..slot-3) concurrently and enforces cap."""
+        from unittest import mock
+        import agent_autopilot as ap_cli
+        from ap_core.models import ensure_secure_dir
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            src_r = base / "src_repo_ms"
+            sha_ms = _init_git_repo(src_r)
+            sroot = ensure_secure_dir(base / "state_ms", 0o700)
+            croot = ensure_secure_dir(base / "cache_ms", 0o700)
+            db = AutopilotDB(sroot / "autopilot.db")
+            try:
+                cfg = WorkflowConfig(
+                    project_id="p_multi",
+                    kind="issue",
+                    enabled=True,
+                    repos=("org/repo",),
+                    workspace_path=str(src_r),
+                    max_in_progress=3,
+                    write_scope=("src/**",),
+                )
+                db.upsert_project(cfg)
+                # Initial staircase cap is 1 until promoted:
+                self.assertEqual(ap_cli._project_effective_cap(cfg, db), 1)
+                with self.assertRaises(AutopilotError):
+                    db.approve_concurrency_promotion("p_multi", target_cap=3)
+                with self.assertRaises(AutopilotError):
+                    db.approve_concurrency_promotion("p_multi", force=True, target_cap=99)
+                self.assertEqual(db.approve_concurrency_promotion("p_multi", force=True, target_cap=3), 3)
+                self.assertEqual(ap_cli._project_effective_cap(cfg, db), 3)
+
+                with mock.patch.dict(os.environ, {"AGENT_AUTOPILOT_CACHE_DIR": str(croot)}):
+                    rc = ap_cli.repo_cache_dir("p_multi", "org/repo")
+                    mg = ensure_managed_bare_repo(src_r, rc / "managed.git")
+                    pf = {"org/repo": (mg, sha_ms)}
+                    pre_gh = ("ghp_dummy_token_for_unit_test_1234567890", "bot-user")
+                    ok_sd = subprocess.CompletedProcess(args=["systemd-run"], returncode=0, stdout="", stderr="")
+                    # Also verify that if slot-1 is free in SQLite but its .flock is held by a dying process (BlockingIOError),
+                    # submission seamlessly skips slot-1 and allocates slot-2!
+                    db.ensure_lease_slots("p_multi", ["p_multi:slot-1", "p_multi:slot-2", "p_multi:slot-3"], sroot / "locks")
+                    s1_flock_path = db._conn.execute("SELECT flock_path FROM leases WHERE slot_key = 'p_multi:slot-1'").fetchone()["flock_path"]
+                    held_fd = os.open(s1_flock_path, os.O_CREAT | os.O_RDWR, 0o600)
+                    try:
+                        fcntl.flock(held_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        with mock.patch.object(ap_cli, "spawn_transient_unit_under_flock", return_value=ok_sd):
+                            s_skip = ap_cli._submit_issue_worker_nonblocking(
+                                cfg=cfg, db=db, state_root=sroot,
+                                cand={"unit_key": "org/repo#1", "repo": "org/repo", "number": 1, "title": "one"},
+                                prefetched_bases=pf, pre_resolved_gh=pre_gh,
+                            )
+                            self.assertEqual(s_skip["slot_key"], "p_multi:slot-2")
+                    finally:
+                        fcntl.flock(held_fd, fcntl.LOCK_UN)
+                        os.close(held_fd)
+
+                    with mock.patch.object(ap_cli, "spawn_transient_unit_under_flock", return_value=ok_sd):
+                        s2 = ap_cli._submit_issue_worker_nonblocking(
+                            cfg=cfg, db=db, state_root=sroot,
+                            cand={"unit_key": "org/repo#2", "repo": "org/repo", "number": 2, "title": "two"},
+                            prefetched_bases=pf, pre_resolved_gh=pre_gh,
+                        )
+                        s3 = ap_cli._submit_issue_worker_nonblocking(
+                            cfg=cfg, db=db, state_root=sroot,
+                            cand={"unit_key": "org/repo#3", "repo": "org/repo", "number": 3, "title": "three"},
+                            prefetched_bases=pf, pre_resolved_gh=pre_gh,
+                        )
+                        self.assertEqual(
+                            sorted([s_skip["slot_key"], s2["slot_key"], s3["slot_key"]]),
+                            ["p_multi:slot-1", "p_multi:slot-2", "p_multi:slot-3"],
+                        )
+                        with self.assertRaises(AutopilotError):
+                            ap_cli._submit_issue_worker_nonblocking(
+                                cfg=cfg, db=db, state_root=sroot,
+                                cand={"unit_key": "org/repo#4", "repo": "org/repo", "number": 4, "title": "four"},
+                                prefetched_bases=pf, pre_resolved_gh=pre_gh,
+                            )
+                # Step back down to 1 cleanly:
+                self.assertEqual(db.approve_concurrency_promotion("p_multi", force=True, target_cap=1), 1)
+                self.assertEqual(ap_cli._project_effective_cap(cfg, db), 1)
+
+                # Also verify `prepare_ro_workspace_dep_bind_args` creates missing `.vite-temp`/`.cache` mountpoints and overlays writable `--tmpfs` inside bwrap:
+                from ap_core.sandbox import build_execution_ring_bwrap, prepare_ro_workspace_dep_bind_args
+                nm_src = ensure_secure_dir(src_r / "apps" / "web" / "node_modules", 0o755)
+                (nm_src / "pkg.js").write_text("module.exports = 1;\n", encoding="utf-8")
+                tgt_wt = ensure_secure_dir(base / "tgt_wt", 0o700)
+                ensure_secure_dir(tgt_wt / "apps" / "web", 0o700)
+                ret_fds: list[int] = []
+                try:
+                    b_args = prepare_ro_workspace_dep_bind_args(
+                        src_r, ("apps/web/node_modules",), tgt_wt, retain_fds=ret_fds
+                    )
+                    self.assertIn("--tmpfs", b_args)
+                    self.assertIn(str(tgt_wt.resolve() / "apps/web/node_modules/.vite-temp"), b_args)
+                    self.assertIn(str(tgt_wt.resolve() / "apps/web/node_modules/.cache"), b_args)
+                finally:
+                    for _fd in ret_fds:
+                        os.close(_fd)
+                vo_fds: list[int] = []
+                try:
+                    ct_t = ensure_secure_dir(base / "ct_nm", 0o700)
+                    ensure_secure_dir(ct_t / "apps" / "web", 0o700)
+                    vo_t = base / "vo_nm"
+                    v_argv = build_execution_ring_bwrap(
+                        ring_kind="verify_ring",
+                        inner_cmd=[
+                            "/bin/bash",
+                            "-lc",
+                            "echo a > apps/web/node_modules/.vite-temp/p.mjs && "
+                            "echo b > apps/web/node_modules/.vite/p.mjs && "
+                            "echo c > apps/web/node_modules/.cache/p.mjs && "
+                            "test -f apps/web/node_modules/pkg.js",
+                        ],
+                        cwd=vo_t,
+                        clean_tree=ct_t,
+                        verify_out_dir=vo_t,
+                        repo_main_dir=src_r,
+                        ro_workspace_deps=("apps/web/node_modules",),
+                        retain_fds=vo_fds,
+                    )
+                    vp = subprocess.run(v_argv, pass_fds=tuple(vo_fds), capture_output=True, text=True, timeout=30)
+                    self.assertEqual(vp.returncode, 0, vp.stderr)
+                    for sub_nm in (".vite-temp", ".vite", ".cache"):
+                        self.assertFalse((nm_src / sub_nm / "p.mjs").exists())
+                finally:
+                    for _fd in vo_fds:
+                        os.close(_fd)
+
+                # Also verify read-only (0555) host `node_modules` without `.vite-temp` does NOT crash sandbox setup:
+                nm_ro = ensure_secure_dir(src_r / "apps" / "ro_pkg" / "node_modules", 0o755)
+                os.chmod(nm_ro, 0o555)
+                ensure_secure_dir(tgt_wt / "apps" / "ro_pkg", 0o700)
+                ro_fds_chk: list[int] = []
+                try:
+                    ro_args = prepare_ro_workspace_dep_bind_args(
+                        src_r, ("apps/ro_pkg/node_modules",), tgt_wt, retain_fds=ro_fds_chk
+                    )
+                    self.assertIn("--ro-bind-fd", ro_args)
+                    self.assertNotIn("--tmpfs", ro_args)
+                finally:
+                    os.chmod(nm_ro, 0o755)
+                    for _fd in ro_fds_chk:
+                        os.close(_fd)
+
+                # Verify `prepare_isolated_worktree` is safe under concurrent threads sharing `managed.git`:
+                import concurrent.futures
+                from ap_core.git_gate import prepare_isolated_worktree
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+                    futs = [
+                        pool.submit(
+                            prepare_isolated_worktree,
+                            managed_gitdir=mg,
+                            worktree_dir=rc / "worktrees" / f"wt-conc-{idx}",
+                            base_sha=sha_ms,
+                        )
+                        for idx in range(3)
+                    ]
+                    wt_results = [f.result() for f in futs]
+                    self.assertEqual(len(wt_results), 3)
+
+                # Verify `delegated-exec --cmd ...` parser stores `delegated_shell_cmd` without overwriting `args.cmd`:
+                parsed_de = ap_cli.build_parser().parse_args(
+                    ["delegated-exec", "--claim-epoch", "99", "--token-file", "", "--cmd", "echo hello"]
+                )
+                self.assertEqual(parsed_de.cmd, "delegated-exec")
+                self.assertEqual(parsed_de.delegated_shell_cmd, "echo hello")
+            finally:
+                db.close()
+
+    def test_baseline_red_helpers_and_delegated_precheck_interval(self) -> None:
+        """Base-tree export for baseline-red detection, and delegated continuation wakeups honoring schedule_interval_sec."""
+        from ap_core.chef_loop import _paths_present_in_tree
+        from ap_core.git_gate import export_base_clean_tree
+        from ap_core.models import ensure_secure_dir
+        from ap_core.routine_flow import probe_delegated_zero_token
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            src_r = base / "src_repo_br"
+            sha_br = _init_git_repo(src_r)
+            mg = ensure_managed_bare_repo(src_r, ensure_secure_dir(base / "cache_br", 0o700) / "managed.git")
+            run_dir = ensure_secure_dir(base / "run_br", 0o700)
+            ct, ct_fd = export_base_clean_tree(managed_gitdir=mg, base_sha=sha_br, clean_tree_dir=run_dir / "base-tree-x")
+            try:
+                self.assertTrue((ct / "src" / "calc.py").is_file())
+                self.assertEqual(_paths_present_in_tree(ct, ("src/calc.py", "src/new_file.py")), ("src/calc.py",))
+            finally:
+                os.close(ct_fd)
+            with self.assertRaises(AutopilotError):
+                export_base_clean_tree(managed_gitdir=mg, base_sha="0" * 40, clean_tree_dir=run_dir / "base-tree-y")
+
+            ws = ensure_secure_dir(base / "ws_del", 0o700)
+            db = AutopilotDB(base / "state_del.db")
+            try:
+                cfg = WorkflowConfig(
+                    project_id="p_del",
+                    kind="delegated",
+                    enabled=True,
+                    repos=(),
+                    workspace_path=str(ws),
+                    schedule_interval_sec=3600,
+                    extra={"precheck_cmd": "exit 0", "runner_config_rel": "none"},
+                )
+                db.upsert_project(cfg)
+                db.ensure_work_unit(unit_key="p_del:delegated", project_id="p_del")
+                db.ensure_lease_slots("p_del", ["p_del:slot-1"], base / "locks_del")
+                ce = db.claim_and_reserve(
+                    unit_key="p_del:delegated", cfg=cfg, slot_keys=["p_del:slot-1"], worker_unit_name="ap-x.service",
+                    expected_cgroup_dir="/nonexistent", base_sha="delegated", authorized_head_ref="agent/delegated",
+                )
+                with db.immediate_tx():
+                    db._conn.execute("UPDATE run_claims SET state = 'released' WHERE claim_epoch = ?", (ce,))
+                res = probe_delegated_zero_token(cfg, db)
+                self.assertFalse(res["actionable"])
+                self.assertEqual(res["reason"], "delegated_precheck_within_interval")
+                # Once the interval elapses, continuation wakeups are evaluated again (never permanently suppressed):
+                from ap_core.routine_flow import delegated_precheck_cooldown_active
+                self.assertTrue(delegated_precheck_cooldown_active(cfg, db))
+                with db.immediate_tx():
+                    db._conn.execute("UPDATE run_claims SET created_at = '2000-01-01T00:00:00+00:00' WHERE claim_epoch = ?", (ce,))
+                self.assertFalse(delegated_precheck_cooldown_active(cfg, db))
+                self.assertNotEqual(probe_delegated_zero_token(cfg, db)["reason"], "delegated_precheck_within_interval")
+            finally:
+                db.close()
+
+        # Verify timeouts become ordinary failing results (rc=124) whose message is part of the failure signature:
+        from ap_core.chef_loop import _failure_signature, _run_verify_subprocess, _verify_timeout
+        to = _run_verify_subprocess(["/bin/bash", "-c", "echo partial-output; sleep 5"], timeout_sec=1)
+        self.assertEqual(to.returncode, 124)
+        self.assertIn("verify timed out after 1s", to.stderr)
+        self.assertIn("error: verify timed out after 1s", _failure_signature(to.stdout + "\n" + to.stderr))
+        self.assertEqual(_verify_timeout(WorkflowConfig(project_id="t", kind="issue", enabled=True, repos=(), workspace_path="/tmp", extra={"verify_timeout_sec": 1200})), 1200)
+        self.assertEqual(_verify_timeout(WorkflowConfig(project_id="t", kind="issue", enabled=True, repos=(), workspace_path="/tmp", extra={"verify_timeout_sec": 5})), 60)
+        self.assertEqual(_verify_timeout(WorkflowConfig(project_id="t", kind="issue", enabled=True, repos=(), workspace_path="/tmp", extra={"verify_timeout_sec": 0})), 60)
+        self.assertEqual(_verify_timeout(WorkflowConfig(project_id="t", kind="issue", enabled=True, repos=(), workspace_path="/tmp")), 300)
+
+        # Baseline-red classification: only when EVERY candidate failure line already fails on the base.
+        from ap_core.chef_loop import (
+            BASELINE_RED_MAX_WAITS,
+            _baseline_red_count,
+            _is_same_baseline_failure,
+            _park_unit_for_baseline_red,
+        )
+        from ap_core.models import QuotaExhaustedError
+        base_err = "src/a.ts(10,2): error TS2339: Property 'x' does not exist\n"
+        self.assertTrue(_is_same_baseline_failure(base_err, 2, base_err + "Found 1 error.\n"))
+        self.assertFalse(_is_same_baseline_failure(base_err + "FAIL src/new.spec.ts\n", 2, base_err))
+        self.assertFalse(_is_same_baseline_failure(base_err, 0, ""))
+        self.assertFalse(_is_same_baseline_failure("", 1, base_err))
+        self.assertEqual(_baseline_red_count("baseline_red[4]: boom"), 4)
+        self.assertEqual(_baseline_red_count("max_retries_exceeded"), 0)
+        # Long lines are compared in full, and capped (possibly truncated) outputs are never classified as baseline-red:
+        from ap_core.chef_loop import VERIFY_FULL_OUTPUT_CAP
+        shared = "error: " + "x" * 300
+        self.assertFalse(_is_same_baseline_failure(shared + " candidate-only", 1, shared + " base"))
+        self.assertFalse(_is_same_baseline_failure(base_err + "y" * VERIFY_FULL_OUTPUT_CAP, 1, base_err))
+        just_under = "error: " + "x" * (VERIFY_FULL_OUTPUT_CAP - 8)
+        self.assertTrue(_is_same_baseline_failure(just_under, 1, just_under))
+        at_cap = "error: " + "x" * (VERIFY_FULL_OUTPUT_CAP - 7)
+        self.assertFalse(_is_same_baseline_failure(at_cap, 1, at_cap))
+
+        with tempfile.TemporaryDirectory() as td2:
+            b2 = Path(td2)
+            db2 = AutopilotDB(b2 / "state_br.db")
+            try:
+                cfg2 = WorkflowConfig(project_id="p_br", kind="issue", enabled=True, repos=("o/r",), workspace_path=str(b2), write_scope=("src/**",))
+                db2.upsert_project(cfg2)
+                db2.ensure_work_unit(unit_key="o/r#1", project_id="p_br", repo="o/r", issue_number=1)
+                for i in range(1, BASELINE_RED_MAX_WAITS):
+                    with self.assertRaises(QuotaExhaustedError):
+                        _park_unit_for_baseline_red(db=db2, cfg=cfg2, unit_key="o/r#1", base_sha="a" * 40, base_out=base_err, advisory_dir=b2 / "adv")
+                    u = db2.get_unit("o/r#1")
+                    self.assertEqual(_baseline_red_count(u["last_error"]), i)
+                    self.assertEqual(int(u["review_rounds_used"]), 0)
+                    self.assertEqual(u["status"], "waiting_quota")
+                res2 = _park_unit_for_baseline_red(db=db2, cfg=cfg2, unit_key="o/r#1", base_sha="a" * 40, base_out=base_err, advisory_dir=b2 / "adv")
+                self.assertEqual(res2["reason"], "baseline_red_persisted")
+                self.assertEqual(db2.get_unit("o/r#1")["terminal_state"], "needs-human")
+            finally:
+                db2.close()
+
+    def test_48_secret_scan_ignores_preexisting_base_fixtures_only(self) -> None:
+        """Editing unrelated lines in a file with a pre-existing secret fixture on base_sha passes; adding or duplicating secrets fails."""
+        from ap_core.git_gate import sample_and_gate_worktree
+
+        fixture_tok = "sk-" + "proj-" + "fixture0123456789abcdef01"
+        new_tok = "sk-" + "proj-" + "brandnew9876543210fedcba9"
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            src = base / "src_repo"
+            _init_git_repo(src)
+            (src / "src" / "redact_test.py").write_text(
+                f"FIXTURE = '{fixture_tok}'\nLABEL = 'old-name'\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "src/redact_test.py"], cwd=src, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "add redaction fixture"], cwd=src, check=True)
+            base_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=src, text=True).strip()
+
+            mg = ensure_managed_bare_repo(src, base / "cache" / "managed.git")
+            wt, wt_gd = prepare_isolated_worktree(
+                managed_gitdir=mg, worktree_dir=base / "cache" / "wt", base_sha=base_sha
+            )
+
+            # 1. Editing an unrelated line in the same file MUST pass:
+            (wt / "src" / "redact_test.py").write_text(
+                f"FIXTURE = '{fixture_tok}'\nLABEL = 'new-name'\n",
+                encoding="utf-8",
+            )
+            gate = sample_and_gate_worktree(
+                managed_gitdir=mg, wt_gitdir=wt_gd, worktree=wt, repo_main=src, base_sha=base_sha,
+                frozen_write_scope=("src/**",), run_dir=base / "run1", commit_message="rename label",
+            )
+            gate.close_fds()
+            self.assertEqual(gate.touched_paths, ("src/redact_test.py",))
+
+            # 2. Duplicating the pre-existing secret fixture MUST still fail:
+            (wt / "src" / "redact_test.py").write_text(
+                f"FIXTURE = '{fixture_tok}'\nDUP = '{fixture_tok}'\nLABEL = 'new-name'\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ScopeViolationError):
+                sample_and_gate_worktree(
+                    managed_gitdir=mg, wt_gitdir=wt_gd, worktree=wt, repo_main=src, base_sha=base_sha,
+                    frozen_write_scope=("src/**",), run_dir=base / "run2", commit_message="dup secret",
+                )
+
+            # 3. Introducing a new secret in an existing file MUST fail:
+            (wt / "src" / "redact_test.py").write_text(
+                f"FIXTURE = '{fixture_tok}'\nOTHER = '{new_tok}'\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ScopeViolationError):
+                sample_and_gate_worktree(
+                    managed_gitdir=mg, wt_gitdir=wt_gd, worktree=wt, repo_main=src, base_sha=base_sha,
+                    frozen_write_scope=("src/**",), run_dir=base / "run3", commit_message="new secret",
+                )
+
+            # 4. Copying a pre-existing secret into a brand-new file MUST fail:
+            (wt / "src" / "redact_test.py").write_text(
+                f"FIXTURE = '{fixture_tok}'\nLABEL = 'new-name'\n",
+                encoding="utf-8",
+            )
+            (wt / "src" / "copied_secret.py").write_text(f"LEAK = '{fixture_tok}'\n", encoding="utf-8")
+            with self.assertRaises(ScopeViolationError):
+                sample_and_gate_worktree(
+                    managed_gitdir=mg, wt_gitdir=wt_gd, worktree=wt, repo_main=src, base_sha=base_sha,
+                    frozen_write_scope=("src/**",), run_dir=base / "run4", commit_message="copy secret",
+                )
+            (wt / "src" / "copied_secret.py").unlink()
+
+            # 5. Replacing the body of a pre-existing PEM private key fixture MUST fail (header-only match cannot bypass):
+            pem_hdr = "-----BEGIN " + "PRIVATE KEY-----"
+            pem_ftr = "-----END " + "PRIVATE KEY-----"
+            (src / "src" / "pem_test.py").write_text(f"KEY = '''{pem_hdr}\nOLD_BODY_DATA\n{pem_ftr}'''\nLABEL = 'a'\n", encoding="utf-8")
+            subprocess.run(["git", "add", "src/pem_test.py"], cwd=src, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "add pem fixture"], cwd=src, check=True)
+            base_sha2 = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=src, text=True).strip()
+            mg2 = ensure_managed_bare_repo(src, base / "cache2" / "managed.git")
+            wt2, wt_gd2 = prepare_isolated_worktree(
+                managed_gitdir=mg2, worktree_dir=base / "cache2" / "wt", base_sha=base_sha2
+            )
+            (wt2 / "src" / "pem_test.py").write_text(f"KEY = '''{pem_hdr}\nOLD_BODY_DATA\n{pem_ftr}'''\nLABEL = 'updated'\n", encoding="utf-8")
+            gate2 = sample_and_gate_worktree(
+                managed_gitdir=mg2, wt_gitdir=wt_gd2, worktree=wt2, repo_main=src, base_sha=base_sha2,
+                frozen_write_scope=("src/**",), run_dir=base / "run5", commit_message="untouched pem fixture",
+            )
+            gate2.close_fds()
+            (wt2 / "src" / "pem_test.py").write_text(f"KEY = '''{pem_hdr}\nNEW_STOLEN_KEY\n{pem_ftr}'''\nLABEL = 'mutated'\n", encoding="utf-8")
+            with self.assertRaises(ScopeViolationError):
+                sample_and_gate_worktree(
+                    managed_gitdir=mg2, wt_gitdir=wt_gd2, worktree=wt2, repo_main=src, base_sha=base_sha2,
+                    frozen_write_scope=("src/**",), run_dir=base / "run6", commit_message="mutated pem body",
+                )
+
+        # Delegated probe skips open issues that already have an open PR and honors schedule_interval_sec cooldown:
+        from ap_core.routine_flow import _delegated_open_pr_issue_numbers, probe_delegated_zero_token
+        cfg_pr = WorkflowConfig(project_id="p_pr_re", kind="delegated", enabled=True, repos=("o/r",), workspace_path="/tmp")
+        fake_gh_prs = json.dumps([
+            {"headRefName": "agent/42-fix", "title": "fix: handle other/repo#99 safely", "closingIssuesReferences": [{"number": 77, "url": "https://github.com/o/r/issues/77"}, {"number": 88, "url": "https://github.com/other/repo/issues/88"}]},
+            {"headRefName": "feat/misc", "title": "chore: link (#55 A)", "closingIssuesReferences": []},
+        ])
+        with unittest.mock.patch("ap_core.routine_flow.subprocess.run", return_value=subprocess.CompletedProcess(["gh"], 0, fake_gh_prs, "")):
+            parsed_prs = _delegated_open_pr_issue_numbers(cfg_pr, "o/r")
+        self.assertEqual(parsed_prs, {42, 55, 77})
+        with tempfile.TemporaryDirectory() as td_d:
+            bd = Path(td_d)
+            dbd = AutopilotDB(bd / "del.db")
+            try:
+                cfg_d = WorkflowConfig(
+                    project_id="p_del_pr", kind="delegated", enabled=True, repos=("o/r",),
+                    workspace_path=str(bd), schedule_interval_sec=1200,
+                    extra={"precheck_cmd": "exit 0", "runner_config_rel": "none"},
+                )
+                dbd.upsert_project(cfg_d)
+                dbd.ensure_work_unit(unit_key="p_del_pr:delegated", project_id="p_del_pr")
+                dbd.ensure_lease_slots("p_del_pr", ["p_del_pr:slot-1"], bd / "locks_d")
+                ced = dbd.claim_and_reserve(
+                    unit_key="p_del_pr:delegated", cfg=cfg_d, slot_keys=["p_del_pr:slot-1"], worker_unit_name="ap-d.service",
+                    expected_cgroup_dir="/nonexistent", base_sha="delegated", authorized_head_ref="agent/delegated",
+                )
+                with dbd.immediate_tx():
+                    dbd._conn.execute("UPDATE run_claims SET state = 'released' WHERE claim_epoch = ?", (ced,))
+                fake_issues = {"actionable": True, "reason": "found_open_issues", "candidates": [{"unit_key": "o/r#42", "repo": "o/r", "number": 42, "title": "t", "priority": 1}], "blocked_units": ["o/r#10"], "repo_errors": {}}
+                with (
+                    unittest.mock.patch("ap_core.routine_flow.probe_github_issues_zero_token", return_value=fake_issues),
+                    unittest.mock.patch("ap_core.routine_flow._delegated_open_pr_issue_numbers", return_value={42}),
+                ):
+                    r_pr = probe_delegated_zero_token(cfg_d, dbd)
+                    self.assertFalse(r_pr["actionable"])
+                with (
+                    unittest.mock.patch("ap_core.routine_flow.probe_github_issues_zero_token", return_value=fake_issues),
+                    unittest.mock.patch("ap_core.routine_flow._delegated_open_pr_issue_numbers", return_value=None),
+                ):
+                    r_err = probe_delegated_zero_token(cfg_d, dbd)
+                    self.assertFalse(r_err["actionable"])
+                    self.assertEqual(r_err["reason"], "delegated_pr_probe_within_interval")
+                # Multi-repo: PR lookup failure in repo A never starves confirmed-unstarted issue in repo B during cooldown:
+                multi_issues = {
+                    "actionable": True,
+                    "reason": "found_open_issues",
+                    "candidates": [
+                        {"unit_key": "o/r1#42", "repo": "o/r1", "number": 42, "title": "t1", "priority": 1},
+                        {"unit_key": "o/r2#43", "repo": "o/r2", "number": 43, "title": "t2", "priority": 1},
+                    ],
+                    "blocked_units": [],
+                    "repo_errors": {},
+                }
+                with (
+                    unittest.mock.patch("ap_core.routine_flow.probe_github_issues_zero_token", return_value=multi_issues),
+                    unittest.mock.patch("ap_core.routine_flow._delegated_open_pr_issue_numbers", side_effect=lambda _c, r: None if r == "o/r1" else set()),
+                ):
+                    r_multi = probe_delegated_zero_token(cfg_d, dbd)
+                    self.assertTrue(r_multi["actionable"])
+                    self.assertEqual([c["unit_key"] for c in r_multi["candidates"]], ["o/r2#43"])
+                with (
+                    unittest.mock.patch("ap_core.routine_flow.probe_github_issues_zero_token", return_value=fake_issues),
+                    unittest.mock.patch("ap_core.routine_flow._delegated_open_pr_issue_numbers", return_value={99}),
+                ):
+                    r_new = probe_delegated_zero_token(cfg_d, dbd)
+                    self.assertTrue(r_new["actionable"])
+                    self.assertEqual([c["number"] for c in r_new["candidates"]], [42])
+            finally:
+                dbd.close()
+
+
+class TestHostComputeGuards(unittest.TestCase):
+    """Machine-wide heavy worker cap, CPU steal / load backoff, Nice and toolchain fan-out caps (burstable hosts)."""
+
+    def setUp(self) -> None:
+        self._td = tempfile.TemporaryDirectory()
+        self.base = Path(self._td.name)
+        self.cfg_dir = self.base / "cfg"
+        self.cfg_dir.mkdir()
+        self._env = unittest.mock.patch.dict(os.environ, {"AGENT_AUTOPILOT_CONFIG_DIR": str(self.cfg_dir)})
+        self._env.start()
+        for k in ("AGENT_AUTOPILOT_MAX_GLOBAL_IN_PROGRESS", "AGENT_AUTOPILOT_HOST_MAX_STEAL_PCT", "AGENT_AUTOPILOT_HOST_MAX_LOAD1"):
+            os.environ.pop(k, None)
+
+    def tearDown(self) -> None:
+        self._env.stop()
+        self._td.cleanup()
+
+    def _cfg(self, pid: str, kind: str = "issue") -> WorkflowConfig:
+        return WorkflowConfig(
+            project_id=pid, kind=kind, enabled=True, repos=("o/r",), workspace_path=str(self.base),
+            trust_tier="T2", write_scope=("src/**",), max_in_progress=2,
+        )
+
+    def _claim(self, db: AutopilotDB, cfg: WorkflowConfig, n: int) -> int:
+        slot = f"{cfg.project_id}:slot-{n}"
+        db.upsert_project(cfg)
+        db.ensure_lease_slots(cfg.project_id, [slot], self.base / "locks")
+        ukey = f"{cfg.project_id}#{n}"
+        db.ensure_work_unit(unit_key=ukey, project_id=cfg.project_id, repo="o/r", issue_number=n)
+        return db.claim_and_reserve(
+            unit_key=ukey, cfg=cfg, slot_keys=[slot], worker_unit_name=f"u{n}.service",
+            expected_cgroup_dir=f"/cg/nonexistent_{n}", base_sha="0000000", authorized_head_ref=f"agent/{n}",
+        )
+
+    def test_global_cap_blocks_second_heavy_project_but_not_routines(self) -> None:
+        from ap_core.host_guard import count_global_heavy_claims, load_global_limits
+
+        self.assertEqual(load_global_limits().max_global_in_progress, 1)
+        db = AutopilotDB(self.base / "a.db")
+        try:
+            self._claim(db, self._cfg("p1"), 1)
+            with self.assertRaises(AutopilotError) as ctx:
+                self._claim(db, self._cfg("p2"), 2)
+            self.assertIn("Global WIP limit", str(ctx.exception))
+            with self.assertRaises(AutopilotError):
+                self._claim(db, self._cfg("p3", kind="delegated"), 3)
+            # Routines are lightweight and stay exempt from the heavy-worker cap.
+            self._claim(db, self._cfg("r1", kind="routine"), 4)
+            self.assertEqual(count_global_heavy_claims(db._conn), 1)
+            # Operator override via <config>/global.json raises the cap.
+            (self.cfg_dir / "global.json").write_text(json.dumps({"max_global_in_progress": 2}), encoding="utf-8")
+            self._claim(db, self._cfg("p2"), 5)
+            self.assertEqual(count_global_heavy_claims(db._conn), 2)
+            # A claim stuck in `reclaiming` (worker already dead, cleanup retained for inspection) frees its global slot.
+            (self.cfg_dir / "global.json").unlink()
+            first = db._conn.execute("SELECT claim_epoch FROM run_claims WHERE unit_key = 'p1#1'").fetchone()[0]
+            second = db._conn.execute("SELECT claim_epoch FROM run_claims WHERE unit_key = 'p2#5'").fetchone()[0]
+            db.begin_reclaim_claim(int(first))
+            db.begin_reclaim_claim(int(second))
+            self.assertEqual(count_global_heavy_claims(db._conn), 0)
+            self._claim(db, self._cfg("p7"), 7)
+        finally:
+            db.close()
+
+    def test_global_limits_malformed_values_fall_back_to_safe_defaults(self) -> None:
+        from ap_core.host_guard import load_global_limits
+
+        (self.cfg_dir / "global.json").write_text(
+            json.dumps({"max_global_in_progress": 0, "host_max_steal_pct": "x", "host_max_load1": -1}), encoding="utf-8"
+        )
+        lim = load_global_limits()
+        self.assertEqual((lim.max_global_in_progress, lim.max_steal_pct, lim.max_load1), (1, 15.0, 4.0))
+        (self.cfg_dir / "global.json").write_text("{not json", encoding="utf-8")
+        self.assertEqual(load_global_limits().max_global_in_progress, 1)
+        with unittest.mock.patch.dict(os.environ, {"AGENT_AUTOPILOT_MAX_GLOBAL_IN_PROGRESS": "3"}):
+            self.assertEqual(load_global_limits().max_global_in_progress, 3)
+
+    def _pressure(self, steal_delta: int, load1: str) -> dict:
+        from ap_core.host_guard import GlobalLimits, sample_host_pressure
+
+        stat = self.base / "stat"
+        loadavg = self.base / "loadavg"
+        # user nice system idle iowait irq softirq steal guest guest_nice
+        stat.write_text("cpu  1000 0 100 5000 0 0 0 100 0 0\ncpu0 1 2 3\n", encoding="ascii")
+        loadavg.write_text(f"{load1} 1.00 1.00 1/100 12345\n", encoding="ascii")
+
+        def _advance(_sec: float) -> None:
+            # 100 elapsed jiffies, `steal_delta` of them stolen by the hypervisor.
+            stat.write_text(
+                f"cpu  {1000 + 100 - steal_delta} 0 100 5000 0 0 0 {100 + steal_delta} 0 0\n", encoding="ascii"
+            )
+
+        return sample_host_pressure(GlobalLimits(), stat_path=stat, loadavg_path=loadavg, sleep=_advance)
+
+    def test_steal_and_load_backoff_thresholds(self) -> None:
+        calm = self._pressure(steal_delta=2, load1="1.50")
+        self.assertFalse(calm["pressured"], calm)
+        self.assertEqual(calm["steal_pct"], 2.0)
+        stolen = self._pressure(steal_delta=60, load1="1.50")
+        self.assertTrue(stolen["pressured"])
+        self.assertTrue(any(r.startswith("cpu_steal_pct:60.0") for r in stolen["reasons"]), stolen)
+        loaded = self._pressure(steal_delta=0, load1="14.90")
+        self.assertTrue(loaded["pressured"])
+        self.assertEqual(loaded["reasons"], ["load1:14.9>4.0"])
+        # Unreadable metrics fail open (global cap still bounds concurrency).
+        from ap_core.host_guard import GlobalLimits, sample_host_pressure
+
+        blind = sample_host_pressure(GlobalLimits(), stat_path=self.base / "nope", loadavg_path=self.base / "nope2", sleep=lambda _s: None)
+        self.assertFalse(blind["pressured"])
+
+    def test_dispatch_gate_holds_heavy_projects_as_ordinary_wait(self) -> None:
+        import agent_autopilot as ap_cli
+
+        wfs = {"p1": self._cfg("p1"), "r1": self._cfg("r1", kind="routine")}
+        db = AutopilotDB(self.base / "g.db")
+        try:
+            hot = {"pressured": True, "reasons": ["cpu_steal_pct:59.0>15.0"], "steal_pct": 59.0, "load1": 15.0}
+            with unittest.mock.patch.object(ap_cli, "sample_host_pressure", return_value=hot) as sp:
+                gate = ap_cli._host_admission_gate(db, wfs)
+            sp.assert_called_once()
+            self.assertEqual(gate["hold_reason"], "waiting_host_capacity:cpu_steal_pct:59.0>15.0")
+            ap_cli._record_host_gate(self.base, gate)
+            rec = json.loads((self.base / "host_gate.json").read_text(encoding="utf-8"))
+            self.assertTrue(rec["waiting"])
+
+            calm = {"pressured": False, "reasons": [], "steal_pct": 0.0, "load1": 0.5}
+            with unittest.mock.patch.object(ap_cli, "sample_host_pressure", return_value=calm):
+                self.assertEqual(ap_cli._host_admission_gate(db, wfs)["hold_reason"], "")
+
+            # Global slot already taken -> hold WITHOUT spending the 1s steal sample.
+            self._claim(db, self._cfg("p1"), 1)
+            with unittest.mock.patch.object(ap_cli, "sample_host_pressure") as sp2:
+                gate2 = ap_cli._host_admission_gate(db, wfs)
+            sp2.assert_not_called()
+            self.assertEqual(gate2["hold_reason"], "global_wip_limit_reached:1/1")
+
+            # Routine-only fleets never sample or hold.
+            with unittest.mock.patch.object(ap_cli, "sample_host_pressure") as sp3:
+                self.assertEqual(ap_cli._host_admission_gate(db, {"r1": wfs["r1"]})["hold_reason"], "")
+            sp3.assert_not_called()
+        finally:
+            db.close()
+
+    def test_transient_units_are_niced_and_rings_cap_fanout(self) -> None:
+        import ap_core.sandbox as sbx
+
+        captured: list[list[str]] = []
+
+        def _fake_run(argv, *a, **kw):
+            captured.append(list(argv))
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+        with unittest.mock.patch.object(sbx.subprocess, "run", side_effect=_fake_run):
+            spawn_transient_unit_under_flock(unit_name="ap-x", cmd=["/bin/true"], wait=False, unit_kind="worker")
+        argv = captured[0]
+        self.assertIn("--slice=app-autopilot.slice", argv)
+        self.assertEqual(argv[argv.index("Nice=15") - 1], "-p")
+
+        ct = self.base / "ct"
+        vo = self.base / "vo"
+        ct.mkdir()
+        vo.mkdir()
+        v_argv = build_execution_ring_bwrap(
+            ring_kind="verify_ring", inner_cmd=["/bin/true"], cwd=vo, clean_tree=ct, verify_out_dir=vo,
+            extra_env={"GOMAXPROCS": "1"},
+        )
+
+        def _envs(av: list[str]) -> dict[str, list[str]]:
+            out: dict[str, list[str]] = {}
+            for i, tok in enumerate(av[: av.index("--")]):
+                if tok == "--setenv":
+                    out.setdefault(av[i + 1], []).append(av[i + 2])
+            return out
+
+        env_v = _envs(v_argv)
+        self.assertEqual(env_v["GOMAXPROCS"], ["1"], "explicit verify_env MUST override the default fan-out cap")
+        self.assertEqual(env_v["RAYON_NUM_THREADS"], ["2"])
+        self.assertEqual(env_v["UV_THREADPOOL_SIZE"], ["2"])
+        self.assertEqual(env_v["PLAYWRIGHT_WORKERS"], ["1"])
+
+    def test_slice_template_stays_below_burst_baseline(self) -> None:
+        tpl = (REPO_ROOT / "skills" / "agent-autopilot" / "templates" / "app-autopilot.slice").read_text(encoding="utf-8")
+        kv = dict(ln.split("=", 1) for ln in tpl.splitlines() if "=" in ln and not ln.startswith("#"))
+        self.assertEqual(kv["CPUWeight"], "10")
+        self.assertLess(int(kv["CPUQuota"].rstrip("%")), 160, "4 vCPU burstable baseline is 160%")
+        self.assertEqual((kv["IOWeight"], kv["MemoryHigh"], kv["MemoryMax"]), ("20", "6G", "8G"))
+        self.assertIn("templates/app-autopilot.slice", (REPO_ROOT / "install.sh").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

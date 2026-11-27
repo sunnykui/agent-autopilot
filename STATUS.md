@@ -10,8 +10,9 @@
 1. **双模型对抗性审查全部 `APPROVE`**：
    - 架构规范（[`docs/AUTOPILOT_PLAN.md`](docs/AUTOPILOT_PLAN.md) v7.8）：Claude Fable 5.2 + Codex GPT-6.2 Astra 双 `APPROVE`。
    - 全量代码实现审查（30+ 轮增量对抗挑刺）：Claude Fable 5.2 / Sonnet 5.5 + Codex GPT-6.2 Astra 双 `APPROVE`（0 个 P0/P1 阻塞项）。
-   - 通用试点增强（2026-11-25）：新增全项目通用的 `--require-labels` 标签准入过滤、无状态多语言 SDK 自动发现（Node / Go / Rust / Terraform / uv，零版本号硬编码）、`go.sum` 离线 `GOMODCACHE` 预取、`ro_workspace_deps` 受控只读依赖挂载、`AP_TOUCHED_FILES` 干净树改动集注入，以及 `delegated` 模式只读断网 `bwrap` 续做预检。
-   - 自动化验证：`python3 -B -m unittest discover -s tests -p "test_*.py"` **43/43 全部通过**，`agent-autopilot selftest --live` **通过**（`schema_version = 16`）。
+   - 通用试点增强（2026-11-25）：新增全项目通用的 `--require-labels` 标签准入过滤、多槽位并行调度（`slot-1..slot-N` 并发派发 + `managed.git` 工作树互斥锁 + `approve-promotion --force --target <N>` 并发调控）、无状态多语言 SDK 自动发现（Node / Go / Rust / Terraform / uv，零版本号硬编码）、`go.sum` 离线 `GOMODCACHE` 预取、`ro_workspace_deps` 受控只读依赖挂载、`AP_TOUCHED_FILES` 干净树改动集注入，以及 `delegated` 模式只读断网 `bwrap` 续做预检。
+   - 自动化验证：`python3 -B -m unittest discover -s tests -p "test_*.py"` **54/54 全部通过**，`agent-autopilot selftest --live` **通过**（`schema_version = 16`）。
+   - 试点首夜修复（2026-11-26）：①“基线已红”识别——验收失败时用同一命令在未改动的授权基线上复跑，候选的每条失败都已出现在基线上才判为环境问题，挂起等待（不扣改代码轮次），醒来先零 token 复查基线，连续 6 次仍红转人工；②`delegated` 项目仅因续做预检触发时遵守 `schedule_interval_sec`（在调度锁内复核），新 issue 不受影响；③`delegated-exec --cmd` 与子命令名冲突、大仓库索引采样超时、清理单元时限过短等修复。
 2. **零个人/业务敏感硬编码**：
    - 仓库内源码与文档已彻底剥离个人邮箱、内部仓库名、宿主机用户路径及任何凭据；
    - 各业务仓库、邮箱地址、忽略发件人列表与专用 Token 路径全部隔离在宿主机本机目录 `~/.config/agent-autopilot/`（`0600`）与 `~/.local/state/agent-autopilot/`（`0700`，本机实例台账见 `~/.local/state/agent-autopilot/HOST_STATUS.md`）。
@@ -52,8 +53,9 @@ agent-autopilot onboard --project-id <routine_id> --kind routine \
   --workspace /path/to/repo --interval-sec 1800 \
   --precheck-cmd "test -s queue.txt" --routine-prompt "处理队列并更新状态"
 
-# 6. 满 10 单 48 小时零回滚后，批准并发阶梯从 1 升到 2（最高 3）
+# 6. 满 10 单 48 小时零回滚后，批准并发阶梯从 1 升到 2（最高 3）；或管理员显式设定并发上限
 agent-autopilot approve-promotion <project_id>
+agent-autopilot approve-promotion <project_id> --force --target 3
 ```
 
 ---

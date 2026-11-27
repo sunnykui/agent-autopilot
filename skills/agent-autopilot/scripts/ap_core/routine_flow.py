@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import re
 import subprocess
 from email.utils import parseaddr
 from pathlib import Path
@@ -372,6 +373,91 @@ def _run_readonly_credential_free_precheck(ws: Path, precheck_cmd: str, *, timeo
                 os.close(_rfd)
 
 
+def _delegated_open_pr_issue_numbers(cfg: WorkflowConfig, repo: str) -> set[int] | None:
+    """Return issue numbers that already have an open PR in `repo`, or `None` if lookup failed/truncated."""
+    env = dict(os.environ, GH_PROMPT_DISABLED="1")
+    if cfg.token_file:
+        try:
+            tok = read_nonempty_token_file(cfg.token_file)
+        except AutopilotError:
+            return None
+        env.pop("GITHUB_TOKEN", None)
+        env["GH_TOKEN"] = tok
+    try:
+        proc = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                repo,
+                "--state",
+                "open",
+                "--limit",
+                "200",
+                "--json",
+                "headRefName,title,closingIssuesReferences",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        prs = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(prs, list):
+        return None
+    nums: set[int] = set()
+    pref = re.escape(cfg.branch_prefix or "agent/")
+    branch_re = re.compile(rf"^{pref}(?:issue-)?([1-9][0-9]*)(?:$|[^0-9])")
+    # Match `#<num>` in PR title only when not part of a cross-repo ref like `other/repo#42`.
+    title_hash_re = re.compile(r"(?<![A-Za-z0-9_./-])#([1-9][0-9]*)(?![0-9])")
+    repo_prefix = f"https://github.com/{repo.lower()}/issues/"
+    for pr in prs:
+        if not isinstance(pr, dict):
+            continue
+        head = str(pr.get("headRefName") or "")
+        m = branch_re.match(head)
+        if m:
+            nums.add(int(m.group(1)))
+        title = str(pr.get("title") or "")
+        for hm in title_hash_re.finditer(title):
+            nums.add(int(hm.group(1)))
+        for ref in pr.get("closingIssuesReferences") or ():
+            if not isinstance(ref, dict):
+                continue
+            r_num = ref.get("number")
+            r_url = str(ref.get("url") or "").lower()
+            if isinstance(r_num, int) and r_num > 0 and (not r_url or r_url.startswith(repo_prefix)):
+                nums.add(r_num)
+    if len(prs) >= 200:
+        # Truncated list: callers treat None as unknown so cooldown still prevents tight spin.
+        return None
+    return nums
+
+
+def delegated_precheck_cooldown_active(cfg: WorkflowConfig, db: AutopilotDB) -> bool:
+    """True when the project's most recent claim is younger than `schedule_interval_sec` (continuation-only wakeups)."""
+    if cfg.schedule_interval_sec <= 0:
+        return False
+    row = db._conn.execute("SELECT MAX(created_at) AS m FROM run_claims WHERE project_id = ?", (cfg.project_id,)).fetchone()
+    last_iso = row["m"] if row else None
+    if not last_iso:
+        return False
+    try:
+        age = (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(str(last_iso))).total_seconds()
+    except ValueError:
+        return False
+    return age < cfg.schedule_interval_sec
+
+
 def probe_delegated_zero_token(cfg: WorkflowConfig, db: AutopilotDB) -> dict[str, Any]:
     """Universal zero-token probe for delegated runners (`require_labels` + WIP/daily caps + isolated `extra.precheck_cmd`)."""
     if not cfg.enabled:
@@ -426,11 +512,34 @@ def probe_delegated_zero_token(cfg: WorkflowConfig, db: AutopilotDB) -> dict[str
             return {"actionable": False, "reason": "delegated_repo_config_invalid", "candidates": []}
 
     res = probe_github_issues_zero_token(cfg, db, extra_require_labels=repo_req_labels)
-    if res.get("actionable") or res.get("blocked_units"):
+    if res.get("actionable") and res.get("candidates"):
+        open_pr_by_repo: dict[str, set[int] | None] = {}
+        confirmed_unstarted: list[dict[str, Any]] = []
+        uncertain_unstarted: list[dict[str, Any]] = []
+        for cand in res["candidates"]:
+            c_repo = str(cand.get("repo") or "")
+            if c_repo not in open_pr_by_repo:
+                open_pr_by_repo[c_repo] = _delegated_open_pr_issue_numbers(cfg, c_repo)
+            pr_nums = open_pr_by_repo[c_repo]
+            if pr_nums is None:
+                uncertain_unstarted.append(cand)
+            elif int(cand["number"]) not in pr_nums:
+                confirmed_unstarted.append(cand)
+        if confirmed_unstarted:
+            return {**res, "candidates": confirmed_unstarted}
+        if uncertain_unstarted:
+            if delegated_precheck_cooldown_active(cfg, db):
+                return {"actionable": False, "reason": "delegated_pr_probe_within_interval", "candidates": []}
+            return {**res, "candidates": uncertain_unstarted}
+        res = {**res, "actionable": False, "reason": "open_issues_have_open_prs", "candidates": []}
+    if res.get("blocked_units"):
         return res
 
     precheck_cmd = str(cfg.extra.get("precheck_cmd") or "").strip()
     if precheck_cmd:
+        # Continuation-only wakeups honor `schedule_interval_sec` (new actionable issues above are never delayed).
+        if delegated_precheck_cooldown_active(cfg, db):
+            return {"actionable": False, "reason": "delegated_precheck_within_interval", "candidates": []}
         try:
             proc = _run_readonly_credential_free_precheck(ws, precheck_cmd, timeout=30)
         except (subprocess.SubprocessError, OSError, AutopilotError) as exc:

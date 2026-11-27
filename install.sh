@@ -7,7 +7,7 @@ Usage: bash ./install.sh [OPTIONS]
 
 Options:
   --allow-claude-permissions  Pre-allow `codex-dispatch` and `agent-autopilot` in ~/.claude/settings.json
-  --install-systemd-units     Install `agent-autopilot-dispatch.{service,timer}` into ~/.config/systemd/user/ (does NOT start timer)
+  --install-systemd-units     Install `agent-autopilot-dispatch.{service,timer}` + CPU-capped `app-autopilot.slice` into ~/.config/systemd/user/ (does NOT start timer)
   -h, --help                  Show this help message
 EOF
 }
@@ -94,6 +94,7 @@ if [ "${INSTALL_SYSTEMD}" -eq 1 ]; then
   mkdir -p "${SD_USER_DIR}"
   cp "${REPO_DIR}/skills/agent-autopilot/templates/agent-autopilot-dispatch.service" "${SD_USER_DIR}/"
   cp "${REPO_DIR}/skills/agent-autopilot/templates/agent-autopilot-dispatch.timer" "${SD_USER_DIR}/"
+  cp "${REPO_DIR}/skills/agent-autopilot/templates/app-autopilot.slice" "${SD_USER_DIR}/"
   systemctl --user daemon-reload
   echo "Installed systemd units into ${SD_USER_DIR}"
 fi

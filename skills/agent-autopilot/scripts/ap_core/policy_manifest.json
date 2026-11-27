@@ -7,10 +7,10 @@
   "forbid_literal_backslash_and_control_chars": true,
   "default_branch_prefix": "agent/",
   "cleanup_unit_limits": {
-    "timeout_start_sec": 10,
-    "runtime_max_sec": 60,
-    "timeout_stop_sec": 10,
-    "wrapper_sigterm_sec": 85,
+    "timeout_start_sec": 15,
+    "runtime_max_sec": 240,
+    "timeout_stop_sec": 15,
+    "wrapper_sigterm_sec": 265,
     "wrapper_kill_after_sec": 5
   },
   "chef_pipeline": {
@@ -86,6 +86,7 @@
       },
       "landlock_allow_exec": [
         "/usr/local/bin/codex",
+        "/usr/local/bin/codex-code-mode-host",
         "/usr/bin/bash",
         "/usr/bin/sh",
         "/usr/bin/dash"
@@ -101,7 +102,8 @@
         "/usr/local/bin/codex": "codex_cli"
       },
       "landlock_allow_exec": [
-        "/usr/local/bin/codex"
+        "/usr/local/bin/codex",
+        "/usr/local/bin/codex-code-mode-host"
       ],
       "dynamic_elf_libs": false,
       "mount_tool_sock": false,

@@ -62,8 +62,14 @@ from ap_core.models import (  # noqa: E402
     read_nonempty_token_file,
     sanitize_terminal_text,
 )
+from ap_core.host_guard import (  # noqa: E402
+    HEAVY_UNIT_KINDS,
+    count_global_heavy_claims,
+    load_global_limits,
+    sample_host_pressure,
+)
 from ap_core.onboard import import_legacy_autopilot_state, onboard_project  # noqa: E402
-from ap_core.routine_flow import probe_project_zero_token  # noqa: E402
+from ap_core.routine_flow import delegated_precheck_cooldown_active, probe_project_zero_token  # noqa: E402
 from ap_core.sandbox import (  # noqa: E402
     AllowlistConnectProxyServer,
     ToolExecServer,
@@ -108,6 +114,9 @@ def resolve_host_binaries() -> dict[str, Path]:
     codex_p = shutil.which("codex")
     if codex_p:
         out["codex_cli"] = Path(codex_p).resolve()
+    cmh_p = shutil.which("codex-code-mode-host")
+    if cmh_p:
+        out["codex_code_mode_host"] = Path(cmh_p).resolve()
     claude_p = shutil.which("claude")
     if claude_p:
         out["claude_cli"] = Path(claude_p).resolve()
@@ -346,6 +355,8 @@ class LiveSandboxedModelRunner:
                     "--skip-git-repo-check",
                     "-c",
                     "features.multi_agent=false",
+                    "-c",
+                    "features.shell_snapshot=false",
                     "-o",
                     "/ap-outbox/verdict.json",
                     "-",
@@ -383,7 +394,7 @@ class LiveSandboxedModelRunner:
                 capture_output=True,
                 text=True,
                 pass_fds=tuple(model_retain_fds),
-                timeout=900,
+                timeout=2400,
                 check=False,
             )
             obox_txt = safe_read_outbox_file_fd(obox_fd, "verdict.json") if family == "codex" else None
@@ -1274,6 +1285,7 @@ def _worker_root_env(state_root: Path) -> dict[str, str]:
         "AGENT_AUTOPILOT_STATE_DIR": str(state_root.resolve()),
         "AGENT_AUTOPILOT_CONFIG_DIR": str(default_config_root()),
         "AGENT_AUTOPILOT_CACHE_DIR": str(default_cache_root()),
+        "PYTHONUNBUFFERED": "1",
     }
 
 
@@ -1351,7 +1363,7 @@ def _resolve_project_gh_identity_unlocked(cfg: WorkflowConfig) -> tuple[str, str
         if not tok:
             env = dict(os.environ, GH_PROMPT_DISABLED="1")
             try:
-                proc = subprocess.run(["gh", "auth", "token"], env=env, capture_output=True, text=True, timeout=10, check=False)
+                proc = subprocess.run(["gh", "auth", "token"], env=env, capture_output=True, text=True, timeout=30, check=False)
             except (subprocess.SubprocessError, OSError) as exc:
                 raise AutopilotError(f"Failed to query `gh auth token` in ambient mode: {exc}") from exc
             tok = proc.stdout.strip() if proc.returncode == 0 else ""
@@ -1371,6 +1383,18 @@ def _write_sealed_token_file(ephem_path: Path, tok: str) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _project_effective_cap(cfg: WorkflowConfig, db: AutopilotDB) -> int:
+    prow = db.get_project_row(cfg.project_id)
+    if prow is None:
+        return max(1, int(cfg.max_in_progress))
+    eff = (
+        int(prow["max_in_progress"])
+        if int(prow["current_step_idx"]) > 0
+        else min(int(cfg.max_in_progress), int(prow["max_in_progress"]))
+    )
+    return max(1, eff)
 
 
 def _submit_issue_worker_nonblocking(
@@ -1395,8 +1419,19 @@ def _submit_issue_worker_nonblocking(
     scope = db.resolve_unit_scope_and_pending(ukey)
     if scope.any_veto != 0 or scope.pending_cnt != 0:
         raise AutopilotError(f"Unit {ukey} blocked by veto/pending external_ops")
-    slot_key = f"{cfg.project_id}:slot-1"
-    db.ensure_lease_slots(cfg.project_id, [slot_key], state_root / "locks")
+    eff_cap = _project_effective_cap(cfg, db)
+    slot_pool = [f"{cfg.project_id}:slot-{idx}" for idx in range(1, eff_cap + 1)]
+    db.ensure_lease_slots(cfg.project_id, slot_pool, state_root / "locks")
+    free_set = {
+        str(r["slot_key"])
+        for r in db._conn.execute(
+            f"SELECT slot_key FROM leases WHERE slot_key IN ({','.join('?' for _ in slot_pool)}) AND state = 'free'",
+            slot_pool,
+        ).fetchall()
+    }
+    ordered_free_slots = [sk for sk in slot_pool if sk in free_set]
+    if not ordered_free_slots:
+        raise AutopilotError(f"All lease slots busy for {cfg.project_id}: {slot_pool}")
 
     rcache = repo_cache_dir(cfg.project_id, repo)
     rc_fd = open_dir_nofollow(rcache, create=False)
@@ -1404,70 +1439,81 @@ def _submit_issue_worker_nonblocking(
         st_rc = os.fstat(rc_fd)
     finally:
         os.close(rc_fd)
-    tag = f"{inum}-{uuid.uuid4().hex[:8]}"
-    uname = f"ap-worker-{cfg.project_id}-{tag}.service"
-    exp_cg = expected_transient_cgroup_dir(uname)
     head_ref = f"{cfg.branch_prefix}issue-{inum}"
-    persisted_run_dir = rcache / "runs" / f"claim-{tag}"
-    persisted_wt_dir = rcache / "worktrees" / f"wt-{tag}"
     sealed_dir = ensure_sealed_tokens_dir(state_root)
-    ephem_tok_path = str(sealed_dir / f"claim-{cfg.project_id}-{tag}.gh_token")
 
-    with _try_acquire_slot_flocks(db, [slot_key]) as slot_fds:
-        # Persist run_claim FIRST so rejected claims leave ZERO token files on disk, and accepted claims track cleanup!
-        ce = db.claim_and_reserve(
-            unit_key=ukey,
-            cfg=cfg,
-            slot_keys=[slot_key],
-            worker_unit_name=uname,
-            expected_cgroup_dir=str(exp_cg),
-            base_sha=base_sha,
-            authorized_head_ref=head_ref,
-            run_dir=str(persisted_run_dir),
-            worktree_path=str(persisted_wt_dir),
-            managed_gitdir=str(mg),
-            frozen_cache_dir=str(rcache.resolve()),
-            frozen_cache_dev=int(st_rc.st_dev),
-            frozen_cache_ino=int(st_rc.st_ino),
-            bound_gh_login=verified_login,
-            ephemeral_token_file=ephem_tok_path,
-        )
-        try:
-            if ephem_tok_path:
-                _write_sealed_token_file(Path(ephem_tok_path), resolved_tok)
-            sd_proc = spawn_transient_unit_under_flock(
-                unit_name=uname,
-                cmd=[
-                    sys.executable,
-                    str(Path(__file__).resolve()),
-                    "worker-exec",
-                    "--project",
-                    cfg.project_id,
-                    "--unit-key",
-                    ukey,
-                    "--claim-epoch",
-                    str(ce),
-                    f"--issue-title={cand.get('title') or ''}",
-                ],
-                flock_fds=slot_fds,
-                wait=False,
-                unit_kind="worker",
-                extra_env=_worker_root_env(state_root),
+    last_slot_err: Exception | None = None
+    for slot_key in ordered_free_slots:
+        tag = f"{inum}-{uuid.uuid4().hex[:8]}"
+        uname = f"ap-worker-{cfg.project_id}-{tag}.service"
+        exp_cg = expected_transient_cgroup_dir(uname)
+        persisted_run_dir = rcache / "runs" / f"claim-{tag}"
+        persisted_wt_dir = rcache / "worktrees" / f"wt-{tag}"
+        ephem_tok_path = str(sealed_dir / f"claim-{cfg.project_id}-{tag}.gh_token")
+        with contextlib.ExitStack() as stack:
+            try:
+                slot_fds = stack.enter_context(_try_acquire_slot_flocks(db, [slot_key]))
+            except (AutopilotError, OSError) as flock_exc:
+                last_slot_err = flock_exc
+                continue
+            # Persist run_claim FIRST so rejected claims leave ZERO token files on disk, and accepted claims track cleanup!
+            ce = db.claim_and_reserve(
+                unit_key=ukey,
+                cfg=cfg,
+                slot_keys=[slot_key],
+                worker_unit_name=uname,
+                expected_cgroup_dir=str(exp_cg),
+                base_sha=base_sha,
+                authorized_head_ref=head_ref,
+                run_dir=str(persisted_run_dir),
+                worktree_path=str(persisted_wt_dir),
+                managed_gitdir=str(mg),
+                frozen_cache_dir=str(rcache.resolve()),
+                frozen_cache_dev=int(st_rc.st_dev),
+                frozen_cache_ino=int(st_rc.st_ino),
+                bound_gh_login=verified_login,
+                ephemeral_token_file=ephem_tok_path,
             )
-            if sd_proc.returncode != 0:
-                raise AutopilotError(f"systemd-run submission failed ({sd_proc.returncode}): {sd_proc.stderr.strip()}")
-        except BaseException:
-            if ephem_tok_path:
-                with contextlib.suppress(OSError):
-                    Path(ephem_tok_path).unlink(missing_ok=True)
-            raise
-        return {
-            "project_id": cfg.project_id,
-            "unit_key": ukey,
-            "claim_epoch": ce,
-            "worker_unit_name": uname,
-            "expected_cgroup_dir": str(exp_cg),
-        }
+            try:
+                if ephem_tok_path:
+                    _write_sealed_token_file(Path(ephem_tok_path), resolved_tok)
+                sd_proc = spawn_transient_unit_under_flock(
+                    unit_name=uname,
+                    cmd=[
+                        sys.executable,
+                        str(Path(__file__).resolve()),
+                        "worker-exec",
+                        "--project",
+                        cfg.project_id,
+                        "--unit-key",
+                        ukey,
+                        "--claim-epoch",
+                        str(ce),
+                        f"--issue-title={cand.get('title') or ''}",
+                    ],
+                    flock_fds=slot_fds,
+                    wait=False,
+                    unit_kind="worker",
+                    extra_env=_worker_root_env(state_root),
+                    timeout_overrides={"runtime_max_sec": 7200, "wrapper_sigterm_sec": 7260},
+                )
+                if sd_proc.returncode != 0:
+                    raise AutopilotError(f"systemd-run submission failed ({sd_proc.returncode}): {sd_proc.stderr.strip()}")
+            except BaseException:
+                if ephem_tok_path:
+                    with contextlib.suppress(OSError):
+                        Path(ephem_tok_path).unlink(missing_ok=True)
+                raise
+            return {
+                "project_id": cfg.project_id,
+                "unit_key": ukey,
+                "slot_key": slot_key,
+                "claim_epoch": ce,
+                "worker_unit_name": uname,
+                "expected_cgroup_dir": str(exp_cg),
+            }
+
+    raise AutopilotError(f"All free lease slots flock-busy for {cfg.project_id}: {last_slot_err}")
 
 
 def _submit_delegated_worker_nonblocking(
@@ -1536,6 +1582,7 @@ def _submit_delegated_worker_nonblocking(
                 wait=False,
                 unit_kind="worker",
                 extra_env=_worker_root_env(state_root),
+                timeout_overrides={"runtime_max_sec": 14400, "wrapper_sigterm_sec": 14460},
             )
             if sd_proc.returncode != 0:
                 raise AutopilotError(f"delegated systemd-run failed ({sd_proc.returncode}): {sd_proc.stderr.strip()}")
@@ -1810,7 +1857,8 @@ def cmd_delegated_exec(args: argparse.Namespace) -> int:
     chk_login = LiveGitHubCliTransport(token=env["GH_TOKEN"], require_explicit_token=True).bot_login
     if not chk_login or chk_login != bound_login:
         raise AutopilotError(f"delegated-exec GitHub identity {chk_login!r} != bound_gh_login {bound_login!r}")
-    proc = subprocess.run(["/bin/bash", "-lc", args.cmd], env=env, check=False)
+    shell_cmd = args.delegated_shell_cmd if hasattr(args, "delegated_shell_cmd") else args.cmd
+    proc = subprocess.run(["/bin/bash", "-lc", shell_cmd], env=env, check=False)
     db2 = AutopilotDB(sroot / "autopilot.db")
     try:
         cl2 = db2.get_claim(int(args.claim_epoch))
@@ -2181,6 +2229,39 @@ def cmd_run_once(args: argparse.Namespace) -> int:
             db2.close()
 
 
+def _host_admission_gate(db_ro: AutopilotDB, wfs: dict[str, WorkflowConfig]) -> dict[str, Any]:
+    """Zero-token gate for heavy (issue/delegated) workers: machine-wide WIP cap, then CPU steal / load backoff.
+
+    A non-empty `hold_reason` is an ordinary wait (re-evaluated on the next dispatch tick), never a needs-human block.
+    """
+    limits = load_global_limits()
+    g_active = count_global_heavy_claims(db_ro._conn)
+    gate: dict[str, Any] = {
+        "max_global_in_progress": limits.max_global_in_progress,
+        "global_heavy_active": g_active,
+        "hold_reason": "",
+    }
+    if not any(w.enabled and w.kind in HEAVY_UNIT_KINDS for w in wfs.values()):
+        return gate
+    if g_active >= limits.max_global_in_progress:
+        gate["hold_reason"] = f"global_wip_limit_reached:{g_active}/{limits.max_global_in_progress}"
+        return gate
+    hp = sample_host_pressure(limits)
+    gate["host_pressure"] = hp
+    if hp["pressured"]:
+        gate["hold_reason"] = "waiting_host_capacity:" + ",".join(hp["reasons"])
+    return gate
+
+
+def _record_host_gate(state_root: Path, gate: dict[str, Any]) -> None:
+    """Persist the latest gate verdict for `top`/operators; best-effort, never fails dispatch."""
+    rec = dict(gate, checked_at=now_iso(), waiting=bool(gate.get("hold_reason")))
+    tmp = state_root / f".host_gate.json.{os.getpid()}.tmp"
+    with contextlib.suppress(OSError):
+        tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, state_root / "host_gate.json")
+
+
 def cmd_dispatch(args: argparse.Namespace) -> int:
     sroot = default_state_root()
     wfs = {w.project_id: w for w in load_all_workflows()}
@@ -2190,8 +2271,12 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
         try:
             now_ts = time.time()
             plan: list[dict[str, Any]] = []
+            gate_ro = _host_admission_gate(db_ro, wfs)
             for pid, wf in sorted(wfs.items()):
                 if not wf.enabled:
+                    continue
+                if wf.kind in HEAVY_UNIT_KINDS and gate_ro["hold_reason"]:
+                    plan.append({"project_id": pid, "actionable": False, "reason": gate_ro["hold_reason"]})
                     continue
                 if wf.kind == "routine" and wf.schedule_interval_sec > 180:
                     crow = db_ro._conn.execute("SELECT last_full_run_ts FROM routine_cursors WHERE project_id = ?", (pid,)).fetchone()
@@ -2199,7 +2284,7 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
                         plan.append({"project_id": pid, "actionable": False, "reason": "within_schedule_interval"})
                         continue
                 plan.append({"project_id": pid, **probe_project_zero_token(wf, db_ro)})
-            print(json.dumps({"dry_run": True, "dispatcher_epoch": db_ro.get_dispatcher_epoch(), "probe_plan": plan}, ensure_ascii=False, indent=2))
+            print(json.dumps({"dry_run": True, "dispatcher_epoch": db_ro.get_dispatcher_epoch(), "host_gate": gate_ro, "probe_plan": plan}, ensure_ascii=False, indent=2))
             return 0
         finally:
             db_ro.close()
@@ -2224,8 +2309,14 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
     now_ts = time.time()
     db_ro_p = AutopilotDB(sroot / "autopilot.db", readonly=True)
     try:
+        host_gate = _host_admission_gate(db_ro_p, wfs)
+        _record_host_gate(sroot, host_gate)
         for pid, wf in sorted(wfs.items()):
             if not wf.enabled:
+                continue
+            if wf.kind in HEAVY_UNIT_KINDS and host_gate["hold_reason"]:
+                # Ordinary wait: skip probe/prefetch/claim this tick; the next timer tick re-samples and resumes.
+                plan.append({"project_id": pid, "actionable": False, "reason": host_gate["hold_reason"]})
                 continue
             if wf.kind == "routine" and wf.schedule_interval_sec > 180:
                 crow = db_ro_p._conn.execute("SELECT last_full_run_ts FROM routine_cursors WHERE project_id = ?", (pid,)).fetchone()
@@ -2310,7 +2401,18 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
                 elif fresh_wf.kind == "issue" and prb.get("candidates") and pid in resolved_gh_by_proj:
                     pf_d = prefetched_by_proj.get(pid, {})
                     pre_gh_d = resolved_gh_by_proj[pid]
+                    eff_cap_d = _project_effective_cap(fresh_wf, db)
+                    active_now = int(
+                        db._conn.execute(
+                            "SELECT COUNT(*) AS c FROM run_claims WHERE project_id = ? AND state IN ('active', 'reclaiming')",
+                            (pid,),
+                        ).fetchone()["c"]
+                    )
+                    avail_slots = max(0, eff_cap_d - active_now)
+                    submitted_cnt = 0
                     for cand in prb["candidates"]:
+                        if submitted_cnt >= avail_slots:
+                            break
                         if cand["repo"] not in pf_d:
                             continue
                         try:
@@ -2324,10 +2426,13 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
                                     pre_resolved_gh=pre_gh_d,
                                 )
                             )
-                            break
+                            submitted_cnt += 1
                         except (AutopilotError, subprocess.SubprocessError, OSError):
                             continue
                 elif fresh_wf.kind == "delegated" and pid in resolved_gh_by_proj:
+                    # Re-check the continuation cooldown under dispatcher.lock (the probe ran outside it).
+                    if prb.get("reason") == "delegated_precheck_matched" and delegated_precheck_cooldown_active(fresh_wf, db):
+                        continue
                     with contextlib.suppress(AutopilotError, subprocess.SubprocessError, OSError):
                         executed.append(
                             _submit_delegated_worker_nonblocking(
@@ -2341,6 +2446,7 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
                         "dispatcher_epoch": disp_epoch,
                         "dry_run": False,
                         "recovery": rec,
+                        "host_gate": host_gate,
                         "probe_plan": plan,
                         "executed": executed,
                     },
@@ -2606,13 +2712,18 @@ def cmd_dream(args: argparse.Namespace) -> int:
 
 def cmd_approve_promotion(args: argparse.Namespace) -> int:
     sroot = default_state_root()
-    db = AutopilotDB(sroot / "autopilot.db")
-    try:
-        new_cap = db.approve_concurrency_promotion(args.project_id)
-        print(json.dumps({"project_id": args.project_id, "new_max_in_progress": new_cap}, indent=2))
-        return 0
-    finally:
-        db.close()
+    with acquire_dispatcher_lock(sroot):
+        db = AutopilotDB(sroot / "autopilot.db")
+        try:
+            new_cap = db.approve_concurrency_promotion(
+                args.project_id,
+                force=bool(getattr(args, "force", False)),
+                target_cap=getattr(args, "target", None),
+            )
+            print(json.dumps({"project_id": args.project_id, "new_max_in_progress": new_cap}, indent=2))
+            return 0
+        finally:
+            db.close()
 
 
 def cmd_import_legacy(args: argparse.Namespace) -> int:
@@ -2689,8 +2800,10 @@ def build_parser() -> argparse.ArgumentParser:
     rs.add_argument("--receipt-id", default=None)
     rs.add_argument("--unsent-proof", default=None)
 
-    ap = sub.add_parser("approve-promotion", help="Approve staircase concurrency step-up after >=10 matured clean runs.")
+    ap = sub.add_parser("approve-promotion", help="Approve staircase concurrency step-up (or set explicit cap with --force --target).")
     ap.add_argument("project_id")
+    ap.add_argument("--force", action="store_true", help="Operator override without waiting for 48h-matured clean run count.")
+    ap.add_argument("--target", type=int, default=None, help="Explicit target concurrency step (requires --force).")
 
     il = sub.add_parser("import-legacy", help="Backup and import legacy autopilot terminal issues.")
     il.add_argument("--legacy-dir", default="~/.local/state/legacy-autopilot")
@@ -2706,7 +2819,7 @@ def build_parser() -> argparse.ArgumentParser:
     de = sub.add_parser("delegated-exec", help=argparse.SUPPRESS)
     de.add_argument("--claim-epoch", required=True)
     de.add_argument("--token-file", default="")
-    de.add_argument("--cmd", required=True)
+    de.add_argument("--cmd", dest="delegated_shell_cmd", required=True)
 
     re_p = sub.add_parser("routine-exec", help=argparse.SUPPRESS)
     re_p.add_argument("--project", required=True)

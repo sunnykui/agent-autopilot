@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -11,12 +12,14 @@ import subprocess
 import sys
 import uuid
 import zlib
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
 from .models import (
     POLICY_MANIFEST,
     AutopilotError,
+    EmptyCandidateError,
     ScopeViolationError,
     build_pnpm_exec_cmd,
     empty_and_fsync_dirfd,
@@ -296,44 +299,54 @@ def prepare_isolated_worktree(
     mg = raw_mg
     wt = raw_wt
     wt_gitdir = mg / "worktrees" / registered_name
-    _assert_wt_gitdir_bound_to_exact_wt(wt_gitdir, wt)
-    env = _safe_git_env(git_dir=mg)
+    wt_lock_fd = os.open(str(mg / ".autopilot-worktree.flock"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(wt_lock_fd, fcntl.LOCK_EX)
+        _assert_wt_gitdir_bound_to_exact_wt(wt_gitdir, wt)
+        env = _safe_git_env(git_dir=mg)
 
-    if not wt.exists():
-        if wt_gitdir.exists() or wt_gitdir.is_symlink():
-            raise AutopilotError(
-                f"Refusing to recreate absent worktree {wt} while metadata {wt_gitdir} already exists; preserving metadata"
+        if not wt.exists():
+            if wt_gitdir.exists() or wt_gitdir.is_symlink():
+                raise AutopilotError(
+                    f"Refusing to recreate absent worktree {wt} while metadata {wt_gitdir} already exists; preserving metadata"
+                )
+            subprocess.run(
+                ["git", "worktree", "add", "--detach", str(wt), base_sha],
+                env=env,
+                pass_fds=(wt_lock_fd,),
+                check=True,
+                timeout=240,
+                capture_output=True,
             )
-        subprocess.run(
-            ["git", "worktree", "add", "--detach", str(wt), base_sha],
-            env=env,
-            check=True,
-            timeout=60,
-            capture_output=True,
-        )
-    elif not wt.is_dir():
-        raise AutopilotError(f"Refusing non-directory worktree path: {wt}")
-    elif not any(wt.iterdir()):
-        if wt_gitdir.exists() or wt_gitdir.is_symlink():
-            raise AutopilotError(
-                f"Refusing to recreate empty worktree {wt} while metadata {wt_gitdir} already exists; preserving metadata"
+        elif not wt.is_dir():
+            raise AutopilotError(f"Refusing non-directory worktree path: {wt}")
+        elif not any(wt.iterdir()):
+            if wt_gitdir.exists() or wt_gitdir.is_symlink():
+                raise AutopilotError(
+                    f"Refusing to recreate empty worktree {wt} while metadata {wt_gitdir} already exists; preserving metadata"
+                )
+            wt.rmdir()
+            subprocess.run(
+                ["git", "worktree", "add", "--detach", str(wt), base_sha],
+                env=env,
+                pass_fds=(wt_lock_fd,),
+                check=True,
+                timeout=240,
+                capture_output=True,
             )
-        wt.rmdir()
-        subprocess.run(
-            ["git", "worktree", "add", "--detach", str(wt), base_sha],
-            env=env,
-            check=True,
-            timeout=60,
-            capture_output=True,
-        )
-    else:
-        # Non-empty existing directory: REQUIRE bidirectional ownership proof BEFORE reset/clean (NEVER rmtree unowned dir!)
-        if not wt_gitdir.is_dir():
-            raise AutopilotError(f"Refusing to overwrite non-empty directory {wt} lacking registered metadata {wt_gitdir}")
-        verify_dot_git_integrity(wt, wt_gitdir)
-        wt_env = _safe_git_env(git_dir=wt_gitdir, git_common_dir=mg, work_tree=wt)
-        subprocess.run(["git", "reset", "--hard", base_sha], env=wt_env, check=True, timeout=60, capture_output=True)
-        subprocess.run(["git", "clean", "-ffdx"], env=wt_env, check=True, timeout=60, capture_output=True)
+        else:
+            # Non-empty existing directory: REQUIRE bidirectional ownership proof BEFORE reset/clean (NEVER rmtree unowned dir!)
+            if not wt_gitdir.is_dir():
+                raise AutopilotError(f"Refusing to overwrite non-empty directory {wt} lacking registered metadata {wt_gitdir}")
+            verify_dot_git_integrity(wt, wt_gitdir)
+            wt_env = _safe_git_env(git_dir=wt_gitdir, git_common_dir=mg, work_tree=wt)
+            subprocess.run(["git", "reset", "--hard", base_sha], env=wt_env, pass_fds=(wt_lock_fd,), check=True, timeout=240, capture_output=True)
+            subprocess.run(["git", "clean", "-ffdx"], env=wt_env, pass_fds=(wt_lock_fd,), check=True, timeout=240, capture_output=True)
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(wt_lock_fd, fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            os.close(wt_lock_fd)
 
     verify_dot_git_integrity(wt, wt_gitdir)
     return wt, wt_gitdir
@@ -431,12 +444,12 @@ def check_autopilot_scope(raw_paths: list[str], frozen_write_scope: list[str] | 
         raise ScopeViolationError("Path outside frozen_write_scope", violations=allow_violations, is_lockfile=False)
 
 
-def parse_diff_tree_raw_z(raw_bytes: bytes) -> list[tuple[str, str, str, str, str]]:
-    """Parse `git diff-tree --raw -r --no-renames -z base_sha tree_oid` into (old_mode, new_mode, new_oid, status, raw_path)."""
+def parse_diff_tree_raw_z(raw_bytes: bytes) -> list[tuple[str, str, str, str, str, str]]:
+    """Parse `git diff-tree --raw -r --no-renames -z base_sha tree_oid` into (old_mode, new_mode, old_oid, new_oid, status, raw_path)."""
     if not raw_bytes:
         return []
     parts = raw_bytes.split(b"\0")
-    entries: list[tuple[str, str, str, str, str]] = []
+    entries: list[tuple[str, str, str, str, str, str]] = []
     i = 0
     while i < len(parts):
         meta = parts[i]
@@ -448,14 +461,39 @@ def parse_diff_tree_raw_z(raw_bytes: bytes) -> list[tuple[str, str, str, str, st
         fields = meta[1:].decode("ascii", errors="replace").split(" ")
         if len(fields) < 5:
             raise AutopilotError(f"Malformed diff-tree metadata: {fields!r}")
-        old_mode, new_mode, _old_oid, new_oid, status = fields[:5]
+        old_mode, new_mode, old_oid, new_oid, status = fields[:5]
         raw_path = parts[i + 1].decode("utf-8", errors="surrogateescape")
-        entries.append((old_mode, new_mode, new_oid, status, raw_path))
+        entries.append((old_mode, new_mode, old_oid, new_oid, status, raw_path))
         i += 2
     return entries
 
 
-def _scan_blob_for_secrets(git_env: dict[str, str], blob_oid: str, raw_path: str) -> None:
+_PEM_PRIVATE_KEY_BLOCK_RE = re.compile(
+    rb"-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----",
+    re.DOTALL,
+)
+
+
+def _secret_match_counts(label: str, pat: re.Pattern[bytes], blob: bytes) -> tuple[Counter[bytes], bool]:
+    """Return `(match_counter, comparable_with_base)`. PEM blocks require full header-to-footer parity; unclosed headers fail closed."""
+    headers = [m.group(0) for m in pat.finditer(blob)]
+    if not headers:
+        return Counter(), True
+    if label == "PEM private key":
+        blocks = [m.group(0) for m in _PEM_PRIVATE_KEY_BLOCK_RE.finditer(blob)]
+        if len(blocks) != len(headers):
+            return Counter(headers), False
+        return Counter(blocks), True
+    return Counter(headers), True
+
+
+def _scan_blob_for_secrets(
+    git_env: dict[str, str],
+    blob_oid: str,
+    raw_path: str,
+    *,
+    base_blob_oid: str = "",
+) -> None:
     proc = subprocess.run(
         ["git", "cat-file", "blob", blob_oid],
         env=git_env,
@@ -466,12 +504,38 @@ def _scan_blob_for_secrets(git_env: dict[str, str], blob_oid: str, raw_path: str
     if proc.returncode != 0:
         raise AutopilotError(f"Failed to inspect blob {blob_oid} for {raw_path}")
     blob = proc.stdout
+    matched_patterns: list[tuple[str, re.Pattern[bytes], Counter[bytes], bool]] = []
     for label, pat in _SECRET_BYTE_PATTERNS:
-        if pat.search(blob):
-            raise ScopeViolationError(
-                f"Secret material detected in {raw_path} ({label})",
-                violations=[f"{raw_path} (contains {label})"],
-            )
+        hits, comparable = _secret_match_counts(label, pat, blob)
+        if hits:
+            matched_patterns.append((label, pat, hits, comparable))
+    if not matched_patterns:
+        return
+    base_blob: bytes | None = None
+    if (
+        len(base_blob_oid) in (40, 64)
+        and all(ch in "0123456789abcdefABCDEF" for ch in base_blob_oid)
+        and any(ch != "0" for ch in base_blob_oid)
+    ):
+        base_proc = subprocess.run(
+            ["git", "cat-file", "blob", base_blob_oid],
+            env=git_env,
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+        if base_proc.returncode != 0:
+            raise AutopilotError(f"Failed to inspect base blob {base_blob_oid} for {raw_path}")
+        base_blob = base_proc.stdout
+    for label, pat, new_hits, comparable in matched_patterns:
+        if base_blob is not None and comparable:
+            old_hits, old_comparable = _secret_match_counts(label, pat, base_blob)
+            if old_comparable and all(cnt <= old_hits[val] for val, cnt in new_hits.items()):
+                continue
+        raise ScopeViolationError(
+            f"Secret material detected in {raw_path} ({label})",
+            violations=[f"{raw_path} (contains {label})"],
+        )
 
 
 def _is_valid_loose_git_object(path: Path, expected_oid: str) -> bool:
@@ -1244,12 +1308,30 @@ def export_verified_clean_tree(
                 os.close(ct_fd)
 
 
+def export_base_clean_tree(*, managed_gitdir: Path, base_sha: str, clean_tree_dir: Path) -> tuple[Path, int]:
+    """Materialize the authorized base commit's tree as an immutable CLEAN_TREE (used to tell baseline-red from candidate-red)."""
+    mg = managed_gitdir.resolve()
+    proc = subprocess.run(
+        ["git", "rev-parse", "--verify", f"{base_sha}^{{tree}}"],
+        env=_safe_git_env(git_dir=mg),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        raise AutopilotError(f"Unable to resolve tree of base {base_sha}: {proc.stderr.strip()}")
+    out = export_verified_clean_tree(managed_gitdir=mg, tree_oid=proc.stdout.strip(), clean_tree_dir=clean_tree_dir, retain_fd=True)
+    assert isinstance(out, tuple)
+    return out
+
+
 def export_review_bundle(
     *,
     managed_gitdir: Path,
     base_sha: str,
     candidate_sha: str,
-    entries: list[tuple[str, str, str, str, str]],
+    entries: list[tuple[str, str, str, str, str, str]],
     dod_check: str,
     issue_summary: str,
     bundle_dir: Path,
@@ -1268,11 +1350,11 @@ def export_review_bundle(
             timeout=30,
             check=True,
         )
-        touched_paths = [rp for _, _, _, _, rp in entries]
+        touched_paths = [rp for _, _, _, _, _, rp in entries]
         symlinks_meta: dict[str, str] = {}
         ctx_dir = rb_pin / "files"
 
-        for _old_mode, new_mode, new_oid, status, rp in entries:
+        for _old_mode, new_mode, _old_oid, new_oid, status, rp in entries:
             if status == "D":
                 continue
             blob_proc = subprocess.run(
@@ -1343,6 +1425,11 @@ def sample_and_gate_worktree(
     mg_real = managed_gitdir.resolve()
     wt_gd_real = wt_gitdir.resolve()
     wt_real = worktree.resolve()
+    seeded_from_wt_index = False
+    wt_idx_src = wt_gd_real / "index"
+    if wt_idx_src.is_file() and not wt_idx_src.is_symlink():
+        shutil.copyfile(wt_idx_src, stage_idx)
+        seeded_from_wt_index = True
 
     alt_dirs = [mg_real / "objects"]
     main_obj = resolve_repo_common_objects_dir(repo_main) if repo_main is not None else None
@@ -1367,10 +1454,11 @@ def sample_and_gate_worktree(
         diff_out_file.unlink()
 
     if run_in_ring:
+        read_tree_flag = "-m " if seeded_from_wt_index else ""
         ring_script = (
-            'set -euo pipefail; '
-            f'git read-tree "{base_sha}" && '
-            'git add -A && '
+            "set -euo pipefail; "
+            f'git read-tree {read_tree_flag}"{base_sha}" && '
+            "git add -A && "
             f'tree_oid=$(git write-tree) && printf "%s" "$tree_oid" > "{tree_out_file}" && '
             f'git diff-tree --raw -r --no-renames -z "{base_sha}" "$tree_oid" > "{diff_out_file}"'
         )
@@ -1393,14 +1481,15 @@ def sample_and_gate_worktree(
                 "GIT_ALTERNATE_OBJECT_DIRECTORIES": os.pathsep.join(str(p) for p in alt_dirs),
             },
         )
-        r_proc = subprocess.run(ring_argv, capture_output=True, text=True, timeout=90, check=False)
+        r_proc = subprocess.run(ring_argv, capture_output=True, text=True, timeout=300, check=False)
         if r_proc.returncode != 0:
             raise AutopilotError(f"git_ops_ring sampling failed: {r_proc.stderr.strip() or r_proc.stdout.strip()}")
         tree_oid = tree_out_file.read_text(encoding="utf-8").strip()
         diff_raw_bytes = diff_out_file.read_bytes()
     else:
-        subprocess.run(["git", "read-tree", base_sha], env=sample_env, check=True, timeout=30, capture_output=True)
-        subprocess.run(["git", "add", "-A"], env=sample_env, check=True, timeout=60, capture_output=True)
+        rt_cmd = ["git", "read-tree", *(["-m"] if seeded_from_wt_index else []), base_sha]
+        subprocess.run(rt_cmd, env=sample_env, check=True, timeout=60, capture_output=True)
+        subprocess.run(["git", "add", "-A"], env=sample_env, check=True, timeout=180, capture_output=True)
         wt_res = subprocess.run(
             ["git", "write-tree"],
             env=sample_env,
@@ -1421,14 +1510,15 @@ def sample_and_gate_worktree(
 
     entries = parse_diff_tree_raw_z(diff_raw_bytes)
     if not entries:
-        raise AutopilotError("Candidate produced empty diff against base_sha")
+        raise EmptyCandidateError("Candidate produced empty diff against base_sha")
 
     raw_paths: list[str] = []
-    for old_mode, new_mode, new_oid, status, raw_path in entries:
+    for old_mode, new_mode, old_oid, new_oid, status, raw_path in entries:
         validate_raw_git_path(raw_path, old_mode=old_mode, new_mode=new_mode)
         raw_paths.append(raw_path)
         if status != "D" and new_mode in ("100644", "100755"):
-            _scan_blob_for_secrets(sample_env, new_oid, raw_path)
+            base_oid = old_oid if (status == "M" and old_mode in ("100644", "100755")) else ""
+            _scan_blob_for_secrets(sample_env, new_oid, raw_path, base_blob_oid=base_oid)
 
     check_autopilot_scope(raw_paths, frozen_write_scope)
 
@@ -1593,13 +1683,17 @@ def scrub_worktree_to_base(*, managed_gitdir: Path, wt_gitdir: Path, worktree: P
         raise AutopilotError(f"base_sha {base_sha!r} not found in {mg_real}; refusing worktree scrub")
 
     dot_git.write_bytes(f"gitdir: {canon_wt_gd}\n".encode("utf-8"))
+    with contextlib.suppress(OSError):
+        idx_lock = wt_gd_real / "index.lock"
+        if not idx_lock.is_symlink() and idx_lock.is_file():
+            idx_lock.unlink()
     env = _safe_git_env(
         git_dir=wt_gd_real,
         git_common_dir=mg_real,
         work_tree=wt_real,
     )
-    r1 = subprocess.run(["git", "reset", "--hard", base_sha], env=env, capture_output=True, timeout=60, check=False)
-    r2 = subprocess.run(["git", "clean", "-ffdx"], env=env, capture_output=True, timeout=60, check=False)
+    r1 = subprocess.run(["git", "reset", "--hard", base_sha], env=env, capture_output=True, timeout=240, check=False)
+    r2 = subprocess.run(["git", "clean", "-ffdx"], env=env, capture_output=True, timeout=240, check=False)
     if r1.returncode != 0 or r2.returncode != 0:
         return 1
     return 0 if verify_worktree_clean(managed_gitdir=mg_real, wt_gitdir=wt_gd_real, worktree=wt_real) else 1

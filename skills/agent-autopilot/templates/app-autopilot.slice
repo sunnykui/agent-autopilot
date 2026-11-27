@@ -1,0 +1,15 @@
+[Unit]
+Description=agent-autopilot background workers (CPU-capped below burstable-host baseline)
+Documentation=file://%h/.claude/skills/agent-autopilot/SKILL.md
+
+# Sized for a 4 vCPU burstable host (Lightsail xlarge / t3.xlarge: 40% baseline = 160% Linux CPU).
+# CPUQuota stays below the credit-earning baseline so interactive desktop/SSH keep headroom and credits refill.
+# Adjust with: systemctl --user edit app-autopilot.slice
+[Slice]
+CPUWeight=10
+CPUQuota=110%
+IOAccounting=yes
+IOWeight=20
+MemoryAccounting=yes
+MemoryHigh=6G
+MemoryMax=8G

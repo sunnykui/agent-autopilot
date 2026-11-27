@@ -11,6 +11,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterator
 
+from .host_guard import HEAVY_UNIT_KINDS, count_global_heavy_claims, load_global_limits
 from .models import (
     ACTION_TYPES,
     CANDIDATE_BOUND_WORKER_ACTIONS,
@@ -1008,6 +1009,11 @@ class AutopilotDB:
             ).fetchone()["c"]
             if int(active_claims) >= cap:
                 raise AutopilotError(f"WIP limit reached for {cfg.project_id}: {active_claims}/{cap}")
+            if cfg.kind in HEAVY_UNIT_KINDS:
+                g_cap = load_global_limits().max_global_in_progress
+                g_active = count_global_heavy_claims(self._conn)
+                if g_active >= g_cap:
+                    raise AutopilotError(f"Global WIP limit reached across projects: {g_active}/{g_cap}")
 
             if cfg.max_per_day > 0:
                 day_start_iso = now_utc().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
@@ -2307,19 +2313,33 @@ class AutopilotDB:
             assert out is not None
             return dict(out)
 
-    def approve_concurrency_promotion(self, project_id: str) -> int:
+    def approve_concurrency_promotion(
+        self,
+        project_id: str,
+        *,
+        force: bool = False,
+        target_cap: int | None = None,
+    ) -> int:
         steps = POLICY_MANIFEST["chef_pipeline"]["staircase_concurrency_steps"]
         min_clean = int(POLICY_MANIFEST["chef_pipeline"]["staircase_min_clean_runs"])
         with self.immediate_tx():
             row = self._conn.execute("SELECT * FROM projects WHERE project_id = ?", (project_id,)).fetchone()
             if row is None:
                 raise AutopilotError(f"Unknown project_id: {project_id}")
-            if int(row["clean_matured_runs"]) < min_clean:
+            if target_cap is not None and not force:
+                raise AutopilotError("Explicit target concurrency override requires --force")
+            if not force and int(row["clean_matured_runs"]) < min_clean:
                 raise AutopilotError(
                     f"Project {project_id} has {row['clean_matured_runs']}/{min_clean} 48h-matured clean runs"
                 )
-            next_idx = min(int(row["current_step_idx"]) + 1, len(steps) - 1)
-            new_cap = int(steps[next_idx])
+            if target_cap is not None:
+                if int(target_cap) not in steps:
+                    raise AutopilotError(f"Invalid target concurrency {target_cap}; allowed steps: {steps}")
+                next_idx = steps.index(int(target_cap))
+                new_cap = int(target_cap)
+            else:
+                next_idx = min(int(row["current_step_idx"]) + 1, len(steps) - 1)
+                new_cap = int(steps[next_idx])
             self._conn.execute(
                 "UPDATE projects SET current_step_idx = ?, max_in_progress = ?, clean_matured_runs = 0, updated_at = ? WHERE project_id = ?",
                 (next_idx, new_cap, now_iso(), project_id),

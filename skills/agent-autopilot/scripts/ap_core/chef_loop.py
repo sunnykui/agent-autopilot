@@ -1,7 +1,9 @@
 """Chef 6-Principle execution loop: Scout -> Executable DoD -> Writer -> verify_ring -> Cross-Family Referee (<=3 rounds)."""
 from __future__ import annotations
 
+import datetime as dt
 import json
+import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -10,11 +12,18 @@ from typing import Any, Protocol
 
 from .db import AutopilotDB
 from .dream import sync_project_pitfalls_markdown
-from .git_gate import CandidateGateResult, prepare_isolated_worktree, resolve_repo_common_objects_dir, sample_and_gate_worktree
+from .git_gate import (
+    CandidateGateResult,
+    export_base_clean_tree,
+    prepare_isolated_worktree,
+    resolve_repo_common_objects_dir,
+    sample_and_gate_worktree,
+)
 from .github_flow import GitHubTransport, execute_granted_op
 from .models import (
     POLICY_MANIFEST,
     AutopilotError,
+    EmptyCandidateError,
     QuotaExhaustedError,
     ScopeViolationError,
     WorkflowConfig,
@@ -161,6 +170,20 @@ def _build_safe_verify_env(
     return merged
 
 
+def _run_verify_subprocess(argv: list[str], *, timeout_sec: int, **kw: Any) -> subprocess.CompletedProcess[str]:
+    """Run a verify command; a timeout becomes an ordinary failing result (rc=124) instead of crashing the worker."""
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout_sec, check=False, **kw)
+    except subprocess.TimeoutExpired as exc:
+        def _txt(v: Any) -> str:
+            if v is None:
+                return ""
+            return v.decode("utf-8", errors="replace") if isinstance(v, (bytes, bytearray)) else str(v)
+
+        msg = f"error: verify timed out after {timeout_sec}s"
+        return subprocess.CompletedProcess(argv, 124, _txt(exc.stdout), _txt(exc.stderr) + "\n" + msg + "\n")
+
+
 def run_verify_ring_command(
     *,
     clean_tree_dir: Path,
@@ -176,22 +199,28 @@ def run_verify_ring_command(
     extra_verify_env: dict[str, str] | None = None,
     repo_main_dir: Path | None = None,
     ro_workspace_deps: tuple[str, ...] = (),
+    max_output_chars: int = 2000,
+    timeout_sec: int = 300,
 ) -> tuple[int, bool, str]:
     """Run executable DoD (+ optional loopback UI check in the SAME verify_ring namespace)."""
     merged_extra_env = _build_safe_verify_env(touched_paths, extra_verify_env)
     if enable_ui_verify and ui_verify_url:
-        ui_res = run_optional_ui_verify(
-            clean_tree_dir=clean_tree_dir,
-            verify_out_dir=verify_out_dir,
-            ui_url=ui_verify_url,
-            dod_and_server_cmd=dod_cmd,
-            trusted_base_cache=trusted_base_cache,
-            clean_tree_fd=clean_tree_fd,
-            trusted_base_cache_fd=trusted_base_cache_fd,
-            extra_env=merged_extra_env,
-            repo_main_dir=repo_main_dir,
-            ro_workspace_deps=ro_workspace_deps,
-        )
+        try:
+            ui_res = run_optional_ui_verify(
+                clean_tree_dir=clean_tree_dir,
+                verify_out_dir=verify_out_dir,
+                ui_url=ui_verify_url,
+                dod_and_server_cmd=dod_cmd,
+                trusted_base_cache=trusted_base_cache,
+                clean_tree_fd=clean_tree_fd,
+                trusted_base_cache_fd=trusted_base_cache_fd,
+                extra_env=merged_extra_env,
+                repo_main_dir=repo_main_dir,
+                ro_workspace_deps=ro_workspace_deps,
+                timeout_sec=timeout_sec,
+            )
+        except subprocess.TimeoutExpired:
+            return 124, False, f"error: UI/DoD verification timed out after {timeout_sec}s"
         if not ui_res["ok"]:
             return 1, False, f"UI/DoD verification failed: {ui_res}"
         return 0, True, str(ui_res.get("stdout") or "ui_verified")
@@ -218,13 +247,8 @@ def run_verify_ring_command(
                 repo_main_dir=repo_main_dir,
                 ro_workspace_deps=ro_workspace_deps,
             )
-            proc = subprocess.run(
-                argv,
-                capture_output=True,
-                text=True,
-                pass_fds=tuple(retain_fds),
-                timeout=300,
-                check=False,
+            proc = _run_verify_subprocess(
+                argv, timeout_sec=timeout_sec, pass_fds=tuple(retain_fds)
             )
         finally:
             for _fd in retain_fds:
@@ -249,23 +273,164 @@ def run_verify_ring_command(
                 "CI": "1",
                 **merged_extra_env,
             }
-            proc = subprocess.run(
-                ["/bin/bash", "-lc", dod_cmd],
-                cwd=str(vo_exec),
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=300,
-                check=False,
+            proc = _run_verify_subprocess(
+                ["/bin/bash", "-lc", dod_cmd], timeout_sec=timeout_sec, cwd=str(vo_exec), env=env
             )
         finally:
             _os.close(_vo_fd)
             _os.close(_ct_fd)
 
-    output_summary = sanitize_terminal_text(proc.stdout + "\n" + proc.stderr, 2000)
+    output_summary = sanitize_terminal_text(proc.stdout + "\n" + proc.stderr, max_output_chars)
     if proc.returncode != 0:
         return proc.returncode, False, output_summary
     return 0, False, output_summary
+
+
+BASELINE_RED_RETRY_SEC = 3600
+
+
+def _verify_timeout(cfg: WorkflowConfig) -> int:
+    """Per-project verify_ring time budget: `extra.verify_timeout_sec` with a 60s floor; missing or non-numeric -> 300s default."""
+    raw = cfg.extra.get("verify_timeout_sec")
+    if raw is None or raw == "":
+        return 300
+    try:
+        return max(60, int(raw))
+    except (TypeError, ValueError):
+        return 300
+
+
+BASELINE_RED_MAX_WAITS = 6
+VERIFY_FULL_OUTPUT_CAP = 400_000
+_BASELINE_RED_PREFIX_RE = re.compile(r"^baseline_red\[(\d+)\]:")
+_FAILURE_LINE_RE = re.compile(r"(error|fail|✖|exception|traceback)", re.IGNORECASE)
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _failure_signature(out: str) -> frozenset[str]:
+    """Normalized failure lines of a verify run (ANSI-stripped, whitespace-collapsed, never truncated)."""
+    sig: set[str] = set()
+    for raw in _ANSI_RE.sub("", out or "").splitlines():
+        line = " ".join(raw.split())
+        if line and _FAILURE_LINE_RE.search(line):
+            sig.add(line)
+    return frozenset(sig)
+
+
+def _is_same_baseline_failure(candidate_out: str, base_rc: int, base_out: str) -> bool:
+    """Baseline-red only when the base also fails and EVERY candidate failure line is already present on the base.
+
+    Outputs that hit the capture cap are treated as unknown (blame the candidate) because a truncated tail could hide
+    candidate-only failures.
+    """
+    if base_rc == 0:
+        return False
+    # `sanitize_terminal_text` returns exactly `max_chars` characters only when it truncated (or the raw output was exactly that long).
+    if len(candidate_out or "") >= VERIFY_FULL_OUTPUT_CAP or len(base_out or "") >= VERIFY_FULL_OUTPUT_CAP:
+        return False
+    base_sig = _failure_signature(base_out)
+    cand_sig = _failure_signature(candidate_out)
+    return bool(base_sig) and bool(cand_sig) and cand_sig <= base_sig
+
+
+def _baseline_red_count(last_error: str | None) -> int:
+    m = _BASELINE_RED_PREFIX_RE.match(str(last_error or ""))
+    return int(m.group(1)) if m else 0
+
+
+def _park_unit_for_baseline_red(
+    *,
+    db: AutopilotDB,
+    cfg: WorkflowConfig,
+    unit_key: str,
+    base_sha: str,
+    base_out: str,
+    advisory_dir: Path,
+) -> dict[str, Any]:
+    """Wait (no review round consumed) while the authorized base is red; escalate after BASELINE_RED_MAX_WAITS waits."""
+    urow = db.get_unit(unit_key) or {}
+    count = _baseline_red_count(urow.get("last_error")) + 1
+    summary = sanitize_terminal_text(base_out, 200)
+    db.record_pitfall(
+        project_id=cfg.project_id,
+        target_area="environment",
+        symptom=f"Authorized base {base_sha[:12]} fails verify with the same errors: {sanitize_terminal_text(base_out, 160)}",
+        rule_text="Verify fails identically on the untouched base: repair the base or the verify environment before retrying the issue",
+    )
+    sync_project_pitfalls_markdown(db, cfg.project_id, advisory_dir=advisory_dir)
+    if count >= BASELINE_RED_MAX_WAITS:
+        db.mark_unit_needs_human(unit_key, f"baseline_red persisted for {count} checks: {summary}", non_veto=True)
+        return {"status": "needs-human", "reason": "baseline_red_persisted", "defect_trajectory": []}
+    wake = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=BASELINE_RED_RETRY_SEC)).replace(microsecond=0).isoformat()
+    db.mark_unit_waiting_quota(unit_key, wake, f"baseline_red[{count}]:{summary}")
+    raise QuotaExhaustedError("Authorized base fails verify in this environment", wake_at_iso=wake, family="environment")
+
+
+def _paths_present_in_tree(tree_dir: Path, paths: tuple[str, ...]) -> tuple[str, ...]:
+    """Keep only touched paths that exist in `tree_dir` (files the candidate added cannot be verified on the base)."""
+    out: list[str] = []
+    for p in paths:
+        cand = tree_dir / p
+        if cand.is_file() and not cand.is_symlink():
+            out.append(p)
+    return tuple(out)
+
+
+def _verify_authorized_base(
+    *,
+    cfg: WorkflowConfig,
+    managed_gitdir: Path,
+    base_sha: str,
+    run_dir: Path,
+    attempt_num: int,
+    dod_cmd: str,
+    touched_paths: tuple[str, ...],
+    use_bwrap: bool,
+    trusted_base_cache: Path | None,
+    trusted_base_cache_fd: int | None,
+    repo_main: Path | None,
+    ro_ws_deps: tuple[str, ...],
+) -> tuple[int, str]:
+    """Run the same DoD on the untouched base tree, scoped to touched paths that already exist there.
+
+    Returns (0, "") when the base is green or cannot be evaluated (fail towards blaming the candidate, never
+    towards silently waiting).
+    """
+    import contextlib as _ctx
+    import os as _os
+
+    tag = f"{base_sha[:12]}-r{attempt_num}"
+    try:
+        base_ct, base_fd = export_base_clean_tree(
+            managed_gitdir=managed_gitdir, base_sha=base_sha, clean_tree_dir=run_dir / f"base-tree-{tag}"
+        )
+    except (AutopilotError, subprocess.SubprocessError, OSError):
+        return 0, ""
+    try:
+        base_paths = _paths_present_in_tree(base_ct, touched_paths)
+        if not base_paths:
+            return 0, ""
+        rc, _ui, out = run_verify_ring_command(
+            clean_tree_dir=base_ct,
+            verify_out_dir=run_dir / f"verify-out-base-{tag}",
+            dod_cmd=dod_cmd,
+            use_bwrap=use_bwrap,
+            trusted_base_cache=trusted_base_cache,
+            clean_tree_fd=base_fd,
+            trusted_base_cache_fd=trusted_base_cache_fd,
+            touched_paths=base_paths,
+            extra_verify_env=dict(cfg.extra.get("verify_env") or {}) if isinstance(cfg.extra.get("verify_env"), dict) else None,
+            repo_main_dir=repo_main,
+            ro_workspace_deps=ro_ws_deps,
+            max_output_chars=VERIFY_FULL_OUTPUT_CAP,
+            timeout_sec=_verify_timeout(cfg),
+        )
+        return rc, out
+    except (AutopilotError, subprocess.SubprocessError, OSError):
+        return 0, ""
+    finally:
+        with _ctx.suppress(OSError):
+            _os.close(base_fd)
 
 
 def execute_chef_issue_pipeline(
@@ -309,6 +474,34 @@ def execute_chef_issue_pipeline(
     writer_model = str(models_cfg[f"{writer_family}_writer"])
     referee_model = str(models_cfg[f"{referee_family}_referee"])
     main_obj = resolve_repo_common_objects_dir(repo_main) if repo_main is not None else None
+
+    # Zero-LLM-token recheck: a unit parked for baseline-red only wakes the models once the base is green again.
+    if _baseline_red_count((urow_init or {}).get("last_error")) > 0:
+        prev_v = db._conn.execute(
+            "SELECT touched_paths_json, dod_cmd FROM verify_receipts WHERE unit_key = ? AND exit_code != 0 ORDER BY created_at DESC LIMIT 1",
+            (unit_key,),
+        ).fetchone()
+        prev_paths = tuple(json.loads(prev_v["touched_paths_json"] or "[]")) if prev_v else ()
+        prev_dod = (cfg.verify_cmd or (str(prev_v["dod_cmd"] or "") if prev_v else "")).strip()
+        if prev_paths and prev_dod:
+            pre_rc, pre_out = _verify_authorized_base(
+                cfg=cfg,
+                managed_gitdir=managed_gitdir,
+                base_sha=base_sha,
+                run_dir=run_dir,
+                attempt_num=0,
+                dod_cmd=prev_dod,
+                touched_paths=prev_paths,
+                use_bwrap=use_bwrap_verify,
+                trusted_base_cache=trusted_base_cache,
+                trusted_base_cache_fd=trusted_base_cache_fd,
+                repo_main=repo_main,
+                ro_ws_deps=tuple(str(x).strip() for x in (cfg.extra.get("ro_workspace_deps") or []) if str(x).strip()),
+            )
+            if pre_rc != 0 and _failure_signature(pre_out):
+                return _park_unit_for_baseline_red(
+                    db=db, cfg=cfg, unit_key=unit_key, base_sha=base_sha, base_out=pre_out, advisory_dir=advisory_dir
+                )
 
     wt, wt_gitdir = prepare_isolated_worktree(
         managed_gitdir=managed_gitdir,
@@ -363,7 +556,9 @@ def execute_chef_issue_pipeline(
             writer_prompt = (
                 f"{advisory_ctx}\n\n<scout_plan>\n{json.dumps(scout_data, ensure_ascii=False)}\n</scout_plan>\n"
                 f"<issue>\n{issue_summary}\n</issue>\n{defect_feedback}\n"
-                "Output JSON matching required_fill_in_schemas.writer (summary <= 300 chars)."
+                "Implement the fix directly in the repository worktree, run fast targeted verification commands, "
+                "and output JSON matching required_fill_in_schemas.writer: "
+                '{"summary_le_300_chars":"...","changed_files":["..."],"executed_checks":["..."],"uncertainties":[]}'
             )
             try:
                 w_turn = model_runner.run_writer(
@@ -401,6 +596,24 @@ def execute_chef_issue_pipeline(
                     commit_message=writer_data["summary_le_300_chars"],
                 )
                 open_gates.append(gate)
+            except EmptyCandidateError:
+                # The writer produced no change (e.g. the issue needs a human/vendor step, or it got stuck).
+                # Give it one more round with explicit feedback; escalate with its own explanation when rounds run out.
+                reserved_empty_round = db.reserve_review_round(unit_key)
+                writer_note = sanitize_terminal_text(
+                    f"{writer_data.get('summary_le_300_chars', '')} | uncertainties: {writer_data.get('uncertainties', [])}", 600
+                )
+                if reserved_empty_round is None or reserved_empty_round >= max_rounds:
+                    db.mark_unit_needs_human(unit_key, f"Writer produced no code change: {writer_note}", non_veto=True)
+                    return {"status": "needs-human", "reason": "empty_candidate", "defect_trajectory": defect_trajectory}
+                defect_feedback = (
+                    f"<empty_candidate round='{reserved_empty_round}'>\n"
+                    "Your previous turn left the worktree unchanged, so nothing can be verified or reviewed. "
+                    "Implement the in-repo part of the issue now (backward-compatible, default-off where external steps are pending). "
+                    "If truly nothing in this repository can change, leave it unchanged again and explain why in uncertainties.\n"
+                    f"Previous summary: {writer_note}\n</empty_candidate>"
+                )
+                continue
             except ScopeViolationError as exc:
                 db.record_pitfall(
                     project_id=cfg.project_id,
@@ -412,7 +625,24 @@ def execute_chef_issue_pipeline(
                 if exc.is_lockfile:
                     db.mark_unit_needs_human(unit_key, f"Lockfile change requires human approval: {exc.violations}", non_veto=True)
                     return {"status": "needs-human", "reason": "lockfile_escalation", "defect_trajectory": defect_trajectory}
-                raise
+                hard_suffixes = ("(matches global_hard_stop_anchored)", "(matches case-insensitive global_hard_stop_basenames)")
+                hard_hits = [v for v in exc.violations if str(v).endswith(hard_suffixes)]
+                if hard_hits:
+                    # Protected paths (migrations, secrets, CI, ...) need a human; retrying the writer cannot help.
+                    db.mark_unit_needs_human(unit_key, f"Change needs protected paths (human approval): {hard_hits[:5]}", non_veto=True)
+                    return {"status": "needs-human", "reason": "hard_stop_paths", "defect_trajectory": defect_trajectory}
+                reserved_scope_round = db.reserve_review_round(unit_key)
+                if reserved_scope_round is None or reserved_scope_round >= max_rounds:
+                    db.mark_unit_needs_human(unit_key, f"Out-of-scope edits after {max_rounds} rounds: {exc.violations[:5]}", non_veto=True)
+                    return {"status": "needs-human", "reason": "scope_exhausted", "defect_trajectory": defect_trajectory}
+                defect_feedback = (
+                    f"<scope_violation round='{reserved_scope_round}'>\n"
+                    f"Allowed write scope: {list(frozen_scope)}\n"
+                    "Revert or move these out-of-scope edits and keep every change inside the allowed scope:\n"
+                    + "\n".join(str(v) for v in exc.violations[:20])
+                    + "\n</scope_violation>"
+                )
+                continue
 
             db.set_current_candidate(unit_key=unit_key, candidate_sha=gate.candidate_sha, claim_epoch=claim_epoch)
 
@@ -431,7 +661,11 @@ def execute_chef_issue_pipeline(
                 extra_verify_env=dict(cfg.extra.get("verify_env") or {}) if isinstance(cfg.extra.get("verify_env"), dict) else None,
                 repo_main_dir=repo_main,
                 ro_workspace_deps=ro_ws_deps,
+                max_output_chars=VERIFY_FULL_OUTPUT_CAP,
+                timeout_sec=_verify_timeout(cfg),
             )
+            v_full = v_out
+            v_out = sanitize_terminal_text(v_full, 2000)
             db.record_verify_receipt(
                 unit_key=unit_key,
                 candidate_sha=gate.candidate_sha,
@@ -442,6 +676,26 @@ def execute_chef_issue_pipeline(
                 touched_paths=gate.touched_paths,
             )
             if v_rc != 0:
+                # Distinguish "candidate broke it" from "the authorized base is already red in this environment"
+                # (e.g. stale generated clients or deps mounted from the host). Baseline-red never consumes a round.
+                base_rc, base_out = _verify_authorized_base(
+                    cfg=cfg,
+                    managed_gitdir=managed_gitdir,
+                    base_sha=base_sha,
+                    run_dir=run_dir,
+                    attempt_num=attempt_num,
+                    dod_cmd=dod_cmd,
+                    touched_paths=gate.touched_paths,
+                    use_bwrap=use_bwrap_verify,
+                    trusted_base_cache=trusted_base_cache,
+                    trusted_base_cache_fd=trusted_base_cache_fd,
+                    repo_main=repo_main,
+                    ro_ws_deps=ro_ws_deps,
+                )
+                if _is_same_baseline_failure(v_full, base_rc, base_out):
+                    return _park_unit_for_baseline_red(
+                        db=db, cfg=cfg, unit_key=unit_key, base_sha=base_sha, base_out=base_out, advisory_dir=advisory_dir
+                    )
                 db.record_pitfall(
                     project_id=cfg.project_id,
                     target_area=target_area,
@@ -464,7 +718,9 @@ def execute_chef_issue_pipeline(
             outbox_dir = ensure_secure_dir(run_dir / f"referee-outbox-r{reserved_round}", 0o700)
             ref_prompt = (
                 f"Adversarially review /ap-review-bundle (round {reserved_round}). "
-                "Output ONLY JSON matching required_fill_in_schemas.referee with 3-column defects (location, failure_case, minimal_fix)."
+                "Output ONLY JSON matching required_fill_in_schemas.referee: "
+                f'{{"round_index":{reserved_round},"verdict":"APPROVE","defect_count":0,"three_col_defects":[],"uncertainties":[]}} '
+                '(or verdict="REVISE" with defect_count == len(three_col_defects), each object having non-empty keys: location, failure_case, minimal_fix).'
             )
             try:
                 r_turn = model_runner.run_referee(
