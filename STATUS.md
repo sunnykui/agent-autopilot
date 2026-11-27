@@ -1,6 +1,6 @@
 # `agent-autopilot` 交接状态与通用运维手册（`STATUS.md`）
 
-更新时间：2026-11-26（`America/Los_Angeles`）
+更新时间：2026-11-27（`America/Los_Angeles`）
 仓库：`sunnykui/agent-autopilot`
 
 ---
@@ -25,6 +25,8 @@
    - 已知旧失败：`test_round22_all_codex_closures`（tool_ring 内 `.git` 只读断言）在本分支基点 `32cb6e1` 上同样失败，与本改动无关。
 4. **单任务受保护迁移路径人工批准（2026-11-26）**：
    - 新增 `agent-autopilot approve-paths <unit_key> --allow <glob>`：仅允许对 `policy_manifest.json` 的 `approvable_hard_stop_anchored` 子集（`prisma/**`、`migrations/**`、`**/migrations/**`）按单任务授权并自动恢复非否决 `needs-human` 暂停；认领时冻结到 `run_claims.frozen_approved_protected_paths_json`，密钥、控制文件、CI 与锁文件仍无条件阻断。
+5. **跨项目通用执行与吞吐准则沉淀（2026-11-27）**：
+   - 将多仓库实战沉淀的 6 条通用准则写入 [`skills/agent-autopilot/SKILL.md`](skills/agent-autopilot/SKILL.md) 与 [`skills/codex-dispatch/SKILL.md`](skills/codex-dispatch/SKILL.md)（严格脱敏、零业务硬编码），并修正既有 `resolve-op` 文档示例为有效状态名（`succeeded_verified` / `not_executed`）：在已批准两级并发上限内将可并发阶段与独占物理资源解耦及批量合测列车、推分支建 PR 后即释槽（原生 `issue` 发布后结束，已实现续做预检的 `delegated` 项目在 CI 完且冷却期与调度条件满足后恢复）、独立快审前置到 DoD 之外的昂贵外部/真机 E2E 之前、平台/外部行为先探针证实、安全进程等待（同 shell 用 `wait "$pid"`，跨 shell 读任务回执，禁 `pgrep -f` 自匹配并按主管超时与身份核验回收僵死进程）、合前审 diff 区分阶段性 PR 及远端 5xx 按原 `op_id` 事务对账。
 
 ---
 

@@ -65,6 +65,7 @@ Execute the required stages back-to-back without stopping for routine intermedia
 
 ## Hard Operating Rules
 
-- **Background without polling**: For runs likely exceeding ~90s (`implement --tier high/hard`, `critique`, `review`), set Claude Bash tool `run_in_background: true`. NEVER append `&`/`nohup` or poll with `sleep`.
+- **Background without polling**: For runs likely exceeding ~90s (`implement --tier high/hard`, `critique`, `review`), set Claude Bash tool `run_in_background: true`. NEVER append `&`/`nohup`, NEVER write `pgrep -f <cmd>` self-matching wait loops, and NEVER run bare `tail --pid` without `-f`. In shell scripts, use `wait "$pid"` for same-shell children; for cross-shell processes, read the background task receipt / PID status (if using GNU `tail --pid=<pid> -f /dev/null` on Linux, wrap with a timeout and inspect the task receipt separately, as it is unsupported on macOS, returns `0` regardless of exit code, and blocks on unreaped zombies).
+- **Front-load quick review before expensive external E2E**: Run a fast `review` after local unit tests pass — before committing to slow external cloud builds or exclusive real-machine runs outside local DoD — so code defects are fixed in one cycle.
 - **Read compact receipts only**: Rely on stdout receipt + targeted `git diff` hunks. Read `<run_dir>/stderr.log` or `events.jsonl` ONLY when status is `FAILED`.
 - **Two-rework cap**: After 2 failed `resume` attempts on the same task, take over directly and finish cleanly.
