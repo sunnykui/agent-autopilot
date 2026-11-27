@@ -1,6 +1,6 @@
 # `agent-autopilot` 交接状态与通用运维手册（`STATUS.md`）
 
-更新时间：2026-11-25（`America/Los_Angeles`）
+更新时间：2026-11-26（`America/Los_Angeles`）
 仓库：`sunnykui/agent-autopilot`
 
 ---
@@ -11,11 +11,18 @@
    - 架构规范（[`docs/AUTOPILOT_PLAN.md`](docs/AUTOPILOT_PLAN.md) v7.8）：Claude Fable 5.2 + Codex GPT-6.2 Astra 双 `APPROVE`。
    - 全量代码实现审查（30+ 轮增量对抗挑刺）：Claude Fable 5.2 / Sonnet 5.5 + Codex GPT-6.2 Astra 双 `APPROVE`（0 个 P0/P1 阻塞项）。
    - 通用试点增强（2026-11-25）：新增全项目通用的 `--require-labels` 标签准入过滤、多槽位并行调度（`slot-1..slot-N` 并发派发 + `managed.git` 工作树互斥锁 + `approve-promotion --force --target <N>` 并发调控）、无状态多语言 SDK 自动发现（Node / Go / Rust / Terraform / uv，零版本号硬编码）、`go.sum` 离线 `GOMODCACHE` 预取、`ro_workspace_deps` 受控只读依赖挂载、`AP_TOUCHED_FILES` 干净树改动集注入，以及 `delegated` 模式只读断网 `bwrap` 续做预检。
-   - 自动化验证：`python3 -B -m unittest discover -s tests -p "test_*.py"` **54/54 全部通过**，`agent-autopilot selftest --live` **通过**（`schema_version = 16`）。
+   - 自动化验证：`python3 -B -m unittest discover -s tests -p "test_*.py"` **45/46 通过**（`test_round22_all_codex_closures` 为基点 `32cb6e1` 起即存在的旧失败），`agent-autopilot selftest --live` **通过**（`schema_version = 16`）。
    - 试点首夜修复（2026-11-26）：①“基线已红”识别——验收失败时用同一命令在未改动的授权基线上复跑，候选的每条失败都已出现在基线上才判为环境问题，挂起等待（不扣改代码轮次），醒来先零 token 复查基线，连续 6 次仍红转人工；②`delegated` 项目仅因续做预检触发时遵守 `schedule_interval_sec`（在调度锁内复核），新 issue 不受影响；③`delegated-exec --cmd` 与子命令名冲突、大仓库索引采样超时、清理单元时限过短等修复。
 2. **零个人/业务敏感硬编码**：
    - 仓库内源码与文档已彻底剥离个人邮箱、内部仓库名、宿主机用户路径及任何凭据；
    - 各业务仓库、邮箱地址、忽略发件人列表与专用 Token 路径全部隔离在宿主机本机目录 `~/.config/agent-autopilot/`（`0600`）与 `~/.local/state/agent-autopilot/`（`0700`，本机实例台账见 `~/.local/state/agent-autopilot/HOST_STATUS.md`）。
+
+3. **主机算力护栏（2026-11-26，分支 `sunnykui/fix-cpu`；起因：4 vCPU 突发型主机 CPU 积分耗尽、Steal 约 60%）**：
+   - 全机重型 Worker（`issue` / `delegated`）并发上限 `max_global_in_progress`（默认 `1`），在 `claim_and_reserve` 事务内强制；只计 `active` 认领（卡在 `reclaiming` 的不占槽位，避免一个清理失败的单元把所有项目饿死）。`routine` 不受限。
+   - 派发前零 Token 闸门：全局槽位已满则直接跳过；否则采样 1 秒 `/proc/stat` steal 占比与 `/proc/loadavg`，steal > 15% 或 1 分钟负载 > 4.0 时本轮记为普通等待（`waiting_host_capacity:*`），下个定时 tick 自动重试；最近一次判定写入 `~/.local/state/agent-autopilot/host_gate.json`。
+   - 可调项（可选）：`~/.config/agent-autopilot/global.json` 的 `max_global_in_progress` / `host_max_steal_pct` / `host_max_load1` / `host_sample_sec`，或同名 `AGENT_AUTOPILOT_*` 环境变量。
+   - `templates/app-autopilot.slice`（`CPUWeight=10`、`CPUQuota=110%`、`IOWeight=20`、`MemoryHigh=6G`、`MemoryMax=8G`）由 `install.sh --install-systemd-units` 安装；不安装时 `systemd-run --slice` 会生成无配额的空 slice。瞬态单元追加 `Nice=15`；tool/verify 沙箱默认注入 `GOMAXPROCS=2`、`RAYON_NUM_THREADS=2`、`UV_THREADPOOL_SIZE=2`、`PLAYWRIGHT_WORKERS=1`（WORKFLOW `verify_env` 显式值优先）。
+   - 已知旧失败：`test_round22_all_codex_closures`（tool_ring 内 `.git` 只读断言）在本分支基点 `32cb6e1` 上同样失败，与本改动无关。
 
 ---
 
