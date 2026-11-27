@@ -96,6 +96,8 @@ CREATE TABLE IF NOT EXISTS work_units (
     waiting_until TEXT,
     failure_streak INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
+    approved_protected_paths_json TEXT NOT NULL DEFAULT '[]',
+    blocked_protected_paths_json TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -119,6 +121,7 @@ CREATE TABLE IF NOT EXISTS run_claims (
     effective_tier TEXT NOT NULL,
     frozen_write_scope_json TEXT NOT NULL,
     frozen_merge_paths_json TEXT NOT NULL,
+    frozen_approved_protected_paths_json TEXT NOT NULL DEFAULT '[]',
     merge_method TEXT NOT NULL,
     unit_kind TEXT NOT NULL DEFAULT 'issue',
     run_dir TEXT NOT NULL DEFAULT '',
@@ -250,6 +253,9 @@ _COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("work_units", "last_confirmed_head_oid", "TEXT"),
     ("work_units", "veto_remote_sync_pending", "INTEGER NOT NULL DEFAULT 0"),
     ("work_units", "scope_quarantined", "INTEGER NOT NULL DEFAULT 0"),
+    ("work_units", "approved_protected_paths_json", "TEXT NOT NULL DEFAULT '[]'"),
+    ("work_units", "blocked_protected_paths_json", "TEXT"),
+    ("run_claims", "frozen_approved_protected_paths_json", "TEXT NOT NULL DEFAULT '[]'"),
     ("run_claims", "repo", "TEXT NOT NULL DEFAULT ''"),
     ("run_claims", "cleanup_unit_name", "TEXT"),
     ("run_claims", "cleanup_cgroup_dir", "TEXT"),
@@ -1056,10 +1062,11 @@ class AutopilotDB:
                     claim_epoch, unit_key, project_id, repo, slot_vector_json, worker_unit_name,
                     expected_cgroup_dir, base_sha, authorized_base_ref, authorized_head_ref,
                     policy_version, effective_tier, frozen_write_scope_json, frozen_merge_paths_json,
+                    frozen_approved_protected_paths_json,
                     merge_method, unit_kind, run_dir, run_dir_dev, run_dir_ino, run_dir_state, cred_ledger_tracked, worktree_path, managed_gitdir,
                     frozen_cache_dir, frozen_cache_dev, frozen_cache_ino, path_recorded,
                     bound_gh_login, ephemeral_token_file, state, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, ?, ?, ?, ?, ?, 1, ?, ?, 'active', ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, ?, ?, ?, ?, ?, 1, ?, ?, 'active', ?)
                 """,
                 (
                     claim_epoch,
@@ -1076,6 +1083,7 @@ class AutopilotDB:
                     cfg.trust_tier,
                     json.dumps(list(cfg.write_scope)),
                     json.dumps(list(cfg.merge_paths)),
+                    str(urow["approved_protected_paths_json"] or "[]"),
                     cfg.merge_method,
                     cfg.kind,
                     run_dir,
@@ -1780,6 +1788,119 @@ class AutopilotDB:
             )
             return scope.scope_units
 
+    def approve_unit_protected_paths(
+        self,
+        unit_key: str,
+        patterns: list[str] | tuple[str, ...],
+    ) -> dict[str, Any]:
+        """Grant operator-approved schema/migration path globs to one unit and resume only matching protected-path pauses."""
+        import ast
+        from .git_gate import is_path_covered_by_approved_protected, validate_approvable_protected_glob
+
+        if not patterns:
+            raise AutopilotError("approve-paths requires at least one --allow glob")
+        validated = [validate_approvable_protected_glob(p) for p in patterns]
+        with self.immediate_tx():
+            ok_int, _, int_reason = self._inspect_scope_integrity_in_tx(unit_key)
+            if not ok_int:
+                raise ScopeConflictError(int_reason)
+            scope = self.resolve_unit_scope_and_pending(unit_key, pr_id=None, statuses=PENDING_OP_STATUSES)
+            if scope.any_veto != 0:
+                raise AutopilotError(f"Cannot approve-paths on {unit_key}: veto_pending=1 in scope {scope.scope_units}")
+            if scope.pending_cnt != 0:
+                raise AutopilotError(
+                    f"Cannot approve-paths on {unit_key}: {scope.pending_cnt} pending external_ops in scope {scope.scope_units}"
+                )
+            urow = self._conn.execute(
+                "SELECT * FROM work_units WHERE unit_key = ?",
+                (unit_key,),
+            ).fetchone()
+            if not urow:
+                raise AutopilotError(f"Unknown unit_key: {unit_key}")
+            if int(urow["scope_quarantined"]) != 0:
+                raise ScopeConflictError(f"Cannot approve-paths on quarantined unit {unit_key}")
+            if urow["terminal_state"] == "done":
+                raise AutopilotError(f"Cannot approve-paths on completed unit {unit_key}")
+            u_marks = ",".join("?" for _ in scope.scope_units)
+            busy_claim = self._conn.execute(
+                f"SELECT unit_key, claim_epoch, state FROM run_claims WHERE unit_key IN ({u_marks}) AND state IN ('active', 'reclaiming') LIMIT 1",
+                scope.scope_units,
+            ).fetchone()
+            if busy_claim:
+                raise AutopilotError(
+                    f"Cannot approve-paths on {unit_key} while {busy_claim['unit_key']} claim_epoch={busy_claim['claim_epoch']} is {busy_claim['state']}"
+                )
+
+            existing = json.loads(str(urow["approved_protected_paths_json"] or "[]"))
+            merged: list[str] = []
+            for p in [*existing, *validated]:
+                if p not in merged:
+                    merged.append(p)
+
+            raw_blocked = urow["blocked_protected_paths_json"]
+            blocked_paths: list[str] = []
+            if raw_blocked is not None:
+                blocked_paths = [str(x) for x in json.loads(str(raw_blocked or "[]")) if str(x)]
+            else:
+                # Backward-compatible parse ONLY for pre-upgrade rows (blocked_protected_paths_json IS NULL).
+                # Legacy errors truncated at 5 entries (`[:5]`), so fail closed if len(parsed) >= 5.
+                prefix = "Change needs protected paths (human approval): "
+                err_txt = str(urow["last_error"] or "")
+                if err_txt.startswith(prefix):
+                    with contextlib.suppress(SyntaxError, ValueError):
+                        parsed = ast.literal_eval(err_txt[len(prefix):].strip())
+                        if isinstance(parsed, list) and 0 < len(parsed) < 5:
+                            suffix = " (matches global_hard_stop_anchored)"
+                            for item in parsed:
+                                s = str(item)
+                                if s.endswith(suffix):
+                                    blocked_paths.append(s[: -len(suffix)])
+                                else:
+                                    blocked_paths = []
+                                    break
+
+            resumed = (
+                urow["status"] == "paused"
+                and urow["terminal_state"] == "needs-human"
+                and urow["pause_reason_kind"] == "non_veto_escalation"
+                and bool(blocked_paths)
+                and all(is_path_covered_by_approved_protected(bp, merged) for bp in blocked_paths)
+            )
+            ts = now_iso()
+            if resumed:
+                self._conn.execute(
+                    """
+                    UPDATE work_units
+                    SET approved_protected_paths_json = ?,
+                        blocked_protected_paths_json = '[]',
+                        status = 'queued',
+                        terminal_state = NULL,
+                        pause_reason_kind = NULL,
+                        waiting_until = NULL,
+                        failure_streak = 0,
+                        review_rounds_used = 0,
+                        last_error = NULL,
+                        updated_at = ?
+                    WHERE unit_key = ?
+                    """,
+                    (json.dumps(merged), ts, unit_key),
+                )
+            else:
+                self._conn.execute(
+                    """
+                    UPDATE work_units
+                    SET approved_protected_paths_json = ?,
+                        updated_at = ?
+                    WHERE unit_key = ?
+                    """,
+                    (json.dumps(merged), ts, unit_key),
+                )
+            return {
+                "unit_key": unit_key,
+                "approved_protected_paths": merged,
+                "resumed": resumed,
+            }
+
     def operator_resolve_op(
         self,
         op_id: str,
@@ -1975,7 +2096,14 @@ class AutopilotDB:
             res["_updated"] = cur.rowcount == 1
             return res
 
-    def mark_unit_needs_human(self, unit_key: str, reason: str, *, non_veto: bool = True) -> None:
+    def mark_unit_needs_human(
+        self,
+        unit_key: str,
+        reason: str,
+        *,
+        non_veto: bool = True,
+        blocked_protected_paths: list[str] | tuple[str, ...] = (),
+    ) -> None:
         with self.immediate_tx():
             kind = "non_veto_escalation" if non_veto else "veto"
             self._conn.execute(
@@ -1985,10 +2113,11 @@ class AutopilotDB:
                     terminal_state = 'needs-human',
                     pause_reason_kind = ?,
                     last_error = ?,
+                    blocked_protected_paths_json = ?,
                     updated_at = ?
                 WHERE unit_key = ?
                 """,
-                (kind, reason, now_iso(), unit_key),
+                (kind, reason, json.dumps(list(blocked_protected_paths)), now_iso(), unit_key),
             )
 
     def mark_unit_waiting_quota(

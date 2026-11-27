@@ -2726,6 +2726,18 @@ def cmd_approve_promotion(args: argparse.Namespace) -> int:
             db.close()
 
 
+def cmd_approve_paths(args: argparse.Namespace) -> int:
+    sroot = default_state_root()
+    with acquire_dispatcher_lock(sroot):
+        db = AutopilotDB(sroot / "autopilot.db")
+        try:
+            res = db.approve_unit_protected_paths(args.unit_key, list(args.allow or []))
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+            return 0
+        finally:
+            db.close()
+
+
 def cmd_import_legacy(args: argparse.Namespace) -> int:
     sroot = default_state_root()
     db = AutopilotDB(sroot / "autopilot.db")
@@ -2805,6 +2817,13 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--force", action="store_true", help="Operator override without waiting for 48h-matured clean run count.")
     ap.add_argument("--target", type=int, default=None, help="Explicit target concurrency step (requires --force).")
 
+    app = sub.add_parser(
+        "approve-paths",
+        help="Approve narrow schema/migration protected path globs for one unit and resume non-veto needs-human pause.",
+    )
+    app.add_argument("unit_key")
+    app.add_argument("--allow", action="append", required=True, help="Protected schema/migration path glob to approve (repeatable).")
+
     il = sub.add_parser("import-legacy", help="Backup and import legacy autopilot terminal issues.")
     il.add_argument("--legacy-dir", default="~/.local/state/legacy-autopilot")
     il.add_argument("--backup-dir", default="~/.local/state/agent-autopilot/backups/legacy-autopilot")
@@ -2849,6 +2868,7 @@ def main(argv: list[str] | None = None) -> int:
         "clear-veto": cmd_clear_veto,
         "resolve-op": cmd_resolve_op,
         "approve-promotion": cmd_approve_promotion,
+        "approve-paths": cmd_approve_paths,
         "import-legacy": cmd_import_legacy,
         "worker-exec": cmd_worker_exec,
         "delegated-exec": cmd_delegated_exec,

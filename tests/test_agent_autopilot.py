@@ -6064,5 +6064,264 @@ class TestHostComputeGuards(unittest.TestCase):
         self.assertIn("templates/app-autopilot.slice", (REPO_ROOT / "install.sh").read_text(encoding="utf-8"))
 
 
+class TestProtectedPathApproval(unittest.TestCase):
+    def setUp(self) -> None:
+        self._td = tempfile.TemporaryDirectory()
+        self.base = Path(self._td.name)
+
+    def tearDown(self) -> None:
+        self._td.cleanup()
+
+    def test_validate_and_scope_only_allow_narrow_migration_patterns(self) -> None:
+        from ap_core.git_gate import check_autopilot_scope, validate_approvable_protected_glob
+
+        # Default hard-stop still blocks migrations when not explicitly approved.
+        with self.assertRaises(ScopeViolationError):
+            check_autopilot_scope(
+                ["apps/api/prisma/migrations/20261126_init/migration.sql"],
+                ["apps/api/prisma/**"],
+            )
+
+        # Valid narrow schema/migration globs are accepted.
+        self.assertEqual(
+            validate_approvable_protected_glob("apps/api/prisma/migrations/**"),
+            "apps/api/prisma/migrations/**",
+        )
+        self.assertEqual(validate_approvable_protected_glob("prisma/**"), "prisma/**")
+
+        # Broad wildcards, non-approvable hard stops, traversal, char-classes, tag chars, and secret basenames are rejected.
+        for bad in (
+            "",
+            "**",
+            "*",
+            ".github/**",
+            "secrets/**",
+            "apps/api/prisma/migrations/.env",
+            "apps/api/prisma/migrations/WORKFLOW.md",
+            "apps/api/prisma/migrations/secrets/**",
+            "../migrations/**",
+            "apps/api/prisma/migrations/package-lock.json",
+            "apps/api/prisma/migrations/[!a]**",
+            "apps/api/prisma/migrations/[z-a]/**",
+            "apps/api/prisma/migrations/?/*.sql",
+            "apps/api/prisma/migrations/**a",
+            "apps/api/prisma/migrations/<tag>/**",
+        ):
+            with self.assertRaises(ScopeViolationError, msg=f"expected rejection for {bad!r}"):
+                validate_approvable_protected_glob(bad)
+
+        # Empty approvable_hard_stop_anchored fails closed.
+        import ap_core.git_gate as gg
+        with unittest.mock.patch.dict(gg.POLICY_MANIFEST, {"approvable_hard_stop_anchored": []}):
+            with self.assertRaises(ScopeViolationError):
+                validate_approvable_protected_glob("apps/api/prisma/migrations/**")
+            self.assertFalse(gg.is_path_covered_by_approved_protected("apps/api/prisma/migrations/1/migration.sql", []))
+
+        # With explicit approval, migration SQL inside frozen_write_scope passes.
+        check_autopilot_scope(
+            ["apps/api/prisma/migrations/20261126_init/migration.sql"],
+            ["apps/api/prisma/**"],
+            approved_protected_paths=["apps/api/prisma/migrations/**"],
+        )
+
+        # Even with approval, secrets, control files, lockfiles, and out-of-scope paths stay blocked.
+        for blocked in (
+            "apps/api/prisma/migrations/.env",
+            "apps/api/prisma/migrations/secret.pem",
+            "apps/api/prisma/migrations/WORKFLOW.md",
+            "apps/api/prisma/migrations/package-lock.json",
+            ".github/workflows/ci.yml",
+            "apps/other/prisma/migrations/20261126_init/migration.sql",
+        ):
+            with self.assertRaises(ScopeViolationError, msg=f"expected scope block for {blocked!r}"):
+                check_autopilot_scope(
+                    [blocked],
+                    ["apps/api/prisma/**", ".github/**"],
+                    approved_protected_paths=["apps/api/prisma/migrations/**"],
+                )
+
+    def test_db_approve_unit_protected_paths_resumes_and_freezes_on_claim(self) -> None:
+        db = AutopilotDB(self.base / "ap.db")
+        try:
+            cfg = WorkflowConfig(
+                project_id="proj-mig",
+                kind="issue",
+                enabled=True,
+                repos=("o/r",),
+                workspace_path=str(self.base / "ws"),
+                authorized_base_ref="main",
+                branch_prefix="agent/",
+                trust_tier="T1",
+                max_in_progress=1,
+                max_per_day=10,
+                write_scope=("apps/api/prisma/**", "apps/api/src/**"),
+                merge_paths=(),
+                merge_method="SQUASH",
+                verify_cmd="true",
+                enable_ui_verify=False,
+                ui_verify_url="",
+                writer_family="codex",
+                schedule_interval_sec=180,
+                routine_driver="",
+                delegated_cmd="",
+                token_file="",
+                merge_token_file="",
+            )
+            db.upsert_project(cfg)
+            db.ensure_lease_slots(cfg.project_id, ["proj-mig:slot-1"], self.base / "locks")
+            unit_key = "o/r#64"
+            db.ensure_work_unit(unit_key=unit_key, project_id="proj-mig", repo="o/r", issue_number=64)
+            db.mark_unit_needs_human(
+                unit_key,
+                "Change needs protected paths (human approval): ['apps/api/prisma/migrations/1/migration.sql (matches global_hard_stop_anchored)']",
+                non_veto=True,
+                blocked_protected_paths=["apps/api/prisma/migrations/1/migration.sql"],
+            )
+
+            res = db.approve_unit_protected_paths(unit_key, ["apps/api/prisma/migrations/**"])
+            self.assertTrue(res["resumed"])
+            self.assertEqual(res["approved_protected_paths"], ["apps/api/prisma/migrations/**"])
+
+            urow = db.get_unit(unit_key)
+            self.assertEqual(urow["status"], "queued")
+            self.assertIsNone(urow["terminal_state"])
+            self.assertIsNone(urow["pause_reason_kind"])
+            self.assertEqual(json.loads(urow["approved_protected_paths_json"]), ["apps/api/prisma/migrations/**"])
+
+            epoch = db.claim_and_reserve(
+                cfg=cfg,
+                unit_key=unit_key,
+                slot_keys=["proj-mig:slot-1"],
+                worker_unit_name="ap-w1",
+                expected_cgroup_dir="/sys/fs/cgroup/ap-w1",
+                base_sha="a" * 40,
+                authorized_head_ref="agent/issue-64",
+                run_dir=str(self.base / "run"),
+            )
+            claim = db.get_claim(epoch)
+            self.assertEqual(
+                json.loads(claim["frozen_approved_protected_paths_json"]),
+                ["apps/api/prisma/migrations/**"],
+            )
+
+            # Refuses approval while claim is active or reclaiming.
+            with self.assertRaises(AutopilotError):
+                db.approve_unit_protected_paths(unit_key, ["prisma/**"])
+            db.begin_reclaim_claim(epoch)
+            with self.assertRaises(AutopilotError):
+                db.approve_unit_protected_paths(unit_key, ["prisma/**"])
+
+            # Unrelated needs-human pause (e.g. review rounds exhausted / lockfile) MUST NOT resume.
+            u2 = "o/r#72"
+            db.ensure_work_unit(unit_key=u2, project_id="proj-mig", repo="o/r", issue_number=72)
+            db._conn.execute("UPDATE work_units SET review_rounds_used = 3 WHERE unit_key = ?", (u2,))
+            db.mark_unit_needs_human(u2, "Exhausted max_review_rounds=3", non_veto=True)
+            res2 = db.approve_unit_protected_paths(u2, ["apps/api/prisma/migrations/**"])
+            self.assertFalse(res2["resumed"])
+            row2 = db.get_unit(u2)
+            self.assertEqual(row2["status"], "paused")
+            self.assertEqual(row2["terminal_state"], "needs-human")
+            self.assertEqual(row2["review_rounds_used"], 3)
+
+            # Partial approval (1 of 2 blocked paths covered) MUST NOT resume until all blocked paths are covered.
+            u3 = "o/r#65"
+            db.ensure_work_unit(unit_key=u3, project_id="proj-mig", repo="o/r", issue_number=65)
+            db.mark_unit_needs_human(
+                u3,
+                "Change needs protected paths (human approval): ['apps/api/prisma/migrations/1/migration.sql (matches global_hard_stop_anchored)', 'prisma/migrations/2/migration.sql (matches global_hard_stop_anchored)']",
+                non_veto=True,
+                blocked_protected_paths=[
+                    "apps/api/prisma/migrations/1/migration.sql",
+                    "prisma/migrations/2/migration.sql",
+                ],
+            )
+            res3_partial = db.approve_unit_protected_paths(u3, ["apps/api/prisma/migrations/**"])
+            self.assertFalse(res3_partial["resumed"])
+            self.assertEqual(db.get_unit(u3)["status"], "paused")
+            res3_full = db.approve_unit_protected_paths(u3, ["prisma/migrations/**"])
+            self.assertTrue(res3_full["resumed"])
+            self.assertEqual(db.get_unit(u3)["status"], "queued")
+            self.assertEqual(json.loads(db.get_unit(u3)["blocked_protected_paths_json"]), [])
+
+            # Modern empty blocked_protected_paths_json ('[]') MUST NOT fall back to last_error parsing.
+            u3b = "o/r#650"
+            db.ensure_work_unit(unit_key=u3b, project_id="proj-mig", repo="o/r", issue_number=650)
+            db.mark_unit_needs_human(
+                u3b,
+                "Change needs protected paths (human approval): ['apps/api/prisma/migrations/1/migration.sql (matches global_hard_stop_anchored)']",
+                non_veto=True,
+                blocked_protected_paths=[],
+            )
+            self.assertFalse(db.approve_unit_protected_paths(u3b, ["apps/api/prisma/migrations/**"])["resumed"])
+
+            # Legacy truncated 5-entry last_error (blocked_protected_paths_json IS NULL) MUST fail closed.
+            u3c = "o/r#651"
+            db.ensure_work_unit(unit_key=u3c, project_id="proj-mig", repo="o/r", issue_number=651)
+            five_hits = [f"apps/api/prisma/migrations/{i}/migration.sql (matches global_hard_stop_anchored)" for i in range(5)]
+            db._conn.execute(
+                "UPDATE work_units SET status='paused', terminal_state='needs-human', pause_reason_kind='non_veto_escalation', last_error=?, blocked_protected_paths_json=NULL WHERE unit_key=?",
+                (f"Change needs protected paths (human approval): {five_hits}", u3c),
+            )
+            self.assertFalse(db.approve_unit_protected_paths(u3c, ["apps/api/prisma/migrations/**"])["resumed"])
+
+            # Quarantined unit, sibling veto, and sibling pending external_op MUST all be rejected.
+            u4 = "o/r#66"
+            db.ensure_work_unit(unit_key=u4, project_id="proj-mig", repo="o/r", issue_number=66)
+            db._conn.execute("UPDATE work_units SET scope_quarantined = 1 WHERE unit_key = ?", (u4,))
+            with self.assertRaises(AutopilotError):
+                db.approve_unit_protected_paths(u4, ["apps/api/prisma/migrations/**"])
+
+            u5a, u5b = "o/r#67", "o/r#68"
+            db.ensure_work_unit(unit_key=u5a, project_id="proj-mig", repo="o/r", issue_number=67)
+            db.ensure_work_unit(unit_key=u5b, project_id="proj-mig", repo="o/r", issue_number=68)
+            db._conn.execute("UPDATE work_units SET pr_id='PR_SHARED_1' WHERE unit_key IN (?, ?)", (u5a, u5b))
+            db._conn.execute("UPDATE work_units SET veto_pending=1 WHERE unit_key=?", (u5b,))
+            with self.assertRaises(AutopilotError):
+                db.approve_unit_protected_paths(u5a, ["apps/api/prisma/migrations/**"])
+            db._conn.execute("UPDATE work_units SET veto_pending=0 WHERE unit_key=?", (u5b,))
+            db._conn.execute(
+                "INSERT INTO external_ops(op_id, op_seq, unit_key, project_id, pr_id, op_type, owner_kind, owner_epoch, status, prepared_at, updated_at) "
+                "VALUES ('op-sib-1', 1, ?, 'proj-mig', 'PR_SHARED_1', 'push_branch', 'worker', 1, 'prepared_local', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+                (u5b,),
+            )
+            with self.assertRaises(AutopilotError):
+                db.approve_unit_protected_paths(u5a, ["apps/api/prisma/migrations/**"])
+        finally:
+            db.close()
+
+    def test_legacy_db_migrates_new_approval_columns(self) -> None:
+        import sqlite3
+
+        db_path = self.base / "legacy.db"
+        db0 = AutopilotDB(db_path)
+        db0.ensure_work_unit(unit_key="o/r#64", project_id="proj-mig", repo="o/r", issue_number=64)
+        db0.mark_unit_needs_human(
+            "o/r#64",
+            "Change needs protected paths (human approval): ['apps/api/prisma/migrations/20261126_init/migration.sql (matches global_hard_stop_anchored)']",
+            non_veto=True,
+        )
+        db0.close()
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("ALTER TABLE work_units DROP COLUMN approved_protected_paths_json")
+        conn.execute("ALTER TABLE work_units DROP COLUMN blocked_protected_paths_json")
+        conn.execute("ALTER TABLE run_claims DROP COLUMN frozen_approved_protected_paths_json")
+        conn.commit()
+        conn.close()
+
+        db1 = AutopilotDB(db_path)
+        try:
+            wu_cols = {r["name"] for r in db1._conn.execute("PRAGMA table_info(work_units)").fetchall()}
+            rc_cols = {r["name"] for r in db1._conn.execute("PRAGMA table_info(run_claims)").fetchall()}
+            self.assertIn("approved_protected_paths_json", wu_cols)
+            self.assertIn("blocked_protected_paths_json", wu_cols)
+            self.assertIn("frozen_approved_protected_paths_json", rc_cols)
+            # Pre-upgrade row (blocked_protected_paths_json IS NULL, <5 hits) cleanly resumes when covered.
+            res = db1.approve_unit_protected_paths("o/r#64", ["apps/api/prisma/migrations/**"])
+            self.assertTrue(res["resumed"])
+            self.assertEqual(db1.get_unit("o/r#64")["status"], "queued")
+        finally:
+            db1.close()
+
+
 if __name__ == "__main__":
     unittest.main()

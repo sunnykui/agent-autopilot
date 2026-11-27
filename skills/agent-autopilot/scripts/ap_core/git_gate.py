@@ -401,7 +401,90 @@ def validate_raw_git_path(raw_path: str, *, old_mode: str = "000000", new_mode: 
             )
 
 
-def check_autopilot_scope(raw_paths: list[str], frozen_write_scope: list[str] | tuple[str, ...]) -> None:
+_APPROVED_GLOB_RE = re.compile(r"^[A-Za-z0-9._/*-]+$")
+
+
+def validate_approvable_protected_glob(pattern: str) -> str:
+    """Validate an operator-approved protected path glob against the narrow approvable subset."""
+    pat = str(pattern or "").strip()
+    if not pat:
+        raise ScopeViolationError("Empty approved protected path pattern", violations=["<empty>"])
+    if not _APPROVED_GLOB_RE.fullmatch(pat):
+        raise ScopeViolationError(
+            f"Disallowed characters in approved protected path pattern (only [A-Za-z0-9._/*-] allowed): {pat!r}",
+            violations=[pat],
+        )
+    if pat.startswith("/") or pat.endswith("/"):
+        raise ScopeViolationError(f"Leading/trailing slash forbidden in pattern: {pat!r}", violations=[pat])
+    segs = pat.split("/")
+    for seg in segs:
+        if seg in ("", ".", ".."):
+            raise ScopeViolationError(f"Invalid path segment in pattern: {pat!r}", violations=[pat])
+        if "**" in seg and seg != "**":
+            raise ScopeViolationError(f"Double-star must occupy an entire segment: {pat!r}", violations=[pat])
+
+    approvable = list(POLICY_MANIFEST.get("approvable_hard_stop_anchored", ()))
+    if not approvable:
+        raise ScopeViolationError(
+            "No approvable_hard_stop_anchored patterns configured; failing closed",
+            violations=[f"{pat} (no approvable_hard_stop_anchored)"],
+        )
+
+    probe = "/".join("x" if s in ("*", "**") else s.replace("*", "x") for s in segs)
+    try:
+        ok_self, _ = _cd.check_scope([probe], [pat], [])
+    except re.error as exc:
+        raise ScopeViolationError(f"Uncompilable approved glob {pat!r}: {exc}", violations=[pat]) from exc
+    if not ok_self:
+        raise ScopeViolationError(f"Approved glob did not match its own probe path: {pat!r}", violations=[pat])
+
+    approvable_set = set(approvable)
+    anchored_forbid = list(POLICY_MANIFEST["global_hard_stop_anchored"])
+    non_approvable = [p for p in anchored_forbid if p not in approvable_set]
+    basenames_forbid_lower = [f"**/{b.lower()}" for b in POLICY_MANIFEST["global_hard_stop_basenames"]]
+    lockfile_patterns = list(POLICY_MANIFEST["dependency_lock_paths"])
+
+    ok_approvable, _ = _cd.check_scope([probe], approvable, [])
+    ok_non_approvable, _ = _cd.check_scope([probe], [], non_approvable)
+    ok_base, _ = _cd.check_scope([probe.lower()], [], basenames_forbid_lower)
+    ok_lock, _ = _cd.check_scope([probe], [], lockfile_patterns)
+    if not (ok_approvable and ok_non_approvable and ok_base and ok_lock):
+        raise ScopeViolationError(
+            f"Protected path pattern {pat!r} is not eligible for operator approval (only schema/migration patterns allowed)",
+            violations=[f"{pat} (not in approvable_hard_stop_anchored)"],
+        )
+    return pat
+
+
+def is_path_covered_by_approved_protected(
+    raw_path: str,
+    approved_protected_paths: list[str] | tuple[str, ...],
+) -> bool:
+    """Return True iff concrete raw_path is eligible for AND covered by operator-approved protected globs."""
+    validate_raw_git_path(raw_path)
+    approvable = list(POLICY_MANIFEST.get("approvable_hard_stop_anchored", ()))
+    if not approvable or not approved_protected_paths:
+        return False
+    approved_list = [validate_approvable_protected_glob(p) for p in approved_protected_paths]
+    anchored_forbid = list(POLICY_MANIFEST["global_hard_stop_anchored"])
+    approvable_set = set(approvable)
+    non_approvable_forbid = [p for p in anchored_forbid if p not in approvable_set]
+    basenames_forbid_lower = [f"**/{b.lower()}" for b in POLICY_MANIFEST["global_hard_stop_basenames"]]
+    lockfile_patterns = list(POLICY_MANIFEST["dependency_lock_paths"])
+
+    ok_approvable, _ = _cd.check_scope([raw_path], approvable, [])
+    ok_approved, _ = _cd.check_scope([raw_path], approved_list, [])
+    ok_non_approvable, _ = _cd.check_scope([raw_path], [], non_approvable_forbid)
+    ok_base, _ = _cd.check_scope([raw_path.lower()], [], basenames_forbid_lower)
+    ok_lock, _ = _cd.check_scope([raw_path], [], lockfile_patterns)
+    return bool(ok_approvable and ok_approved and ok_non_approvable and ok_base and ok_lock)
+
+
+def check_autopilot_scope(
+    raw_paths: list[str],
+    frozen_write_scope: list[str] | tuple[str, ...],
+    approved_protected_paths: list[str] | tuple[str, ...] = (),
+) -> None:
     """Validate raw paths then apply two-step codex_dispatch.check_scope() + aggregated lockfile escalation."""
     if not frozen_write_scope:
         raise ScopeViolationError(
@@ -414,6 +497,7 @@ def check_autopilot_scope(raw_paths: list[str], frozen_write_scope: list[str] | 
     anchored_forbid = list(POLICY_MANIFEST["global_hard_stop_anchored"])
     basenames_forbid_lower = [f"**/{b.lower()}" for b in POLICY_MANIFEST["global_hard_stop_basenames"]]
     lockfile_patterns = list(POLICY_MANIFEST["dependency_lock_paths"])
+    approved_list = [validate_approvable_protected_glob(p) for p in approved_protected_paths]
 
     hard_violations: list[str] = []
     lock_hits: list[str] = []
@@ -424,8 +508,9 @@ def check_autopilot_scope(raw_paths: list[str], frozen_write_scope: list[str] | 
 
         ok_a, _ = _cd.check_scope([rp], [], anchored_forbid)
         if not ok_a:
-            hard_violations.append(f"{rp} (matches global_hard_stop_anchored)")
-            continue
+            if not (approved_list and is_path_covered_by_approved_protected(rp, approved_list)):
+                hard_violations.append(f"{rp} (matches global_hard_stop_anchored)")
+                continue
         ok_b, _ = _cd.check_scope([rp.lower()], [], basenames_forbid_lower)
         if not ok_b:
             hard_violations.append(f"{rp} (matches case-insensitive global_hard_stop_basenames)")
@@ -1408,6 +1493,7 @@ def sample_and_gate_worktree(
     run_dir: Path,
     base_sha: str,
     frozen_write_scope: list[str] | tuple[str, ...],
+    approved_protected_paths: list[str] | tuple[str, ...] = (),
     dod_check: str = "",
     issue_summary: str = "",
     commit_message: str = "autopilot candidate",
@@ -1520,7 +1606,7 @@ def sample_and_gate_worktree(
             base_oid = old_oid if (status == "M" and old_mode in ("100644", "100755")) else ""
             _scan_blob_for_secrets(sample_env, new_oid, raw_path, base_blob_oid=base_oid)
 
-    check_autopilot_scope(raw_paths, frozen_write_scope)
+    check_autopilot_scope(raw_paths, frozen_write_scope, approved_protected_paths=approved_protected_paths)
 
     _promote_scratch_objects(scratch_objects, mg_real / "objects")
     mg_env = _safe_git_env(git_dir=mg_real, alt_object_dirs=alt_dirs[1:])

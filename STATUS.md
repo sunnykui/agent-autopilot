@@ -23,6 +23,8 @@
    - 可调项（可选）：`~/.config/agent-autopilot/global.json` 的 `max_global_in_progress` / `host_max_steal_pct` / `host_max_load1` / `host_sample_sec`，或同名 `AGENT_AUTOPILOT_*` 环境变量。
    - `templates/app-autopilot.slice`（`CPUWeight=10`、`CPUQuota=110%`、`IOWeight=20`、`MemoryHigh=6G`、`MemoryMax=8G`）由 `install.sh --install-systemd-units` 安装；不安装时 `systemd-run --slice` 会生成无配额的空 slice。瞬态单元追加 `Nice=15`；tool/verify 沙箱默认注入 `GOMAXPROCS=2`、`RAYON_NUM_THREADS=2`、`UV_THREADPOOL_SIZE=2`、`PLAYWRIGHT_WORKERS=1`（WORKFLOW `verify_env` 显式值优先）。
    - 已知旧失败：`test_round22_all_codex_closures`（tool_ring 内 `.git` 只读断言）在本分支基点 `32cb6e1` 上同样失败，与本改动无关。
+4. **单任务受保护迁移路径人工批准（2026-11-26）**：
+   - 新增 `agent-autopilot approve-paths <unit_key> --allow <glob>`：仅允许对 `policy_manifest.json` 的 `approvable_hard_stop_anchored` 子集（`prisma/**`、`migrations/**`、`**/migrations/**`）按单任务授权并自动恢复非否决 `needs-human` 暂停；认领时冻结到 `run_claims.frozen_approved_protected_paths_json`，密钥、控制文件、CI 与锁文件仍无条件阻断。
 
 ---
 

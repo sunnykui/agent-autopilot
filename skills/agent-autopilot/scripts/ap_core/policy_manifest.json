@@ -251,6 +251,11 @@
     "secrets/**",
     "**/secrets/**"
   ],
+  "approvable_hard_stop_anchored": [
+    "prisma/**",
+    "migrations/**",
+    "**/migrations/**"
+  ],
   "global_hard_stop_basenames": [
     ".env",
     ".env.*",
