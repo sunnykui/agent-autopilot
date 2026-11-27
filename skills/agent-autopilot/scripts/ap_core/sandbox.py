@@ -876,12 +876,25 @@ def build_model_ring_bwrap(
         argv.extend(["--ro-bind", str(src_bin), container_dst])
         if container_dst != "/usr/local/bin/ap-sandbox-init":
             mounted_exec_targets.append(container_dst)
+    if role_key.startswith("codex:") and "codex_code_mode_host" in host_binaries:
+        cmh_dst = "/usr/local/bin/codex-code-mode-host"
+        argv.extend(["--ro-bind", str(host_binaries["codex_code_mode_host"]), cmh_dst])
+        if cmh_dst not in mounted_exec_targets:
+            mounted_exec_targets.append(cmh_dst)
 
     if spec.get("dynamic_elf_libs"):
         main_slot = "claude_cli" if role_key.startswith("claude:") else "codex_cli"
         st_dir = elf_lib_stage_dir or (sandbox_home.parent / "elf_libs_stage")
+        st_prefix = str(st_dir).rstrip("/") + "/"
         for host_lib, target_lib in resolve_elf_runtime_mounts(host_binaries[main_slot], st_dir):
-            argv.extend(["--ro-bind", host_lib, target_lib])
+            if retain_fds is not None and host_lib.startswith(st_prefix):
+                # bwrap resolves path sources after entering its user namespace, where the caller's /proc/<pid>/fd
+                # magic links (pinned run dirs) are not traversable: hand it an already-open, inode-pinned fd instead.
+                lib_fd = os.open(host_lib, os.O_RDONLY | os.O_NOFOLLOW)
+                retain_fds.append(lib_fd)
+                argv.extend(["--ro-bind-fd", str(lib_fd), target_lib])
+            else:
+                argv.extend(["--ro-bind", host_lib, target_lib])
             if "ld-linux" in target_lib and target_lib not in mounted_exec_targets:
                 mounted_exec_targets.append(target_lib)
 
@@ -1319,6 +1332,16 @@ def prepare_ro_workspace_dep_bind_args(
             retain_fds.append(src_fd)
             transferred = True
             bind_args.extend(["--ro-bind-fd", str(src_fd), str(eff_container_root / rel)])
+            if leaf == "node_modules":
+                for scratch_sub in (".vite-temp", ".vite", ".cache"):
+                    with contextlib.suppress(FileExistsError, PermissionError, OSError):
+                        os.mkdir(scratch_sub, 0o755, dir_fd=src_fd)
+                    try:
+                        sub_fd = os.open(scratch_sub, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=src_fd)
+                    except FileNotFoundError:
+                        continue
+                    os.close(sub_fd)
+                    bind_args.extend(["--tmpfs", str(eff_container_root / rel / scratch_sub)])
         finally:
             if pkg_fd is not None:
                 with contextlib.suppress(OSError):

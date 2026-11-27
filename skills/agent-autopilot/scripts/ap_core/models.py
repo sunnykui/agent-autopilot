@@ -52,6 +52,10 @@ class ScopeViolationError(AutopilotError):
         self.is_lockfile = is_lockfile
 
 
+class EmptyCandidateError(AutopilotError):
+    """Raised when the writer's worktree has no changes against the authorized base."""
+
+
 class QuotaExhaustedError(AutopilotError):
     """Raised when an LLM CLI reports a subscription window limit with a parseable reset timestamp."""
 
