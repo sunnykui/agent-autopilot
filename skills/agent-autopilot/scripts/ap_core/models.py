@@ -103,7 +103,7 @@ def build_pnpm_exec_cmd(pnpm_bin: str | Path) -> list[str]:
 def load_policy_manifest(path: Path | None = None) -> dict[str, Any]:
     target = path or POLICY_MANIFEST_PATH
     data = json.loads(target.read_text(encoding="utf-8"))
-    if data.get("schema_version") != 17:
+    if data.get("schema_version") != 18:
         raise AutopilotError(f"Unexpected policy_manifest schema_version: {data.get('schema_version')}")
     if not data.get("one_mutation_per_op_id"):
         raise AutopilotError("policy_manifest must enforce one_mutation_per_op_id=true")

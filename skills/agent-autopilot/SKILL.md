@@ -42,8 +42,11 @@ agent-autopilot probe
 # 4. Run a single deterministic cycle manually before enabling timer
 agent-autopilot run-once --project my-app
 
-# 5. Inspect live systemd/cgroup & SQLite status, consolidate pitfalls, or veto/unveto
+# 5. Inspect live systemd/cgroup & SQLite status (incl. active evolution experiments), run audit/dream, or apply/dismiss experiments
 agent-autopilot top
+agent-autopilot audit --readonly
+agent-autopilot evolution list
+agent-autopilot evolution apply <exp_id>
 agent-autopilot dream
 agent-autopilot veto org/my-app#42 --reason "hold for schema review"
 agent-autopilot clear-veto org/my-app#42
@@ -65,3 +68,4 @@ These rules apply to every onboarded repository regardless of stack:
 4. **Probe Unverified Platform or External Behavior First**: Before implementing against OS internals, UI/accessibility events, or external services, run a fast read-only diagnostic probe to confirm the expected events/paths actually occur.
 5. **Safe Process Waiting & Timeout-Gated Hang Recovery**: Wait on same-shell children with `wait "$pid"` (preserving exit status). For cross-shell tasks, prefer explicit PID/receipt checks; never use `pgrep -f <cmd>` self-matching loops, brittle line-start `^rc=`/`done=` polling, or bare `tail --pid` without `-f` (note: `tail --pid=<pid> -f /dev/null` requires GNU `tail`, is unsupported on macOS, does not propagate exit codes, and hangs on unreaped zombies — always pair with a timeout and inspect the task receipt separately). Do NOT kill a worker solely because it is idle in `ep_poll` after a `Stop` hook (hooks may trigger continued turns awaiting network I/O); terminate only after supervisor timeout confirmation and worker-identity verification, releasing the slot through normal cgroup exit/reclaim.
 6. **Diff-Aware Issue Closing & Transactional 5xx Reconciliation**: Inspect actual PR diff and scope before closing linked issues (keep parent/multi-phase issues open on partial Phase-1 PRs). On HTTP 5xx (e.g., GitHub `502 Bad Gateway`) during remote merge, reconcile by the original `op_id`: keep `OPEN` in `unknown_paused` rather than blindly resending, verify candidate SHA and target branch if `MERGED`, and re-issue only with confirmed unsent or deterministic rejection proof.
+7. **Closed-Loop Zero-Token Self-Evolution Experiments (`evolution_experiments`)**: `agent-autopilot audit` (and `autopilot-dream`, running outside `dispatcher.lock` with full fault isolation) evaluates ratio + own-7d-baseline metrics (`null_outcome_rate`, `<3m` `short_spin_rate`, `needs_human_or_failure_rate`, healthy-only `slot_underutilization`, `delegated_telemetry_missing`, `cost_or_turns_regression`, `high_review_rework`, `cross_family_gap`, and deep stale cache) without polluting code `pitfalls`. Active experiments surface directly in `agent-autopilot top` and can be executed via `agent-autopilot evolution apply <exp_id>` (or dismissed). After `review_after`, the next audit re-measures the metric against its baseline and either marks `verified_better` or automatically executes `rollback_payload` (`rolled_back`). Delegated runners report token/cost telemetry to `AUTOPILOT_TELEMETRY_OUT` so `delegated-exec` ingests them into `turn_usage_ledger`.

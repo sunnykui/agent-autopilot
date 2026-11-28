@@ -605,9 +605,20 @@ def probe_project_zero_token(cfg: WorkflowConfig, db: AutopilotDB) -> dict[str, 
 
             cnt = db._conn.execute("SELECT COUNT(*) AS c FROM pitfalls").fetchone()["c"]
             hist = count_matureable_runs(db)
+            cutoff_7d = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=7)).replace(microsecond=0).isoformat()
+            claims_7d = db._conn.execute(
+                "SELECT COUNT(*) AS c FROM run_claims WHERE created_at >= ?",
+                (cutoff_7d,),
+            ).fetchone()["c"]
+            due_exp = 0
+            if db._has_evolution_table():
+                due_exp = db._conn.execute(
+                    "SELECT COUNT(*) AS c FROM evolution_experiments WHERE state = 'applied' AND review_after IS NOT NULL AND review_after <= ?",
+                    (dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat(),),
+                ).fetchone()["c"]
             return {
-                "actionable": int(cnt) > 0 or int(hist) > 0,
-                "reason": f"pitfalls={cnt},unmatured_runs={hist}",
+                "actionable": int(cnt) > 0 or int(hist) > 0 or int(claims_7d) > 0 or int(due_exp) > 0,
+                "reason": f"pitfalls={cnt},unmatured_runs={hist},claims_7d={claims_7d},due_experiments={due_exp}",
             }
         if cfg.routine_driver in ("custom", ""):
             return probe_custom_routine_zero_token(cfg, db)

@@ -1,5 +1,5 @@
 {
-  "schema_version": 17,
+  "schema_version": 18,
   "require_systemd_linger": true,
   "merge_pr_requires_separate_merge_token": true,
   "basenames_case_insensitive": true,

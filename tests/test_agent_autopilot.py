@@ -101,7 +101,7 @@ def _init_git_repo(repo_dir: Path) -> str:
 class TestPolicyManifestAndGitGates(unittest.TestCase):
     def test_policy_manifest_samples_and_backslash_in_real_git_tree(self) -> None:
         m = POLICY_MANIFEST
-        self.assertEqual(m["schema_version"], 17)
+        self.assertEqual(m["schema_version"], 18)
         self.assertTrue(m["one_mutation_per_op_id"])
         self.assertEqual(len(m["global_hard_stop_anchored"]), 79)
         self.assertEqual(len(m["global_hard_stop_basenames"]), 36)
@@ -7926,6 +7926,485 @@ class TestThreeFamilyCrossReviewAndTelemetry(unittest.TestCase):
                     self.assertEqual(r_fl["slot_key"], "p-del-flock:slot-2")
                 finally:
                     fcntl.flock(held_f.fileno(), fcntl.LOCK_UN)
+        finally:
+            db.close()
+
+    def test_closed_loop_self_evolution_experiments_and_delegated_telemetry(self) -> None:
+        """Closed-loop evolution audit: healthy projects yield 0 findings, unhealthy projects never get promotion proposals, apply->verify/rollback works, delegated telemetry ingests, and dream is isolated outside dispatcher.lock."""
+        import argparse
+        import io
+        from unittest import mock
+
+        import agent_autopilot as ap_cli
+        from ap_core.dream import (
+            apply_evolution_experiment,
+            dismiss_evolution_experiment,
+            run_system_efficiency_audit,
+        )
+
+        sroot = self.base / "evo2_state"
+        croot = self.base / "evo2_cfg"
+        cache_r = self.base / "evo2_cache"
+        sroot.mkdir(parents=True, exist_ok=True)
+        (croot / "projects" / "p-spin").mkdir(parents=True, exist_ok=True)
+        (croot / "projects" / "p-single-ref").mkdir(parents=True, exist_ok=True)
+        db = AutopilotDB(sroot / "autopilot.db")
+        ref_now = dt.datetime(2026, 11, 28, 12, 0, 0, tzinfo=dt.timezone.utc)
+
+        def _insert_claim(
+            epoch: int,
+            pid: str,
+            ukind: str,
+            outcome: str | None,
+            created: dt.datetime,
+            dur_sec: int,
+            state: str = "released",
+            run_dir: str = "",
+        ) -> None:
+            rel = (created + dt.timedelta(seconds=dur_sec)).isoformat() if state == "released" else None
+            db._conn.execute(
+                """
+                INSERT INTO run_claims(
+                    claim_epoch, unit_key, project_id, repo, slot_vector_json, worker_unit_name,
+                    expected_cgroup_dir, base_sha, authorized_base_ref, authorized_head_ref,
+                    policy_version, effective_tier, frozen_write_scope_json, frozen_merge_paths_json,
+                    merge_method, unit_kind, run_dir, state, outcome, created_at, released_at
+                ) VALUES (?, ?, ?, 'o/r', '["s1"]', ?, '/tmp/cg', 'aaaaaaa', 'main', 'agent/x',
+                          'v1', 'T1', '["src/**"]', '[]', 'SQUASH', ?, ?, ?, ?, ?, ?)
+                """,
+                (epoch, f"{pid}#1", pid, f"u-{epoch}.service", ukind, run_dir, state, outcome, created.isoformat(), rel),
+            )
+
+        try:
+            # 1. Healthy high-throughput project (15 clean runs in 24h on cap=2, 50% 1-rework-then-approve, with telemetry) MUST yield ZERO findings!
+            wf_healthy = WorkflowConfig(
+                project_id="p-healthy",
+                kind="issue",
+                enabled=True,
+                repos=("o/h",),
+                workspace_path=str(self.base),
+                max_in_progress=2,
+                writer_family="codex",
+                referee_families=("claude", "agy"),
+            )
+            db.upsert_project(wf_healthy)
+            db.approve_concurrency_promotion("p-healthy", force=True, target_cap=2)
+            db.ensure_work_unit(unit_key="p-healthy#1", project_id="p-healthy", repo="o/h", issue_number=1)
+            with db.immediate_tx():
+                for i in range(1, 16):
+                    _insert_claim(100 + i, "p-healthy", "issue", "succeeded", ref_now - dt.timedelta(hours=10) + dt.timedelta(minutes=i * 20), 600)
+                # Normal 1-rework then approve (2 revise, 2 approved = 50% <= 60% threshold -> zero false positive!)
+                for r_i, st_v in enumerate(("revise", "approved", "revise", "approved"), start=1):
+                    db._conn.execute(
+                        """
+                        INSERT INTO review_attempts(attempt_id, unit_key, claim_epoch, candidate_sha, round_index, writer_family, required_referees_json, state, created_at)
+                        VALUES (?, 'p-healthy#1', 101, 'bbbbbbb', ?, 'codex', '["claude","agy"]', ?, ?)
+                        """,
+                        (f"h-att-{r_i}", r_i, st_v, (ref_now - dt.timedelta(hours=2)).isoformat()),
+                    )
+            db.record_delegated_telemetry(
+                claim_epoch=101,
+                unit_key="p-healthy#1",
+                project_id="p-healthy",
+                telemetry={
+                    "writer_family": "codex",
+                    "model": "gpt-test",
+                    "input_tokens": 1000,
+                    "cache_read_tokens": 200000,
+                    "cost_usd": 0.40,
+                    "cost_known": True,
+                    "referee_turns": [
+                        {"family": "claude", "model": "claude-fable-5-2", "input_tokens": 500, "output_tokens": 120, "cost_usd": 0.05},
+                        {"family": "agy", "model": "agy-default", "input_tokens": 400, "output_tokens": 100},
+                    ],
+                },
+            )
+            with db.immediate_tx():
+                db._conn.execute(
+                    "UPDATE turn_usage_ledger SET created_at = ? WHERE turn_id LIKE 'delegated-101%'",
+                    ((ref_now - dt.timedelta(hours=3)).isoformat(),),
+                )
+            self.assertEqual(
+                db._conn.execute("SELECT COUNT(*) FROM turn_usage_ledger WHERE claim_epoch = 101").fetchone()[0],
+                3,
+            )
+
+            rep_h = run_system_efficiency_audit(
+                db,
+                state_root=sroot,
+                workflows=[wf_healthy],
+                host_cli_families={"codex", "claude", "agy"},
+                now=ref_now,
+                readonly=True,
+                disk_usage_fn=lambda _p: (100 * 1024**3, 40 * 1024**3, 60 * 1024**3),
+                load1_fn=lambda: 0.4,
+                cache_root=cache_r,
+            )
+            self.assertEqual(rep_h["finding_count"], 0)
+            self.assertEqual(db.list_evolution_experiments(), [])
+
+            # 2. Unhealthy project (high NULL outcomes + failures on cap=1) MUST NOT get slot_underutilization promotion!
+            wf_bad = WorkflowConfig(
+                project_id="p-unhealthy",
+                kind="issue",
+                enabled=True,
+                repos=("o/b",),
+                workspace_path=str(self.base),
+                max_in_progress=1,
+                writer_family="codex",
+                referee_families=("claude", "agy"),
+            )
+            db.upsert_project(wf_bad)
+            with db.immediate_tx():
+                for i in range(1, 9):
+                    out_v = None if i <= 3 else ("failed:needs-human" if i <= 6 else "succeeded")
+                    _insert_claim(200 + i, "p-unhealthy", "issue", out_v, ref_now - dt.timedelta(hours=12) + dt.timedelta(minutes=i * 30), 600)
+
+            # 3. Delegated project with short (<3m) spins + missing telemetry + WORKFLOW.md for adjust_cooldown apply & auto-rollback!
+            wf_spin_path = croot / "projects" / "p-spin" / "WORKFLOW.md"
+            wf_spin_path.write_text(
+                '---\n{"project_id": "p-spin", "kind": "delegated", "enabled": true, "repos": ["o/s"], "workspace_path": "'
+                + str(self.base)
+                + '", "schedule_interval_sec": 300}\n---\n\n# body\n',
+                encoding="utf-8",
+            )
+            wf_spin = WorkflowConfig(
+                project_id="p-spin",
+                kind="delegated",
+                enabled=True,
+                repos=("o/s",),
+                workspace_path=str(self.base),
+                max_in_progress=1,
+                schedule_interval_sec=300,
+            )
+            db.upsert_project(wf_spin)
+            with db.immediate_tx():
+                for i in range(1, 9):
+                    dur = 65 if i <= 6 else 400  # 6/8 = 75% <3m spins, all >=60s -> also trips delegated_telemetry_missing!
+                    _insert_claim(300 + i, "p-spin", "delegated", "succeeded", ref_now - dt.timedelta(hours=6) + dt.timedelta(minutes=i * 20), dur)
+
+            # 4. Deep stale cache dirs (>7d) under delegated/*/claim-* with 1 active claim dir excluded!
+            active_claim_dir = cache_r / "delegated" / "p-spin" / "claim-active"
+            active_claim_dir.mkdir(parents=True, exist_ok=True)
+            old_ts = (ref_now - dt.timedelta(days=10)).timestamp()
+            os.utime(active_claim_dir, (old_ts, old_ts))
+            with db.immediate_tx():
+                _insert_claim(399, "p-spin", "delegated", None, ref_now - dt.timedelta(minutes=5), 0, state="active", run_dir=str(active_claim_dir))
+            stale_paths: list[Path] = []
+            for idx in range(5):
+                sp = cache_r / "delegated" / "p-spin" / f"claim-old-{idx}"
+                sp.mkdir(parents=True, exist_ok=True)
+                os.utime(sp, (old_ts, old_ts))
+                stale_paths.append(sp)
+
+            # 5. Cost regression vs own 7d median (3 baseline runs @ $0.50 -> recent 24h run @ $2.50 = 5x)
+            for b_i in range(1, 4):
+                db.record_delegated_telemetry(
+                    claim_epoch=100 + b_i,
+                    unit_key="p-healthy#1",
+                    project_id="p-healthy",
+                    telemetry={"writer_family": "codex", "model": "gpt-test", "input_tokens": 1000, "cache_read_tokens": 500000, "cost_usd": 0.50, "cost_known": True},
+                )
+                with db.immediate_tx():
+                    db._conn.execute(
+                        "UPDATE turn_usage_ledger SET created_at = ? WHERE turn_id = ?",
+                        ((ref_now - dt.timedelta(days=3)).isoformat(), f"delegated-{100 + b_i}"),
+                    )
+            db.record_delegated_telemetry(
+                claim_epoch=115,
+                unit_key="p-healthy#1",
+                project_id="p-healthy",
+                telemetry={"writer_family": "codex", "model": "gpt-test", "input_tokens": 5000, "cache_read_tokens": 4000000, "cost_usd": 2.50, "cost_known": True},
+            )
+            with db.immediate_tx():
+                db._conn.execute(
+                    "UPDATE turn_usage_ledger SET created_at = ? WHERE turn_id = 'delegated-115'",
+                    ((ref_now - dt.timedelta(hours=2)).isoformat(),),
+                )
+
+            rep = run_system_efficiency_audit(
+                db,
+                state_root=sroot,
+                workflows=[wf_healthy, wf_bad, wf_spin],
+                host_cli_families={"codex", "claude", "agy"},
+                now=ref_now,
+                readonly=False,
+                disk_usage_fn=lambda _p: (100 * 1024**3, 40 * 1024**3, 60 * 1024**3),
+                load1_fn=lambda: 0.3,
+                cache_root=cache_r,
+            )
+            pairs = {(f["project_id"], f["kind"]) for f in rep["findings"]}
+            self.assertIn(("p-unhealthy", "null_outcome_rate"), pairs)
+            self.assertIn(("p-unhealthy", "needs_human_or_failure_rate"), pairs)
+            # Mutual-exclusion: unhealthy project MUST NOT be proposed for concurrency promotion!
+            self.assertNotIn(("p-unhealthy", "slot_underutilization"), pairs)
+            self.assertIn(("p-spin", "short_spin_rate"), pairs)
+            self.assertIn(("p-spin", "delegated_telemetry_missing"), pairs)
+            self.assertIn(("p-healthy", "cost_or_turns_regression"), pairs)
+            self.assertIn(("__host__", "deep_stale_cache"), pairs)
+            # Pitfalls table MUST remain completely untouched (0 systemic rows polluting code pitfalls!)
+            self.assertEqual(db._conn.execute("SELECT COUNT(*) FROM pitfalls").fetchone()[0], 0)
+
+            # 6. Apply `adjust_cooldown` on p-spin -> updates WORKFLOW.md to 600 -> after 25h if still spinning -> AUTO-ROLLBACK to 300!
+            exps = db.list_evolution_experiments(states=("proposed",))
+            spin_exp = next(e for e in exps if e["project_id"] == "p-spin" and e["kind"] == "short_spin_rate")
+            applied = apply_evolution_experiment(db, spin_exp["exp_id"], config_root=croot, now=ref_now)
+            self.assertEqual(applied["state"], "applied")
+            self.assertIn('"schedule_interval_sec": 600', wf_spin_path.read_text(encoding="utf-8"))
+
+            # Apply `prune_stale_cache` -> deletes ONLY the 5 unreferenced stale dirs, keeps active_claim_dir intact!
+            cache_exp = next(e for e in exps if e["kind"] == "deep_stale_cache")
+            apply_evolution_experiment(db, cache_exp["exp_id"], cache_root=cache_r, now=ref_now)
+            self.assertTrue(active_claim_dir.is_dir())
+            self.assertTrue(all(not p.exists() for p in stale_paths))
+
+            # Dismiss one diagnostic experiment -> MUST block re-proposal within 7d cooldown!
+            diag_exp = next(e for e in exps if e["kind"] == "delegated_telemetry_missing")
+            self.assertEqual(dismiss_evolution_experiment(db, diag_exp["exp_id"], now=ref_now)["state"], "dismissed")
+            # Dismissing an already-applied experiment MUST be rejected by state guard!
+            with self.assertRaises(AutopilotError):
+                dismiss_evolution_experiment(db, spin_exp["exp_id"], now=ref_now)
+
+            # Advance 25h: keep p-spin still spinning at 75% (so adjust_cooldown failed to improve) while stale cache is now 0!
+            later = ref_now + dt.timedelta(hours=25)
+            with db.immediate_tx():
+                for i in range(1, 9):
+                    dur = 65 if i <= 6 else 400
+                    _insert_claim(400 + i, "p-spin", "delegated", "succeeded", later - dt.timedelta(hours=4) + dt.timedelta(minutes=i * 15), dur)
+            rep_later = run_system_efficiency_audit(
+                db,
+                state_root=sroot,
+                workflows=[wf_healthy, wf_bad, wf_spin],
+                host_cli_families={"codex", "claude", "agy"},
+                now=later,
+                readonly=False,
+                disk_usage_fn=lambda _p: (100 * 1024**3, 40 * 1024**3, 60 * 1024**3),
+                load1_fn=lambda: 0.3,
+                cache_root=cache_r,
+            )
+            self.assertIn(cache_exp["exp_id"], rep_later["experiments_verified_better"])
+            self.assertIn(spin_exp["exp_id"], rep_later["experiments_rolled_back"])
+            # WORKFLOW.md MUST have been rolled back to 300 automatically!
+            self.assertIn('"schedule_interval_sec": 300', wf_spin_path.read_text(encoding="utf-8"))
+            # Cooldown check: neither dismissed `delegated_telemetry_missing` nor rolled_back `short_spin_rate` re-proposed within 7d!
+            open_after = {(e["project_id"], e["kind"]) for e in db.list_evolution_experiments(states=("proposed",))}
+            self.assertNotIn(("p-spin", "delegated_telemetry_missing"), open_after)
+            self.assertNotIn(("p-spin", "short_spin_rate"), open_after)
+            # Double-rollback MUST be rejected by state guard!
+            from ap_core.dream import rollback_evolution_experiment
+
+            with self.assertRaises(AutopilotError):
+                rollback_evolution_experiment(db, spin_exp["exp_id"], now=later)
+
+            # 6b. Non-force staircase promote_concurrency apply + rollback MUST succeed and restore clean_matured_runs!
+            wf_mat = WorkflowConfig(
+                project_id="p-matured",
+                kind="issue",
+                enabled=True,
+                repos=("o/m",),
+                workspace_path=str(self.base),
+                max_in_progress=1,
+                writer_family="codex",
+                referee_families=("claude", "agy"),
+            )
+            db.upsert_project(wf_mat)
+            with db.immediate_tx():
+                db._conn.execute("UPDATE projects SET clean_matured_runs = 12 WHERE project_id = 'p-matured'")
+            rep_m = run_system_efficiency_audit(
+                db,
+                state_root=sroot,
+                workflows=[wf_mat],
+                host_cli_families={"codex", "claude", "agy"},
+                now=ref_now,
+                readonly=False,
+                disk_usage_fn=lambda _p: (100 * 1024**3, 40 * 1024**3, 60 * 1024**3),
+                load1_fn=lambda: 0.2,
+                cache_root=cache_r,
+            )
+            mat_exp = next(e for e in db.list_evolution_experiments(states=("proposed",), project_id="p-matured") if e["kind"] == "slot_underutilization")
+            self.assertFalse(mat_exp["action_payload"]["force"])
+            self.assertNotIn("target_cap", mat_exp["action_payload"])
+            apply_evolution_experiment(db, mat_exp["exp_id"], now=ref_now)
+            self.assertEqual(int(db.get_project_row("p-matured")["max_in_progress"]), 2)
+            self.assertEqual(int(db.get_project_row("p-matured")["clean_matured_runs"]), 0)
+            rollback_evolution_experiment(db, mat_exp["exp_id"], now=ref_now)
+            self.assertEqual(int(db.get_project_row("p-matured")["max_in_progress"]), 1)
+            self.assertEqual(int(db.get_project_row("p-matured")["clean_matured_runs"]), 12)
+
+            # 6c. Manual operator edit to WORKFLOW.md is NOT overwritten during rollback!
+            wf_edit_path = croot / "projects" / "p-single-ref" / "WORKFLOW.md"
+            wf_edit_path.write_text(
+                '---\n{"project_id": "p-single-ref", "kind": "issue", "enabled": true, "repos": ["o/e"], "workspace_path": "'
+                + str(self.base)
+                + '", "writer_family": "codex", "referee_families": ["claude"], "write_scope": ["src/**"]}\n---\n\n# body\n',
+                encoding="utf-8",
+            )
+            wf_sr = WorkflowConfig(
+                project_id="p-single-ref",
+                kind="issue",
+                enabled=True,
+                repos=("o/e",),
+                workspace_path=str(self.base),
+                writer_family="codex",
+                referee_families=("claude",),
+                write_scope=("src/**",),
+            )
+            db.upsert_project(wf_sr)
+            run_system_efficiency_audit(
+                db, state_root=sroot, workflows=[wf_sr], host_cli_families={"codex", "claude", "agy"}, now=ref_now, readonly=False,
+                disk_usage_fn=lambda _p: (100 * 1024**3, 40 * 1024**3, 60 * 1024**3), load1_fn=lambda: 0.2, cache_root=cache_r,
+            )
+            ref_exp = next(e for e in db.list_evolution_experiments(states=("proposed",), project_id="p-single-ref") if e["kind"] == "cross_family_gap")
+            apply_evolution_experiment(db, ref_exp["exp_id"], config_root=croot, now=ref_now)
+            # Simulate operator manually customizing referee_families afterward -> rollback MUST NOT overwrite!
+            wf_edit_path.write_text(wf_edit_path.read_text(encoding="utf-8").replace('"agy",\n    "claude"', '"claude"'), encoding="utf-8")
+            # Write distinct manual value ["agy"]
+            raw_ed = wf_edit_path.read_text(encoding="utf-8")
+            wf_edit_path.write_text(
+                '---\n{"project_id": "p-single-ref", "kind": "issue", "enabled": true, "repos": ["o/e"], "workspace_path": "'
+                + str(self.base)
+                + '", "writer_family": "codex", "referee_families": ["agy"], "write_scope": ["src/**"]}\n---\n\n# body\n',
+                encoding="utf-8",
+            )
+            rollback_evolution_experiment(db, ref_exp["exp_id"], now=ref_now)
+            self.assertIn('"referee_families": ["agy"]', wf_edit_path.read_text(encoding="utf-8"))
+
+            # Rollback failure on WORKFLOW.md MUST revert experiment state back to `applied` for retry!
+            import ap_core.dream as dream_mod
+
+            wf_rf_path = croot / "projects" / "p-rb-fail" / "WORKFLOW.md"
+            wf_rf_path.parent.mkdir(parents=True, exist_ok=True)
+            wf_rf_path.write_text(
+                '---\n{"project_id": "p-rb-fail", "kind": "issue", "enabled": true, "repos": ["o/rf"], "workspace_path": "'
+                + str(self.base)
+                + '", "writer_family": "codex", "referee_families": ["claude"], "write_scope": ["src/**"]}\n---\n\n# body\n',
+                encoding="utf-8",
+            )
+            wf_rf = WorkflowConfig(
+                project_id="p-rb-fail",
+                kind="issue",
+                enabled=True,
+                repos=("o/rf",),
+                workspace_path=str(self.base),
+                writer_family="codex",
+                referee_families=("claude",),
+                write_scope=("src/**",),
+            )
+            db.upsert_project(wf_rf)
+            run_system_efficiency_audit(
+                db, state_root=sroot, workflows=[wf_rf], host_cli_families={"codex", "claude", "agy"}, now=ref_now, readonly=False,
+                disk_usage_fn=lambda _p: (100 * 1024**3, 40 * 1024**3, 60 * 1024**3), load1_fn=lambda: 0.2, cache_root=cache_r,
+            )
+            rf_exp = next(e for e in db.list_evolution_experiments(states=("proposed",), project_id="p-rb-fail") if e["kind"] == "cross_family_gap")
+            apply_evolution_experiment(db, rf_exp["exp_id"], config_root=croot, now=ref_now)
+            with mock.patch.object(dream_mod, "_update_workflow_frontmatter", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    rollback_evolution_experiment(db, rf_exp["exp_id"], now=ref_now)
+            self.assertEqual(db.get_evolution_experiment(rf_exp["exp_id"])["state"], "applied")
+
+            # 6d. Malformed/overflow delegated telemetry MUST NOT swallow claim_outcome!
+            del_sroot = self.base / "del_tel_state"
+            del_sroot.mkdir(parents=True, exist_ok=True)
+            del_db = AutopilotDB(del_sroot / "autopilot.db")
+            try:
+                tok_f = self.base / "del_tok.txt"
+                tok_f.write_text("ghp_dummy\n", encoding="utf-8")
+                os.chmod(tok_f, 0o600)
+                rd_del = self.base / "del_run_dir"
+                wf_dt = WorkflowConfig(project_id="p-dt", kind="delegated", enabled=True, repos=("o/t",), workspace_path=str(self.base), delegated_cmd="true")
+                del_db.upsert_project(wf_dt)
+                del_db.ensure_work_unit(unit_key="p-dt:delegated", project_id="p-dt", repo="o/t")
+                del_db.ensure_lease_slots("p-dt", ["p-dt:slot-1"], del_sroot / "locks")
+                ce_dt = del_db.claim_and_reserve(
+                    unit_key="p-dt:delegated", cfg=wf_dt, slot_keys=["p-dt:slot-1"], worker_unit_name="u-dt.service",
+                    expected_cgroup_dir="/tmp/cg", base_sha="delegated", authorized_head_ref="agent/delegated",
+                    run_dir=str(rd_del), bound_gh_login="octocat", ephemeral_token_file=str(tok_f),
+                )
+            finally:
+                del_db.close()
+
+            def _fake_del_run(cmd: list[str], env: dict[str, str], check: bool = False) -> subprocess.CompletedProcess[str]:
+                # Write huge >64-bit integer + garbage JSON structure that could trip overflow if unclamped, plus mock DB error
+                Path(env["AUTOPILOT_TELEMETRY_OUT"]).write_text('{"input_tokens": ' + str(1 << 80) + '}', encoding="utf-8")
+                return subprocess.CompletedProcess(args=cmd, returncode=0)
+
+            with (
+                mock.patch.dict(os.environ, {"AGENT_AUTOPILOT_STATE_DIR": str(del_sroot)}),
+                mock.patch.object(ap_cli, "verify_self_in_expected_cgroup", return_value=True),
+                mock.patch.object(ap_cli, "LiveGitHubCliTransport", return_value=mock.Mock(bot_login="octocat")),
+                mock.patch.object(ap_cli.subprocess, "run", side_effect=_fake_del_run),
+                mock.patch.object(AutopilotDB, "record_delegated_telemetry", side_effect=OverflowError("int too big")),
+            ):
+                rc_dt = ap_cli.cmd_delegated_exec(argparse.Namespace(claim_epoch=ce_dt, token_file="", delegated_shell_cmd="true"))
+            self.assertEqual(rc_dt, 0)
+            del_db_chk = AutopilotDB(del_sroot / "autopilot.db", readonly=True)
+            try:
+                self.assertEqual(del_db_chk.get_claim(ce_dt)["outcome"], "succeeded")
+            finally:
+                del_db_chk.close()
+
+            # 6e. Pre-migration v17 DB (missing evolution_experiments table) opened readonly MUST NOT crash top/list/probe!
+            v17_sroot = self.base / "v17_ro_state"
+            v17_sroot.mkdir(parents=True, exist_ok=True)
+            v17_db = AutopilotDB(v17_sroot / "autopilot.db")
+            with v17_db.immediate_tx():
+                v17_db._conn.execute("DROP TABLE evolution_experiments")
+            v17_db.close()
+            v17_ro = AutopilotDB(v17_sroot / "autopilot.db", readonly=True)
+            try:
+                self.assertEqual(v17_ro.list_evolution_experiments(), [])
+                from ap_core.routine_flow import probe_project_zero_token
+
+                wf_dr_v17 = WorkflowConfig(project_id="dream", kind="routine", routine_driver="dream", enabled=True, repos=(), workspace_path=str(self.base))
+                self.assertFalse(probe_project_zero_token(wf_dr_v17, v17_ro)["actionable"])
+            finally:
+                v17_ro.close()
+
+            # 7. `top` surfaces evolution_experiments directly; dream failure in cmd_dispatch MUST NOT block other projects!
+            buf_top = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, {"AGENT_AUTOPILOT_STATE_DIR": str(sroot)}),
+                mock.patch.object(ap_cli.subprocess, "run", return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="active\n", stderr="")),
+                mock.patch("sys.stdout", buf_top),
+            ):
+                self.assertEqual(ap_cli.cmd_top(argparse.Namespace()), 0)
+            top_out = json.loads(buf_top.getvalue())
+            self.assertIn("evolution_experiments", top_out)
+            self.assertTrue(any(e["exp_id"] == spin_exp["exp_id"] and e["state"] == "rolled_back" for e in top_out["evolution_experiments"]))
+
+            # Fault isolation: dream raising OSError("No space left on device") after dispatcher.lock MUST NOT fail dispatch of z-project!
+            iso_sroot = self.base / "iso_state"
+            iso_sroot.mkdir(parents=True, exist_ok=True)
+            wf_dr = WorkflowConfig(project_id="aaa-dream", kind="routine", routine_driver="dream", enabled=True, repos=(), workspace_path=str(self.base))
+            wf_z = WorkflowConfig(project_id="zzz-del", kind="delegated", enabled=True, repos=("o/z",), workspace_path=str(self.base), delegated_cmd="true")
+            ok_proc = subprocess.CompletedProcess(args=["systemd-run"], returncode=0, stdout="", stderr="")
+            calm = {"pressured": False, "steal_pct": 0.0, "load1": 0.1, "reason": None}
+            buf_iso = io.StringIO()
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"AGENT_AUTOPILOT_STATE_DIR": str(iso_sroot), "AGENT_AUTOPILOT_CACHE_DIR": str(self.base / "iso_cache")},
+                ),
+                mock.patch.object(ap_cli, "load_all_workflows", return_value=[wf_dr, wf_z]),
+                mock.patch.object(ap_cli, "supervisor_recover_and_reconcile", return_value={}),
+                mock.patch.object(
+                    ap_cli,
+                    "probe_project_zero_token",
+                    side_effect=lambda wf, _db: {"actionable": True, "reason": "ok", "candidates": [{"repo": "o/z", "number": 1, "unit_key": "o/z#1"}]}
+                    if wf.project_id == "zzz-del"
+                    else {"actionable": True, "reason": "due"},
+                ),
+                mock.patch.object(ap_cli, "_resolve_project_gh_identity_unlocked", return_value=("ghp_tok", "octocat")),
+                mock.patch.object(ap_cli, "spawn_transient_unit_under_flock", return_value=ok_proc),
+                mock.patch.object(ap_cli, "sample_host_pressure", return_value=calm),
+                mock.patch.object(ap_cli, "run_dream_consolidation", side_effect=OSError("No space left on device")),
+                mock.patch("sys.stdout", buf_iso),
+            ):
+                rc_iso = ap_cli.cmd_dispatch(argparse.Namespace(dry_run=False))
+            self.assertEqual(rc_iso, 0)
+            iso_out = json.loads(buf_iso.getvalue())
+            self.assertTrue(any(e.get("project_id") == "zzz-del" for e in iso_out["executed"]))
+            self.assertTrue(any(e.get("project_id") == "aaa-dream" and "No space left" in e.get("dream_error", "") for e in iso_out["executed"]))
         finally:
             db.close()
 

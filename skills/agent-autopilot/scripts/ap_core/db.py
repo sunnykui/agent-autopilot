@@ -306,6 +306,28 @@ CREATE TABLE IF NOT EXISTS claim_credential_dirs (
     purged_at TEXT,
     PRIMARY KEY(claim_epoch, dir_dev, dir_ino)
 );
+
+CREATE TABLE IF NOT EXISTS evolution_experiments (
+    exp_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    severity TEXT NOT NULL CHECK(severity IN ('high', 'med', 'low')),
+    metric_name TEXT NOT NULL,
+    baseline_value REAL NOT NULL,
+    latest_value REAL,
+    summary TEXT NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    action_kind TEXT NOT NULL,
+    action_payload_json TEXT NOT NULL DEFAULT '{}',
+    rollback_payload_json TEXT NOT NULL DEFAULT '{}',
+    state TEXT NOT NULL CHECK(state IN ('proposed', 'applied', 'verified_better', 'rolled_back', 'dismissed', 'resolved')),
+    review_after TEXT,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    settled_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_evo_proj_state ON evolution_experiments(project_id, state, kind);
 """
 
 _COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
@@ -3467,6 +3489,293 @@ class AutopilotDB:
             out = self._conn.execute("SELECT * FROM pitfalls WHERE sig = ?", (sig,)).fetchone()
             assert out is not None
             return dict(out)
+
+    def record_delegated_telemetry(
+        self,
+        *,
+        claim_epoch: int,
+        unit_key: str,
+        project_id: str,
+        telemetry: dict[str, Any],
+        default_status: str = "ok",
+    ) -> bool:
+        """Safely ingest a delegated runner's JSON telemetry receipt into `turn_usage_ledger`."""
+        if not isinstance(telemetry, dict):
+            return False
+
+        def _nonneg_int(val: Any) -> int:
+            if isinstance(val, bool) or not isinstance(val, int) or val < 0:
+                return 0
+            return min(val, (1 << 63) - 1)
+
+        fam = str(telemetry.get("writer_family") or telemetry.get("family") or "delegated").strip() or "delegated"
+        model = str(telemetry.get("model") or "unknown").strip() or "unknown"
+        status = str(telemetry.get("status") or default_status).strip() or default_status
+        in_tok = _nonneg_int(telemetry.get("input_tokens"))
+        out_tok = _nonneg_int(telemetry.get("output_tokens"))
+        cr_tok = _nonneg_int(telemetry.get("cache_read_tokens"))
+        cw_tok = _nonneg_int(telemetry.get("cache_write_tokens"))
+        th_tok = _nonneg_int(telemetry.get("thinking_tokens"))
+        usage_known = bool(
+            telemetry.get("usage_known")
+            or any(v > 0 for v in (in_tok, out_tok, cr_tok, cw_tok, th_tok))
+        )
+        raw_cost = telemetry.get("cost_usd")
+        cost_usd = (
+            float(raw_cost)
+            if (raw_cost is not None and not isinstance(raw_cost, bool) and isinstance(raw_cost, (int, float)) and math.isfinite(float(raw_cost)) and float(raw_cost) >= 0.0)
+            else None
+        )
+        cost_known = bool(telemetry.get("cost_known")) if "cost_known" in telemetry else (cost_usd is not None)
+        self.record_turn_usage(
+            turn_id=f"delegated-{int(claim_epoch)}",
+            claim_epoch=int(claim_epoch),
+            unit_key=str(unit_key),
+            project_id=str(project_id),
+            role="delegated_writer",
+            family=fam,
+            model=model,
+            status=status,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+            cache_read_tokens=cr_tok,
+            cache_write_tokens=cw_tok,
+            thinking_tokens=th_tok,
+            cost_usd=cost_usd,
+            cost_known=cost_known,
+            usage_known=usage_known,
+        )
+        # Also ingest optional per-referee turn telemetry emitted by multi-family delegated runners.
+        ref_turns = telemetry.get("referee_turns")
+        if isinstance(ref_turns, list):
+            for idx, rt in enumerate(ref_turns[:16]):
+                if not isinstance(rt, dict):
+                    continue
+                r_fam = str(rt.get("family") or rt.get("referee_family") or "referee").strip() or "referee"
+                r_mod = str(rt.get("model") or "unknown").strip() or "unknown"
+                r_st = str(rt.get("status") or "ok").strip() or "ok"
+                r_in = _nonneg_int(rt.get("input_tokens"))
+                r_out = _nonneg_int(rt.get("output_tokens"))
+                r_cr = _nonneg_int(rt.get("cache_read_tokens"))
+                r_cw = _nonneg_int(rt.get("cache_write_tokens"))
+                r_th = _nonneg_int(rt.get("thinking_tokens"))
+                r_uk = bool(rt.get("usage_known") or any(v > 0 for v in (r_in, r_out, r_cr, r_cw, r_th)))
+                r_rc = rt.get("cost_usd")
+                r_cost = (
+                    float(r_rc)
+                    if (r_rc is not None and not isinstance(r_rc, bool) and isinstance(r_rc, (int, float)) and math.isfinite(float(r_rc)) and float(r_rc) >= 0.0)
+                    else None
+                )
+                r_ck = bool(rt.get("cost_known")) if "cost_known" in rt else (r_cost is not None)
+                self.record_turn_usage(
+                    turn_id=f"delegated-{int(claim_epoch)}-ref-{idx}-{r_fam}",
+                    claim_epoch=int(claim_epoch),
+                    unit_key=str(unit_key),
+                    project_id=str(project_id),
+                    role=str(rt.get("role") or "delegated_referee"),
+                    family=r_fam,
+                    model=r_mod,
+                    status=r_st,
+                    input_tokens=r_in,
+                    output_tokens=r_out,
+                    cache_read_tokens=r_cr,
+                    cache_write_tokens=r_cw,
+                    thinking_tokens=r_th,
+                    cost_usd=r_cost,
+                    cost_known=r_ck,
+                    usage_known=r_uk,
+                )
+        return True
+
+    def _has_evolution_table(self) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'evolution_experiments'"
+        ).fetchone()
+        return row is not None
+
+    def list_evolution_experiments(
+        self,
+        *,
+        states: tuple[str, ...] | None = None,
+        project_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if states:
+            clauses.append(f"state IN ({','.join('?' for _ in states)})")
+            params.extend(states)
+        if project_id:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            if not self._has_evolution_table():
+                return []
+            rows = self._conn.execute(
+                f"SELECT * FROM evolution_experiments {where} ORDER BY CASE severity WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END, created_at DESC",
+                params,
+            ).fetchall()
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                d = dict(r)
+                for jf in ("evidence_json", "action_payload_json", "rollback_payload_json"):
+                    try:
+                        d[jf[:-5]] = json.loads(d[jf] or "{}")
+                    except json.JSONDecodeError:
+                        d[jf[:-5]] = {}
+                out.append(d)
+            return out
+
+    def get_evolution_experiment(self, exp_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            if not self._has_evolution_table():
+                return None
+            r = self._conn.execute("SELECT * FROM evolution_experiments WHERE exp_id = ?", (exp_id,)).fetchone()
+            if r is None:
+                return None
+            d = dict(r)
+            for jf in ("evidence_json", "action_payload_json", "rollback_payload_json"):
+                try:
+                    d[jf[:-5]] = json.loads(d[jf] or "{}")
+                except json.JSONDecodeError:
+                    d[jf[:-5]] = {}
+            return d
+
+    def upsert_evolution_experiment(
+        self,
+        *,
+        project_id: str,
+        kind: str,
+        severity: str,
+        metric_name: str,
+        baseline_value: float,
+        summary: str,
+        evidence: dict[str, Any],
+        action_kind: str,
+        action_payload: dict[str, Any],
+        expires_at: str,
+        cooldown_days: int = 7,
+        now_str: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Insert or refresh an open `proposed` experiment for `(project_id, kind)` (preserves `applied`, respects cooldown after `dismissed`/`rolled_back`)."""
+        ts = now_str or now_iso()
+        with self.immediate_tx():
+            active = self._conn.execute(
+                "SELECT * FROM evolution_experiments WHERE project_id = ? AND kind = ? AND state IN ('proposed', 'applied') ORDER BY created_at DESC LIMIT 1",
+                (project_id, kind),
+            ).fetchone()
+            if active is not None:
+                if active["state"] == "applied":
+                    self._conn.execute(
+                        "UPDATE evolution_experiments SET latest_value = ?, evidence_json = ?, updated_at = ? WHERE exp_id = ?",
+                        (float(baseline_value), json.dumps(evidence, ensure_ascii=False), ts, active["exp_id"]),
+                    )
+                else:
+                    self._conn.execute(
+                        """
+                        UPDATE evolution_experiments
+                        SET severity = ?, baseline_value = ?, latest_value = ?, summary = ?,
+                            evidence_json = ?, action_kind = ?, action_payload_json = ?,
+                            expires_at = ?, updated_at = ?
+                        WHERE exp_id = ?
+                        """,
+                        (
+                            severity,
+                            float(baseline_value),
+                            float(baseline_value),
+                            summary,
+                            json.dumps(evidence, ensure_ascii=False),
+                            action_kind,
+                            json.dumps(action_payload, ensure_ascii=False),
+                            expires_at,
+                            ts,
+                            active["exp_id"],
+                        ),
+                    )
+                exp_id = str(active["exp_id"])
+            else:
+                # Respect cooldown after a recent human dismissal or auto-rollback for the same (project_id, kind).
+                recent_cooled = self._conn.execute(
+                    "SELECT settled_at FROM evolution_experiments WHERE project_id = ? AND kind = ? AND state IN ('dismissed', 'rolled_back') ORDER BY settled_at DESC LIMIT 1",
+                    (project_id, kind),
+                ).fetchone()
+                if recent_cooled is not None and recent_cooled["settled_at"]:
+                    try:
+                        now_dt = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                        set_dt = dt.datetime.fromisoformat(str(recent_cooled["settled_at"]).replace("Z", "+00:00"))
+                        if (now_dt - set_dt).total_seconds() < max(1, int(cooldown_days)) * 86400:
+                            return None
+                    except ValueError:
+                        pass
+                exp_id = f"exp-{uuid.uuid4().hex[:12]}"
+                self._conn.execute(
+                    """
+                    INSERT INTO evolution_experiments(
+                        exp_id, project_id, kind, severity, metric_name, baseline_value, latest_value,
+                        summary, evidence_json, action_kind, action_payload_json, rollback_payload_json,
+                        state, expires_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', 'proposed', ?, ?, ?)
+                    """,
+                    (
+                        exp_id,
+                        project_id,
+                        kind,
+                        severity,
+                        metric_name,
+                        float(baseline_value),
+                        float(baseline_value),
+                        summary,
+                        json.dumps(evidence, ensure_ascii=False),
+                        action_kind,
+                        json.dumps(action_payload, ensure_ascii=False),
+                        expires_at,
+                        ts,
+                        ts,
+                    ),
+                )
+        return self.get_evolution_experiment(exp_id)
+
+    def update_evolution_experiment(
+        self,
+        exp_id: str,
+        *,
+        state: str,
+        expected_states: tuple[str, ...] | None = None,
+        latest_value: float | None = None,
+        review_after: str | None = None,
+        rollback_payload: dict[str, Any] | None = None,
+        settled_at: str | None = None,
+        now_str: str | None = None,
+    ) -> dict[str, Any]:
+        ts = now_str or now_iso()
+        with self.immediate_tx():
+            row = self._conn.execute("SELECT * FROM evolution_experiments WHERE exp_id = ?", (exp_id,)).fetchone()
+            if row is None:
+                raise AutopilotError(f"Unknown evolution experiment: {exp_id}")
+            if expected_states is not None and str(row["state"]) not in expected_states:
+                raise AutopilotError(
+                    f"Experiment {exp_id} transition to {state!r} rejected: current state is {row['state']!r}, expected one of {expected_states}"
+                )
+            rb_json = (
+                json.dumps(rollback_payload, ensure_ascii=False)
+                if rollback_payload is not None
+                else str(row["rollback_payload_json"] or "{}")
+            )
+            lv = float(latest_value) if latest_value is not None else row["latest_value"]
+            ra = review_after if review_after is not None else row["review_after"]
+            sa = settled_at if settled_at is not None else row["settled_at"]
+            self._conn.execute(
+                """
+                UPDATE evolution_experiments
+                SET state = ?, latest_value = ?, review_after = ?, rollback_payload_json = ?,
+                    settled_at = ?, updated_at = ?
+                WHERE exp_id = ?
+                """,
+                (state, lv, ra, rb_json, sa, ts, exp_id),
+            )
+        res = self.get_evolution_experiment(exp_id)
+        assert res is not None
+        return res
 
     def approve_concurrency_promotion(
         self,

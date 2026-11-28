@@ -25,7 +25,13 @@ if str(SCRIPT_DIR) not in sys.path:
 from ap_core import SCHEMA_VERSION, __version__  # noqa: E402
 from ap_core.chef_loop import ModelTurnResult, execute_chef_issue_pipeline  # noqa: E402
 from ap_core.db import AutopilotDB  # noqa: E402
-from ap_core.dream import run_dream_consolidation  # noqa: E402
+from ap_core.dream import (  # noqa: E402
+    apply_evolution_experiment,
+    dismiss_evolution_experiment,
+    rollback_evolution_experiment,
+    run_dream_consolidation,
+    run_system_efficiency_audit,
+)
 from ap_core.git_gate import (  # noqa: E402
     check_autopilot_scope,
     ensure_managed_bare_repo,
@@ -2030,18 +2036,40 @@ def cmd_delegated_exec(args: argparse.Namespace) -> int:
     chk_login = LiveGitHubCliTransport(token=env["GH_TOKEN"], require_explicit_token=True).bot_login
     if not chk_login or chk_login != bound_login:
         raise AutopilotError(f"delegated-exec GitHub identity {chk_login!r} != bound_gh_login {bound_login!r}")
+    run_dir_raw = str(cl.get("run_dir") or "").strip()
+    telemetry_path: Path | None = None
+    if run_dir_raw:
+        with contextlib.suppress(OSError, AutopilotError):
+            rd_p = ensure_secure_dir(Path(run_dir_raw), 0o700)
+            telemetry_path = rd_p / "delegated-telemetry.json"
+            env["AUTOPILOT_TELEMETRY_OUT"] = str(telemetry_path)
     shell_cmd = args.delegated_shell_cmd if hasattr(args, "delegated_shell_cmd") else args.cmd
     proc = subprocess.run(["/bin/bash", "-lc", shell_cmd], env=env, check=False)
     db2 = AutopilotDB(sroot / "autopilot.db")
     try:
         cl2 = db2.get_claim(int(args.claim_epoch))
         if cl2:
+            # Record claim outcome FIRST so a telemetry parse/DB error can NEVER leave outcome NULL!
             if proc.returncode == 0:
                 with db2.immediate_tx():
                     db2._conn.execute("UPDATE work_units SET status = 'queued', failure_streak = 0, updated_at = ? WHERE unit_key = ?", (now_iso(), cl2["unit_key"]))
                     db2.record_claim_outcome(int(args.claim_epoch), "succeeded")
             else:
                 db2.record_claim_outcome(int(args.claim_epoch), f"failed:{proc.returncode}")
+            if telemetry_path is not None and telemetry_path.is_file() and not telemetry_path.is_symlink():
+                try:
+                    if telemetry_path.stat().st_size <= 262144:
+                        t_data = json.loads(telemetry_path.read_text(encoding="utf-8"))
+                        if isinstance(t_data, dict):
+                            db2.record_delegated_telemetry(
+                                claim_epoch=int(args.claim_epoch),
+                                unit_key=str(cl2["unit_key"]),
+                                project_id=str(cl2["project_id"]),
+                                telemetry=t_data,
+                                default_status="ok" if proc.returncode == 0 else "error",
+                            )
+                except Exception:
+                    pass
     finally:
         db2.close()
     return proc.returncode
@@ -2308,7 +2336,12 @@ def cmd_run_once(args: argparse.Namespace) -> int:
             db.upsert_project(cfg)
             rec = supervisor_recover_and_reconcile(db, disp_epoch, wfs)
             if cfg.kind == "routine" and cfg.routine_driver == "dream":
-                dres = run_dream_consolidation(db, state_root=sroot)
+                dres = run_dream_consolidation(
+                    db,
+                    state_root=sroot,
+                    workflows=list(load_all_workflows()),
+                    host_cli_families=_host_cli_families_safe(),
+                )
                 print(json.dumps({"project_id": cfg.project_id, "recovery": rec, "dream": dres}, ensure_ascii=False, indent=2))
                 return 0
         finally:
@@ -2567,12 +2600,17 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
         db_ro_p.close()
 
     # Phase 3: Re-acquire dispatcher.lock, RE-READ WORKFLOW.md to reject concurrent policy changes, and submit!
+    # Defer `dream` (pitfall consolidation + self-evolution audit) until AFTER releasing dispatcher.lock so audit/disk errors
+    # never block dispatch of other projects!
+    deferred_dream_pids: list[str] = []
+    deferred_wfs: list[WorkflowConfig] = []
+    executed: list[dict[str, Any]] = []
     with acquire_dispatcher_lock(sroot):
         db = AutopilotDB(sroot / "autopilot.db")
         try:
             disp_epoch = db.bump_dispatcher_epoch()
             fresh_wfs = {w.project_id: w for w in load_all_workflows()}
-            executed: list[dict[str, Any]] = []
+            deferred_wfs = list(fresh_wfs.values())
             for pid in sorted(probed_map.keys()):
                 fresh_wf = fresh_wfs.get(pid)
                 if fresh_wf is None or not fresh_wf.enabled or fresh_wf.policy_version != probed_policy_vers.get(pid):
@@ -2586,16 +2624,17 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
                     crow2 = db._conn.execute("SELECT last_full_run_ts FROM routine_cursors WHERE project_id = ?", (pid,)).fetchone()
                     if crow2 and crow2["last_full_run_ts"] and (now_ts - float(crow2["last_full_run_ts"])) < fresh_wf.schedule_interval_sec:
                         continue
-                    with db.immediate_tx():
-                        db._conn.execute(
-                            "INSERT OR REPLACE INTO routine_cursors(project_id, last_full_run_ts, updated_at) VALUES (?, ?, ?)",
-                            (pid, now_ts, now_iso()),
-                        )
+                    if fresh_wf.routine_driver != "dream":
+                        with db.immediate_tx():
+                            db._conn.execute(
+                                "INSERT OR REPLACE INTO routine_cursors(project_id, last_full_run_ts, updated_at) VALUES (?, ?, ?)",
+                                (pid, now_ts, now_iso()),
+                            )
                 if not prb.get("actionable"):
                     continue
 
                 if fresh_wf.kind == "routine" and fresh_wf.routine_driver == "dream":
-                    executed.append({"project_id": pid, "dream": run_dream_consolidation(db, state_root=sroot)})
+                    deferred_dream_pids.append(pid)
                 elif fresh_wf.kind == "routine" and fresh_wf.routine_driver in ("lark_payments", "custom", ""):
                     with contextlib.suppress(AutopilotError, subprocess.SubprocessError, OSError):
                         executed.append(
@@ -2660,23 +2699,51 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
                         except (AutopilotError, subprocess.SubprocessError, OSError):
                             break
 
-            print(
-                json.dumps(
-                    {
-                        "dispatcher_epoch": disp_epoch,
-                        "dry_run": False,
-                        "recovery": rec,
-                        "host_gate": host_gate,
-                        "probe_plan": plan,
-                        "executed": executed,
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            )
-            return 0
         finally:
             db.close()
+
+    # Phase 4: Run deferred dream consolidation & self-evolution audit OUTSIDE dispatcher.lock with full fault isolation.
+    if deferred_dream_pids:
+        db_dream = AutopilotDB(sroot / "autopilot.db")
+        try:
+            host_fams = _host_cli_families_safe()
+            for pid in deferred_dream_pids:
+                try:
+                    dres = run_dream_consolidation(
+                        db_dream,
+                        state_root=sroot,
+                        workflows=deferred_wfs,
+                        host_cli_families=host_fams,
+                    )
+                    # Advance routine_cursors ONLY after dream succeeds so a transient failure retries on the next tick.
+                    wf_d = next((w for w in deferred_wfs if w.project_id == pid), None)
+                    if wf_d is not None and wf_d.schedule_interval_sec > 180:
+                        with db_dream.immediate_tx():
+                            db_dream._conn.execute(
+                                "INSERT OR REPLACE INTO routine_cursors(project_id, last_full_run_ts, updated_at) VALUES (?, ?, ?)",
+                                (pid, now_ts, now_iso()),
+                            )
+                    executed.append({"project_id": pid, "dream": dres})
+                except Exception as exc:
+                    executed.append({"project_id": pid, "dream_error": sanitize_terminal_text(str(exc), 200)})
+        finally:
+            db_dream.close()
+
+    print(
+        json.dumps(
+            {
+                "dispatcher_epoch": disp_epoch,
+                "dry_run": False,
+                "recovery": rec,
+                "host_gate": host_gate,
+                "probe_plan": plan,
+                "executed": executed,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
 
 
 def cmd_top(args: argparse.Namespace) -> int:
@@ -2709,6 +2776,7 @@ def cmd_top(args: argparse.Namespace) -> int:
             timeout=5,
             check=False,
         )
+        evo_exps = db.list_evolution_experiments(states=("proposed", "applied", "rolled_back"))
         out = {
             "checked_at": now_iso(),
             "dispatcher_epoch": db.get_dispatcher_epoch(),
@@ -2717,6 +2785,7 @@ def cmd_top(args: argparse.Namespace) -> int:
             "leases": leases_raw,
             "pending_external_ops": pending_ops,
             "recent_units": units,
+            "evolution_experiments": evo_exps,
         }
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return 0
@@ -2919,15 +2988,84 @@ def cmd_resolve_op(args: argparse.Namespace) -> int:
             db.close()
 
 
+def _host_cli_families_safe() -> set[str]:
+    fams: set[str] = set()
+    try:
+        bins = resolve_host_binaries()
+    except Exception:
+        bins = {}
+    for fam, key in (("codex", "codex_cli"), ("claude", "claude_cli"), ("agy", "agy_cli")):
+        p = bins.get(key)
+        if p is not None and Path(p).is_file():
+            fams.add(fam)
+    return fams
+
+
 def cmd_dream(args: argparse.Namespace) -> int:
     sroot = default_state_root()
     db = AutopilotDB(sroot / "autopilot.db")
     try:
-        res = run_dream_consolidation(db, state_root=sroot)
+        res = run_dream_consolidation(
+            db,
+            state_root=sroot,
+            workflows=list(load_all_workflows()),
+            host_cli_families=_host_cli_families_safe(),
+        )
         print(json.dumps(res, ensure_ascii=False, indent=2))
         return 0
     finally:
         db.close()
+
+
+def cmd_audit(args: argparse.Namespace) -> int:
+    sroot = default_state_root()
+    readonly = bool(getattr(args, "readonly", False))
+    db = AutopilotDB(sroot / "autopilot.db", readonly=readonly)
+    try:
+        res = run_system_efficiency_audit(
+            db,
+            state_root=sroot,
+            workflows=list(load_all_workflows()),
+            host_cli_families=_host_cli_families_safe(),
+            readonly=readonly,
+        )
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_evolution(args: argparse.Namespace) -> int:
+    sroot = default_state_root()
+    action = str(getattr(args, "evo_action", "list") or "list")
+    if action == "list":
+        db_ro = AutopilotDB(sroot / "autopilot.db", readonly=True)
+        try:
+            states = None if getattr(args, "all", False) else ("proposed", "applied", "rolled_back")
+            exps = db_ro.list_evolution_experiments(states=states, project_id=getattr(args, "project", None))
+            print(json.dumps({"experiments": exps}, ensure_ascii=False, indent=2))
+            return 0
+        finally:
+            db_ro.close()
+
+    with acquire_dispatcher_lock(sroot):
+        db = AutopilotDB(sroot / "autopilot.db")
+        try:
+            exp_id = str(getattr(args, "exp_id", "") or "").strip()
+            if not exp_id:
+                raise AutopilotError("exp_id is required")
+            if action == "apply":
+                res = apply_evolution_experiment(db, exp_id)
+            elif action == "rollback":
+                res = rollback_evolution_experiment(db, exp_id)
+            elif action == "dismiss":
+                res = dismiss_evolution_experiment(db, exp_id)
+            else:
+                raise AutopilotError(f"Unknown evolution action: {action}")
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+            return 0
+        finally:
+            db.close()
 
 
 def cmd_approve_promotion(args: argparse.Namespace) -> int:
@@ -3018,7 +3156,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("top", help="Inspect live SQLite + real systemd/cgroup status.")
     sub.add_parser("status", help="Alias for top.")
-    sub.add_parser("dream", help="Consolidate pitfalls and evaluate 48h-matured concurrency promotions.")
+    sub.add_parser("dream", help="Consolidate code pitfalls, mature 48h runs, and run closed-loop self-evolution audit.")
+    au = sub.add_parser("audit", help="Run zero-token ratio+baseline efficiency audit and verify applied evolution experiments.")
+    au.add_argument("--readonly", action="store_true", help="Read-only audit with zero DB or file side effects.")
+
+    ev = sub.add_parser("evolution", help="Inspect, apply, rollback, or dismiss closed-loop self-evolution experiments.")
+    ev_sub = ev.add_subparsers(dest="evo_action", required=True)
+    ev_ls = ev_sub.add_parser("list", help="List active (or --all) evolution experiments.")
+    ev_ls.add_argument("--all", action="store_true")
+    ev_ls.add_argument("--project", default=None)
+    ev_ap = ev_sub.add_parser("apply", help="Apply a proposed machine-executable evolution experiment.")
+    ev_ap.add_argument("exp_id")
+    ev_rb = ev_sub.add_parser("rollback", help="Manually rollback an applied evolution experiment.")
+    ev_rb.add_argument("exp_id")
+    ev_dm = ev_sub.add_parser("dismiss", help="Dismiss a proposed evolution experiment.")
+    ev_dm.add_argument("exp_id")
 
     vt = sub.add_parser("veto", help="Atomically pause a unit/PR and execute single-mutation compensations.")
     vt.add_argument("unit_key")
@@ -3085,6 +3237,8 @@ def main(argv: list[str] | None = None) -> int:
         "top": cmd_top,
         "status": cmd_top,
         "dream": cmd_dream,
+        "audit": cmd_audit,
+        "evolution": cmd_evolution,
         "veto": cmd_veto,
         "clear-veto": cmd_clear_veto,
         "resolve-op": cmd_resolve_op,
