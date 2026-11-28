@@ -1,6 +1,6 @@
 # `agent-autopilot` 通用自进化 24×7 自治引擎完整规范 (v7.8 — 双模型终审封版)
 
-> **版本绑定与唯一事实来源声明**：本规范为 100% 自包含正本（无任何跨版本缩写引用），与机器可读策略清单 [`skills/agent-autopilot/scripts/ap_core/policy_manifest.json`](../skills/agent-autopilot/scripts/ap_core/policy_manifest.json)（`schema_version = 16`）、静态 C 源码 [`ap_sandbox_init.c`](../skills/agent-autopilot/native/ap_sandbox_init.c) 及 [`ap_safe_sh.c`](../skills/agent-autopilot/native/ap_safe_sh.c) 完全一致；单测直接加载 `policy_manifest.json` 校验四类 `model_ring` 角色、三类执行环、`chef_pipeline`、10 类单变异动作映射（`one_mutation_per_op_id: true`）、11 项状态枚举、4 项原始非法路径样例与 21+3 范围命中样例。
+> **版本绑定与唯一事实来源声明**：本规范为 100% 自包含正本（无任何跨版本缩写引用），与机器可读策略清单 [`skills/agent-autopilot/scripts/ap_core/policy_manifest.json`](../skills/agent-autopilot/scripts/ap_core/policy_manifest.json)（`schema_version = 17`）、静态 C 源码 [`ap_sandbox_init.c`](../skills/agent-autopilot/native/ap_sandbox_init.c) 及 [`ap_safe_sh.c`](../skills/agent-autopilot/native/ap_safe_sh.c) 完全一致；单测直接加载 `policy_manifest.json` 校验六类 `model_ring` 角色（`codex`/`claude`/`agy` 各 issue+readonly）、三类执行环、`chef_pipeline`、10 类单变异动作映射（`one_mutation_per_op_id: true`）、11 项状态枚举、4 项原始非法路径样例与 21+3 范围命中样例。
 > *注：按用户全局规则，未经用户最终提交授权前工作区不执行 `git commit`，本轮终审对象为当前工作区上述四个文件的精确内容。*
 >
 > **v7.8 终审收口要点**：

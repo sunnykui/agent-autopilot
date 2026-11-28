@@ -1,5 +1,5 @@
 {
-  "schema_version": 16,
+  "schema_version": 17,
   "require_systemd_linger": true,
   "merge_pr_requires_separate_merge_token": true,
   "basenames_case_insensitive": true,
@@ -17,7 +17,8 @@
     "roles": ["scout", "writer", "referee"],
     "cross_family_referee_map": {
       "codex": "claude",
-      "claude": "codex"
+      "claude": "codex",
+      "agy": "claude"
     },
     "configurable_models": {
       "claude_scout": "claude-sonnet-5-5",
@@ -26,6 +27,9 @@
       "codex_scout": "gpt-6.2-sol",
       "codex_writer": "gpt-6.2-sol",
       "codex_referee": "gpt-6.2-astra",
+      "agy_scout": "gemini-4-neon-medium",
+      "agy_writer": "gemini-4-neon-high",
+      "agy_referee": "gemini-4-neon-high",
       "visual_inspector": "gpt-6.1-terra"
     },
     "enable_ui_verify_default": false,
@@ -56,7 +60,8 @@
     "ap_sandbox_init": "Static C initializer binary (distinct inode from ap_safe_sh)",
     "ap_safe_sh": "Static C non-blocking shell proxy client (bound to /usr/bin/{bash,sh,dash}; host shells are NEVER mounted in model_ring)",
     "codex_cli": "Resolved host codex static-pie ELF binary",
-    "claude_cli": "Resolved host claude ELF binary (invoked with --setting-sources user --strict-mcp-config --exclude-dynamic-system-prompt-sections; dynamic loader + 0644 .so libs when dynamic_elf_libs=true)"
+    "claude_cli": "Resolved host claude ELF binary (invoked with --setting-sources user --strict-mcp-config --exclude-dynamic-system-prompt-sections; dynamic loader + 0644 .so libs when dynamic_elf_libs=true)",
+    "agy_cli": "Resolved host agy ELF binary (invoked with --disable-slash-commands and structured stream-json/json print mode; dynamic loader + 0644 .so libs when dynamic_elf_libs=true)"
   },
   "llm_proxy_allowlist_domains": [
     "api.anthropic.com",
@@ -66,6 +71,42 @@
     "api.openai.com",
     "chatgpt.com",
     "auth.openai.com"
+  ],
+  "family_llm_proxy_allowlist_domains": {
+    "claude": [
+      "api.anthropic.com",
+      "claude.ai",
+      "api.claude.ai",
+      "platform.claude.com"
+    ],
+    "codex": [
+      "api.openai.com",
+      "chatgpt.com",
+      "auth.openai.com"
+    ],
+    "agy": [
+      "daily-cloudcode-pa.googleapis.com",
+      "cloudcode-pa.googleapis.com",
+      "aicode.googleapis.com"
+    ]
+  },
+  "agy_permission_deny": [
+    "read_file(/home/sandbox/.gemini)",
+    "write_file(/home/sandbox/.gemini)",
+    "read_file(~/.gemini)",
+    "write_file(~/.gemini)",
+    "write_file(.agents)",
+    "write_file(.agent)",
+    "write_file(_agent)",
+    "write_file(_agents)",
+    "write_file(.gemini)",
+    "read_file(/proc)",
+    "write_file(/proc)",
+    "read_file(/run/ap)",
+    "write_file(/run/ap)",
+    "mcp(*)",
+    "read_url(*)",
+    "execute_url(*)"
   ],
   "claude_permission_deny": [
     "Read(~/.claude/**)",
@@ -151,6 +192,47 @@
       "readonly_review_bundle_mount": "/ap-review-bundle",
       "verdict_handoff_channel": "stdout_json_validated_by_host",
       "writable_mounts": ["sandbox_home", "outbox"]
+    },
+    "agy:issue_model": {
+      "binary_mounts": {
+        "/usr/local/bin/ap-sandbox-init": "ap_sandbox_init",
+        "/usr/local/bin/agy": "agy_cli",
+        "/usr/bin/bash": "ap_safe_sh",
+        "/usr/bin/sh": "ap_safe_sh",
+        "/usr/bin/dash": "ap_safe_sh"
+      },
+      "landlock_allow_exec": [
+        "/usr/local/bin/agy",
+        "/usr/lib64/ld-linux-x86-64.so.2",
+        "/usr/bin/bash",
+        "/usr/bin/sh",
+        "/usr/bin/dash"
+      ],
+      "agy_cli_flags": ["--mode", "accept-edits", "--disable-slash-commands"],
+      "agy_permission_allow": ["command(*)", "read_file(/tmp)", "write_file(/tmp)"],
+      "dynamic_elf_libs": true,
+      "mount_tool_sock": true,
+      "readonly_worktree_dot_git": true,
+      "writable_mounts": ["sandbox_home", "shared_tmp", "shell_snapshots", "worktree", "outbox"]
+    },
+    "agy:readonly_model": {
+      "binary_mounts": {
+        "/usr/local/bin/ap-sandbox-init": "ap_sandbox_init",
+        "/usr/local/bin/agy": "agy_cli"
+      },
+      "landlock_allow_exec": [
+        "/usr/local/bin/agy",
+        "/usr/lib64/ld-linux-x86-64.so.2"
+      ],
+      "agy_cli_flags": ["--mode", "plan", "--disable-slash-commands"],
+      "agy_permission_allow": ["read_file(/ap-review-bundle)"],
+      "agy_extra_permission_deny": ["write_file(*)", "command(*)"],
+      "dynamic_elf_libs": true,
+      "mount_tool_sock": false,
+      "readonly_worktree_dot_git": false,
+      "readonly_review_bundle_mount": "/ap-review-bundle",
+      "verdict_handoff_channel": "stdout_json_validated_by_host",
+      "writable_mounts": ["sandbox_home"]
     }
   },
   "execution_rings": {
@@ -201,6 +283,16 @@
     "**/.claude/**",
     ".codex/**",
     "**/.codex/**",
+    ".agents/**",
+    "**/.agents/**",
+    ".agent/**",
+    "**/.agent/**",
+    "_agent/**",
+    "**/_agent/**",
+    "_agents/**",
+    "**/_agents/**",
+    ".gemini/**",
+    "**/.gemini/**",
     ".cursor/**",
     "**/.cursor/**",
     ".cursorrules",

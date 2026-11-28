@@ -38,6 +38,27 @@ def sync_project_pitfalls_markdown(
     return pit_md
 
 
+def count_matureable_runs(db: AutopilotDB, *, now: dt.datetime | None = None) -> int:
+    """Count clean published runs eligible for Dream 48h maturation (shared by precheck and consolidator)."""
+    ref_now = now or now_utc()
+    maturity_hours = int(POLICY_MANIFEST["chef_pipeline"]["staircase_maturity_hours"])
+    cutoff_iso = (ref_now - dt.timedelta(hours=maturity_hours)).replace(microsecond=0).isoformat()
+    row = db._conn.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM run_history h
+        JOIN work_units u ON u.unit_key = h.unit_key
+        WHERE h.status = 'published'
+          AND h.matured_clean = 0
+          AND h.completed_at <= ?
+          AND u.veto_pending = 0
+          AND COALESCE(u.terminal_state, '') != 'needs-human'
+        """,
+        (cutoff_iso,),
+    ).fetchone()
+    return int(row["c"]) if row else 0
+
+
 def run_dream_consolidation(
     db: AutopilotDB,
     *,

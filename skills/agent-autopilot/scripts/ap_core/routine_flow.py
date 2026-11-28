@@ -599,8 +599,10 @@ def probe_project_zero_token(cfg: WorkflowConfig, db: AutopilotDB) -> dict[str, 
         if cfg.routine_driver == "lark_payments":
             return probe_lark_payments_zero_token(cfg, db)
         if cfg.routine_driver == "dream":
+            from .dream import count_matureable_runs
+
             cnt = db._conn.execute("SELECT COUNT(*) AS c FROM pitfalls").fetchone()["c"]
-            hist = db._conn.execute("SELECT COUNT(*) AS c FROM run_history WHERE matured_clean = 0").fetchone()["c"]
+            hist = count_matureable_runs(db)
             return {
                 "actionable": int(cnt) > 0 or int(hist) > 0,
                 "reason": f"pitfalls={cnt},unmatured_runs={hist}",

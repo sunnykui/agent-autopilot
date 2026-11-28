@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import json
+import math
 import sqlite3
 import sys
 import threading
@@ -19,6 +20,7 @@ from .models import (
     PENDING_OP_STATUSES,
     POLICY_MANIFEST,
     SUPERVISOR_ADMIN_ACTIONS,
+    VALID_MODEL_FAMILIES,
     AutopilotError,
     PrSnapshot,
     ScopeConflictError,
@@ -31,6 +33,7 @@ from .models import (
     now_utc,
     open_dir_nofollow,
     resolve_cross_family_referee,
+    resolve_cross_family_referees,
 )
 
 _CODEX_DISPATCH_SCRIPTS = Path(__file__).resolve().parents[3] / "codex-dispatch" / "scripts"
@@ -98,6 +101,8 @@ CREATE TABLE IF NOT EXISTS work_units (
     last_error TEXT,
     approved_protected_paths_json TEXT NOT NULL DEFAULT '[]',
     blocked_protected_paths_json TEXT,
+    current_review_attempt_id TEXT,
+    current_approved_attempt_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -122,6 +127,8 @@ CREATE TABLE IF NOT EXISTS run_claims (
     frozen_write_scope_json TEXT NOT NULL,
     frozen_merge_paths_json TEXT NOT NULL,
     frozen_approved_protected_paths_json TEXT NOT NULL DEFAULT '[]',
+    frozen_writer_family TEXT NOT NULL DEFAULT '',
+    frozen_referee_families_json TEXT NOT NULL DEFAULT '[]',
     merge_method TEXT NOT NULL,
     unit_kind TEXT NOT NULL DEFAULT 'issue',
     run_dir TEXT NOT NULL DEFAULT '',
@@ -167,6 +174,7 @@ CREATE TABLE IF NOT EXISTS external_ops (
     conflicting_pr_id TEXT,
     error_detail TEXT,
     superseded_by_op_id TEXT,
+    authorized_attempt_id TEXT,
     prepared_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -176,6 +184,7 @@ CREATE INDEX IF NOT EXISTS idx_external_ops_pr ON external_ops(pr_id, status) WH
 CREATE TABLE IF NOT EXISTS verify_receipts (
     unit_key TEXT NOT NULL,
     candidate_sha TEXT NOT NULL,
+    claim_epoch INTEGER,
     dod_cmd TEXT NOT NULL,
     exit_code INTEGER NOT NULL,
     ui_verified INTEGER NOT NULL DEFAULT 0,
@@ -185,10 +194,26 @@ CREATE TABLE IF NOT EXISTS verify_receipts (
     PRIMARY KEY(unit_key, candidate_sha)
 );
 
+CREATE TABLE IF NOT EXISTS review_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    unit_key TEXT NOT NULL,
+    claim_epoch INTEGER NOT NULL,
+    candidate_sha TEXT NOT NULL,
+    round_index INTEGER NOT NULL,
+    writer_family TEXT NOT NULL,
+    required_referees_json TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('open', 'approved', 'revise', 'aborted_quota', 'failed')),
+    created_at TEXT NOT NULL,
+    settled_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_review_attempts_claim ON review_attempts(claim_epoch, candidate_sha, state);
+
 CREATE TABLE IF NOT EXISTS review_receipts (
     unit_key TEXT NOT NULL,
     candidate_sha TEXT NOT NULL,
     round_index INTEGER NOT NULL,
+    attempt_id TEXT NOT NULL DEFAULT '',
+    claim_epoch INTEGER,
     writer_family TEXT NOT NULL,
     referee_family TEXT NOT NULL,
     referee_model TEXT NOT NULL,
@@ -197,20 +222,57 @@ CREATE TABLE IF NOT EXISTS review_receipts (
     defects_json TEXT NOT NULL,
     raw_path TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    PRIMARY KEY(unit_key, candidate_sha, round_index)
+    PRIMARY KEY(unit_key, candidate_sha, round_index, referee_family, attempt_id)
 );
 
 CREATE TABLE IF NOT EXISTS run_history (
     run_id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL,
     unit_key TEXT NOT NULL,
+    claim_epoch INTEGER,
     status TEXT NOT NULL,
     duration_ms INTEGER NOT NULL DEFAULT 0,
     input_tokens INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    thinking_tokens INTEGER NOT NULL DEFAULT 0,
     cost_usd REAL NOT NULL DEFAULT 0.0,
+    cost_known INTEGER NOT NULL DEFAULT 0,
+    cost_known_turns INTEGER NOT NULL DEFAULT 0,
+    total_turns INTEGER NOT NULL DEFAULT 0,
     completed_at TEXT NOT NULL,
     matured_clean INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS turn_usage_ledger (
+    turn_id TEXT PRIMARY KEY,
+    claim_epoch INTEGER NOT NULL,
+    unit_key TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    family TEXT NOT NULL,
+    model TEXT NOT NULL,
+    status TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    thinking_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL,
+    cost_known INTEGER NOT NULL DEFAULT 0,
+    usage_known INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_turn_usage_claim ON turn_usage_ledger(claim_epoch);
+
+CREATE TABLE IF NOT EXISTS receipt_audit_log (
+    audit_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    unit_key TEXT NOT NULL,
+    candidate_sha TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS pitfalls (
@@ -255,7 +317,11 @@ _COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("work_units", "scope_quarantined", "INTEGER NOT NULL DEFAULT 0"),
     ("work_units", "approved_protected_paths_json", "TEXT NOT NULL DEFAULT '[]'"),
     ("work_units", "blocked_protected_paths_json", "TEXT"),
+    ("work_units", "current_review_attempt_id", "TEXT"),
+    ("work_units", "current_approved_attempt_id", "TEXT"),
     ("run_claims", "frozen_approved_protected_paths_json", "TEXT NOT NULL DEFAULT '[]'"),
+    ("run_claims", "frozen_writer_family", "TEXT NOT NULL DEFAULT ''"),
+    ("run_claims", "frozen_referee_families_json", "TEXT NOT NULL DEFAULT '[]'"),
     ("run_claims", "repo", "TEXT NOT NULL DEFAULT ''"),
     ("run_claims", "cleanup_unit_name", "TEXT"),
     ("run_claims", "cleanup_cgroup_dir", "TEXT"),
@@ -280,7 +346,18 @@ _COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("external_ops", "grant_token", "TEXT"),
     ("external_ops", "send_consumed", "INTEGER NOT NULL DEFAULT 0"),
     ("external_ops", "conflicting_pr_id", "TEXT"),
+    ("external_ops", "authorized_attempt_id", "TEXT"),
     ("verify_receipts", "touched_paths_json", "TEXT NOT NULL DEFAULT '[]'"),
+    ("verify_receipts", "claim_epoch", "INTEGER"),
+    ("review_receipts", "claim_epoch", "INTEGER"),
+    ("run_history", "claim_epoch", "INTEGER"),
+    ("run_history", "cache_read_tokens", "INTEGER NOT NULL DEFAULT 0"),
+    ("run_history", "cache_write_tokens", "INTEGER NOT NULL DEFAULT 0"),
+    ("run_history", "thinking_tokens", "INTEGER NOT NULL DEFAULT 0"),
+    ("run_history", "cost_known", "INTEGER NOT NULL DEFAULT 0"),
+    ("run_history", "cost_known_turns", "INTEGER NOT NULL DEFAULT 0"),
+    ("run_history", "total_turns", "INTEGER NOT NULL DEFAULT 0"),
+    ("turn_usage_ledger", "cost_known", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -355,6 +432,132 @@ class AutopilotDB:
                     }
                     if col not in existing_cols:
                         self._conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {col_def}")
+                        if tbl == "turn_usage_ledger" and col == "cost_known":
+                            # Only promote non-Codex legacy rows whose single-turn cost is guaranteed complete;
+                            # legacy Codex rows may be multi-thread partial subtotals so keep cost_known=0!
+                            self._conn.execute(
+                                "UPDATE turn_usage_ledger SET cost_known = 1 WHERE cost_usd IS NOT NULL AND family != 'codex'"
+                            )
+                # Migrate legacy 3-column PK review_receipts to attempt+referee-scoped PK preserving every row!
+                rr_info = self._conn.execute("PRAGMA table_info(review_receipts)").fetchall()
+                rr_cols = {str(r["name"]) for r in rr_info}
+                rr_pk_cols = [str(r["name"]) for r in sorted((r for r in rr_info if int(r["pk"]) > 0), key=lambda r: int(r["pk"]))]
+                expected_rr_pk = ["unit_key", "candidate_sha", "round_index", "referee_family", "attempt_id"]
+                if rr_pk_cols != expected_rr_pk:
+                    cnt_before = int(self._conn.execute("SELECT COUNT(*) AS c FROM review_receipts").fetchone()["c"])
+                    self._conn.execute("DROP TABLE IF EXISTS review_receipts_v17")
+                    self._conn.execute(
+                        """
+                        CREATE TABLE review_receipts_v17 (
+                            unit_key TEXT NOT NULL,
+                            candidate_sha TEXT NOT NULL,
+                            round_index INTEGER NOT NULL,
+                            attempt_id TEXT NOT NULL DEFAULT '',
+                            claim_epoch INTEGER,
+                            writer_family TEXT NOT NULL,
+                            referee_family TEXT NOT NULL,
+                            referee_model TEXT NOT NULL,
+                            verdict TEXT NOT NULL,
+                            defect_count INTEGER NOT NULL,
+                            defects_json TEXT NOT NULL,
+                            raw_path TEXT NOT NULL,
+                            created_at TEXT NOT NULL,
+                            PRIMARY KEY(unit_key, candidate_sha, round_index, referee_family, attempt_id)
+                        )
+                        """
+                    )
+                    att_expr = "COALESCE(attempt_id, '')" if "attempt_id" in rr_cols else "''"
+                    ce_expr = "claim_epoch" if "claim_epoch" in rr_cols else "NULL"
+                    self._conn.execute(
+                        f"""
+                        INSERT INTO review_receipts_v17(
+                            unit_key, candidate_sha, round_index, attempt_id, claim_epoch, writer_family, referee_family,
+                            referee_model, verdict, defect_count, defects_json, raw_path, created_at
+                        )
+                        SELECT
+                            unit_key, candidate_sha, round_index, {att_expr}, {ce_expr}, writer_family, referee_family,
+                            referee_model, verdict, defect_count, defects_json, raw_path, created_at
+                        FROM review_receipts
+                        """
+                    )
+                    cnt_after = int(self._conn.execute("SELECT COUNT(*) AS c FROM review_receipts_v17").fetchone()["c"])
+                    if cnt_after != cnt_before:
+                        raise AutopilotError(f"review_receipts migration row-count mismatch: {cnt_after} != {cnt_before}")
+                    self._conn.execute("DROP TABLE review_receipts")
+                    self._conn.execute("ALTER TABLE review_receipts_v17 RENAME TO review_receipts")
+                # Move any legacy unattributed (`claim_epoch IS NULL`) receipts out of active tables into `receipt_audit_log`
+                # so new claim-bound receipts never overwrite them or collide with legacy PKs!
+                legacy_vr = self._conn.execute(
+                    "SELECT unit_key, candidate_sha, dod_cmd, exit_code, ui_verified, touched_paths_json, artifact_dir, created_at "
+                    "FROM verify_receipts WHERE claim_epoch IS NULL"
+                ).fetchall()
+                for lvr in legacy_vr:
+                    self._conn.execute(
+                        """
+                        INSERT INTO receipt_audit_log(audit_id, kind, unit_key, candidate_sha, payload_json, created_at)
+                        VALUES (?, 'verify', ?, ?, ?, ?)
+                        """,
+                        (
+                            f"mig-vr-{uuid.uuid4().hex[:16]}",
+                            str(lvr["unit_key"]),
+                            str(lvr["candidate_sha"]),
+                            json.dumps(
+                                {
+                                    "migrated_legacy": True,
+                                    "dod_cmd": str(lvr["dod_cmd"] or ""),
+                                    "exit_code": int(lvr["exit_code"]),
+                                    "ui_verified": bool(lvr["ui_verified"]),
+                                    "touched_paths_json": str(lvr["touched_paths_json"] or "[]"),
+                                    "artifact_dir": str(lvr["artifact_dir"] or ""),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            str(lvr["created_at"] or now_iso()),
+                        ),
+                    )
+                if legacy_vr:
+                    self._conn.execute("DELETE FROM verify_receipts WHERE claim_epoch IS NULL")
+                legacy_rr = self._conn.execute(
+                    "SELECT unit_key, candidate_sha, round_index, attempt_id, writer_family, referee_family, "
+                    "referee_model, verdict, defect_count, defects_json, raw_path, created_at "
+                    "FROM review_receipts WHERE claim_epoch IS NULL"
+                ).fetchall()
+                for lrr in legacy_rr:
+                    self._conn.execute(
+                        """
+                        INSERT INTO receipt_audit_log(audit_id, kind, unit_key, candidate_sha, payload_json, created_at)
+                        VALUES (?, 'review', ?, ?, ?, ?)
+                        """,
+                        (
+                            f"mig-rr-{uuid.uuid4().hex[:16]}",
+                            str(lrr["unit_key"]),
+                            str(lrr["candidate_sha"]),
+                            json.dumps(
+                                {
+                                    "migrated_legacy": True,
+                                    "round_index": int(lrr["round_index"]),
+                                    "attempt_id": str(lrr["attempt_id"] or ""),
+                                    "writer_family": str(lrr["writer_family"] or ""),
+                                    "referee_family": str(lrr["referee_family"] or ""),
+                                    "referee_model": str(lrr["referee_model"] or ""),
+                                    "verdict": str(lrr["verdict"] or ""),
+                                    "defect_count": int(lrr["defect_count"]),
+                                    "defects_json": str(lrr["defects_json"] or "[]"),
+                                    "raw_path": str(lrr["raw_path"] or ""),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            str(lrr["created_at"] or now_iso()),
+                        ),
+                    )
+                if legacy_rr:
+                    self._conn.execute("DELETE FROM review_receipts WHERE claim_epoch IS NULL")
+                self._conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_review_receipts_attempt_ref ON review_receipts(attempt_id, referee_family) WHERE attempt_id != ''"
+                )
+                self._conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_run_history_claim_epoch ON run_history(claim_epoch) WHERE claim_epoch IS NOT NULL"
+                )
                 # Conservatively mark ANY pre-migration in_flight OR unknown_paused row lacking grant_token as send_consumed=1
                 self._conn.execute(
                     "UPDATE external_ops SET send_consumed = 1 WHERE status IN ('in_flight', 'unknown_paused') AND grant_token IS NULL AND send_consumed = 0"
@@ -481,13 +684,13 @@ class AutopilotDB:
             self._tx_depth = 1
             try:
                 yield self._conn
-            except BaseException:
-                if self._conn.in_transaction:
-                    self._conn.execute("ROLLBACK")
-                raise
-            else:
                 if self._conn.in_transaction:
                     self._conn.execute("COMMIT")
+            except BaseException:
+                if self._conn.in_transaction:
+                    with contextlib.suppress(sqlite3.Error):
+                        self._conn.execute("ROLLBACK")
+                raise
             finally:
                 self._tx_depth = 0
 
@@ -1054,6 +1257,8 @@ class AutopilotDB:
                         _os.close(_rfd)
 
             rd_state = "bound" if (run_dir_dev is not None and run_dir_ino is not None) else "uncreated"
+            frozen_writer = str(cfg.writer_family or "codex").strip()
+            frozen_refs = resolve_cross_family_referees(frozen_writer, cfg.referee_families)
             claim_epoch = self._next_counter_in_tx("claim_epoch")
             ts = now_iso()
             self._conn.execute(
@@ -1062,11 +1267,11 @@ class AutopilotDB:
                     claim_epoch, unit_key, project_id, repo, slot_vector_json, worker_unit_name,
                     expected_cgroup_dir, base_sha, authorized_base_ref, authorized_head_ref,
                     policy_version, effective_tier, frozen_write_scope_json, frozen_merge_paths_json,
-                    frozen_approved_protected_paths_json,
+                    frozen_approved_protected_paths_json, frozen_writer_family, frozen_referee_families_json,
                     merge_method, unit_kind, run_dir, run_dir_dev, run_dir_ino, run_dir_state, cred_ledger_tracked, worktree_path, managed_gitdir,
                     frozen_cache_dir, frozen_cache_dev, frozen_cache_ino, path_recorded,
                     bound_gh_login, ephemeral_token_file, state, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, ?, ?, ?, ?, ?, 1, ?, ?, 'active', ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, ?, ?, ?, ?, ?, 1, ?, ?, 'active', ?)
                 """,
                 (
                     claim_epoch,
@@ -1084,6 +1289,8 @@ class AutopilotDB:
                     json.dumps(list(cfg.write_scope)),
                     json.dumps(list(cfg.merge_paths)),
                     str(urow["approved_protected_paths_json"] or "[]"),
+                    frozen_writer,
+                    json.dumps(list(frozen_refs)),
                     cfg.merge_method,
                     cfg.kind,
                     run_dir,
@@ -1163,7 +1370,7 @@ class AutopilotDB:
                 (op_seq, ts, unit_key),
             )
             self._conn.execute(
-                "UPDATE work_units SET current_candidate_sha = ?, updated_at = ? WHERE unit_key = ?",
+                "UPDATE work_units SET current_candidate_sha = ?, current_review_attempt_id = NULL, current_approved_attempt_id = NULL, updated_at = ? WHERE unit_key = ?",
                 (candidate_sha, ts, unit_key),
             )
 
@@ -1280,12 +1487,13 @@ class AutopilotDB:
                         f"prepare_op rejected conflicting payload[{pkey!r}]={pl[pkey]!r} != {auth_v!r}"
                     )
 
+            auth_attempt_id: str | None = None
             if op_type in CANDIDATE_BOUND_WORKER_ACTIONS:
                 if not eff_cand or eff_cand != urow["current_candidate_sha"]:
                     raise AutopilotError(
                         f"{op_type} requires candidate_sha matching current_candidate_sha={urow['current_candidate_sha']!r}"
                     )
-                self._verify_publish_receipts_in_tx(unit_key, str(eff_cand))
+                auth_attempt_id = self._verify_publish_receipts_in_tx(unit_key, str(eff_cand), claim_epoch=claim_epoch)
                 if op_type in ("enqueue_pr", "merge_pr"):
                     self._check_t3_and_ready_prereqs_in_tx(
                         unit_key=unit_key,
@@ -1303,8 +1511,8 @@ class AutopilotDB:
                 INSERT INTO external_ops(
                     op_id, op_seq, unit_key, project_id, pr_id, op_type, owner_kind, owner_epoch, claim_epoch,
                     candidate_sha, authorized_base_ref, authorized_head_ref, ref_id_hmac, payload_json,
-                    status, send_consumed, prepared_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'worker', ?, ?, ?, ?, ?, ?, ?, 'prepared_local', 0, ?, ?)
+                    status, send_consumed, authorized_attempt_id, prepared_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'worker', ?, ?, ?, ?, ?, ?, ?, 'prepared_local', 0, ?, ?, ?)
                 """,
                 (
                     new_id,
@@ -1320,6 +1528,7 @@ class AutopilotDB:
                     crow["authorized_head_ref"],
                     ref_id_hmac,
                     json.dumps(pl, ensure_ascii=False),
+                    auth_attempt_id,
                     ts,
                     ts,
                 ),
@@ -1387,6 +1596,15 @@ class AutopilotDB:
                     return SendGrant(False, op_id, op_type, caller_owner_kind, caller_epoch, unit_key=unit_key)
                 if op_type in CANDIDATE_BOUND_WORKER_ACTIONS:
                     if not urow or urow["current_candidate_sha"] != row["candidate_sha"]:
+                        return SendGrant(False, op_id, op_type, caller_owner_kind, caller_epoch, unit_key=unit_key)
+                    try:
+                        self._verify_publish_receipts_in_tx(
+                            unit_key,
+                            str(row["candidate_sha"]),
+                            claim_epoch=caller_epoch,
+                            expected_attempt_id=row["authorized_attempt_id"],
+                        )
+                    except AutopilotError:
                         return SendGrant(False, op_id, op_type, caller_owner_kind, caller_epoch, unit_key=unit_key)
                     if op_type in ("enqueue_pr", "merge_pr"):
                         try:
@@ -1509,6 +1727,37 @@ class AutopilotDB:
                 )
                 conflict_reason = int_reason
             else:
+                if (
+                    row["owner_kind"] == "worker"
+                    and row["op_type"] in CANDIDATE_BOUND_WORKER_ACTIONS
+                    and row["claim_epoch"] is not None
+                    and row["candidate_sha"]
+                ):
+                    try:
+                        self._verify_publish_receipts_in_tx(
+                            str(row["unit_key"]),
+                            str(row["candidate_sha"]),
+                            claim_epoch=int(row["claim_epoch"]),
+                            expected_attempt_id=row["authorized_attempt_id"],
+                        )
+                    except AutopilotError as exc_rev:
+                        # Settle unsendable op to `not_executed` with unsent_proof so it never wedges the unit as `in_flight`!
+                        ts_inv = now_iso()
+                        seq_inv = self._next_counter_in_tx("op_seq")
+                        self._conn.execute(
+                            """
+                            UPDATE external_ops
+                            SET status = 'not_executed',
+                                unsent_proof = 'review_receipt_invalidated_pre_send',
+                                error_detail = ?,
+                                grant_token = '',
+                                op_seq = ?,
+                                updated_at = ?
+                            WHERE op_id = ? AND status = 'in_flight' AND send_consumed = 0
+                            """,
+                            (str(exc_rev), seq_inv, ts_inv, grant.op_id),
+                        )
+                        return False
                 seq = self._next_counter_in_tx("op_seq")
                 cur = self._conn.execute(
                     """
@@ -1879,6 +2128,8 @@ class AutopilotDB:
                         waiting_until = NULL,
                         failure_streak = 0,
                         review_rounds_used = 0,
+                        current_review_attempt_id = NULL,
+                        current_approved_attempt_id = NULL,
                         last_error = NULL,
                         updated_at = ?
                     WHERE unit_key = ?
@@ -2148,19 +2399,294 @@ class AutopilotDB:
                     (wake_at_iso, reason, now_iso(), unit_key),
                 )
 
-    def mark_unit_published(self, unit_key: str, *, duration_ms: int = 0) -> None:
+    def record_turn_usage(
+        self,
+        *,
+        turn_id: str,
+        claim_epoch: int,
+        unit_key: str,
+        project_id: str,
+        role: str,
+        family: str,
+        model: str,
+        status: str,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        thinking_tokens: int = 0,
+        cost_usd: float | None = None,
+        cost_known: bool | None = None,
+        usage_known: bool = False,
+    ) -> None:
+        """Idempotently persist one model turn's token/cost telemetry into `turn_usage_ledger`."""
+        def _clean_int(v: Any) -> int:
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                return 0
+            return v
+
+        clean_cost: float | None = None
+        if cost_usd is not None and not isinstance(cost_usd, bool) and isinstance(cost_usd, (int, float)):
+            f = float(cost_usd)
+            if math.isfinite(f) and f >= 0.0:
+                clean_cost = f
+        eff_cost_known = (clean_cost is not None) if cost_known is None else (bool(cost_known) and clean_cost is not None)
+
+        with self.immediate_tx():
+            self._conn.execute(
+                """
+                INSERT OR IGNORE INTO turn_usage_ledger(
+                    turn_id, claim_epoch, unit_key, project_id, role, family, model, status,
+                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, thinking_tokens,
+                    cost_usd, cost_known, usage_known, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(turn_id),
+                    int(claim_epoch),
+                    str(unit_key),
+                    str(project_id),
+                    str(role),
+                    str(family),
+                    str(model),
+                    str(status),
+                    _clean_int(input_tokens),
+                    _clean_int(output_tokens),
+                    _clean_int(cache_read_tokens),
+                    _clean_int(cache_write_tokens),
+                    _clean_int(thinking_tokens),
+                    clean_cost,
+                    1 if eff_cost_known else 0,
+                    1 if usage_known else 0,
+                    now_iso(),
+                ),
+            )
+
+    def summarize_claim_usage(self, claim_epoch: int, *, expected_turns: int | None = None) -> dict[str, Any]:
+        """Aggregate all recorded turn usage for `claim_epoch`."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT
+                    COALESCE(SUM(input_tokens), 0) AS in_tok,
+                    COALESCE(SUM(output_tokens), 0) AS out_tok,
+                    COALESCE(SUM(cache_read_tokens), 0) AS cr_tok,
+                    COALESCE(SUM(cache_write_tokens), 0) AS cw_tok,
+                    COALESCE(SUM(thinking_tokens), 0) AS thk_tok,
+                    COALESCE(SUM(CASE WHEN cost_usd IS NOT NULL THEN cost_usd ELSE 0.0 END), 0.0) AS cost_sum,
+                    SUM(CASE WHEN cost_usd IS NOT NULL THEN 1 ELSE 0 END) AS cost_present_cnt,
+                    SUM(CASE WHEN cost_known = 1 AND cost_usd IS NOT NULL THEN 1 ELSE 0 END) AS cost_known_cnt,
+                    COUNT(*) AS turn_cnt
+                FROM turn_usage_ledger
+                WHERE claim_epoch = ?
+                """,
+                (int(claim_epoch),),
+            ).fetchone()
+            assert row is not None
+            cp_cnt = int(row["cost_present_cnt"] or 0)
+            ck_cnt = int(row["cost_known_cnt"] or 0)
+            tot_cnt = int(row["turn_cnt"] or 0)
+            eff_tot = max(tot_cnt, int(expected_turns)) if expected_turns is not None else tot_cnt
+            is_complete = eff_tot > 0 and ck_cnt == eff_tot
+            return {
+                "input_tokens": int(row["in_tok"] or 0),
+                "output_tokens": int(row["out_tok"] or 0),
+                "cache_read_tokens": int(row["cr_tok"] or 0),
+                "cache_write_tokens": int(row["cw_tok"] or 0),
+                "thinking_tokens": int(row["thk_tok"] or 0),
+                "cost_usd": float(row["cost_sum"] or 0.0),
+                "cost_known": is_complete,
+                "cost_partial": cp_cnt > 0 and not is_complete,
+                "cost_known_turns": ck_cnt,
+                "total_turns": eff_tot,
+            }
+
+    def record_claim_run_history(
+        self,
+        *,
+        claim_epoch: int,
+        unit_key: str,
+        status: str,
+        duration_ms: int = 0,
+        expected_turns: int | None = None,
+    ) -> None:
+        """Idempotently persist claim telemetry into `run_history` (even for non-published exits like needs-human/waiting_quota)."""
         with self.immediate_tx():
             urow = self._conn.execute("SELECT project_id FROM work_units WHERE unit_key = ?", (unit_key,)).fetchone()
             if urow is None:
                 return
+            agg = self.summarize_claim_usage(claim_epoch, expected_turns=expected_turns)
+            ts = now_iso()
+            existing = self._conn.execute(
+                "SELECT run_id, status FROM run_history WHERE claim_epoch = ?",
+                (int(claim_epoch),),
+            ).fetchone()
+            if existing is not None:
+                if str(existing["status"]) == "published":
+                    return
+                self._conn.execute(
+                    """
+                    UPDATE run_history
+                    SET status = ?, duration_ms = ?, input_tokens = ?, output_tokens = ?,
+                        cache_read_tokens = ?, cache_write_tokens = ?, thinking_tokens = ?,
+                        cost_usd = ?, cost_known = ?, cost_known_turns = ?, total_turns = ?, completed_at = ?
+                    WHERE claim_epoch = ?
+                    """,
+                    (
+                        str(status),
+                        int(duration_ms),
+                        agg["input_tokens"],
+                        agg["output_tokens"],
+                        agg["cache_read_tokens"],
+                        agg["cache_write_tokens"],
+                        agg["thinking_tokens"],
+                        agg["cost_usd"],
+                        1 if agg["cost_known"] else 0,
+                        agg["cost_known_turns"],
+                        agg["total_turns"],
+                        ts,
+                        int(claim_epoch),
+                    ),
+                )
+                return
+            self._conn.execute(
+                """
+                INSERT INTO run_history(
+                    run_id, project_id, unit_key, claim_epoch, status, duration_ms,
+                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, thinking_tokens,
+                    cost_usd, cost_known, cost_known_turns, total_turns, completed_at, matured_clean
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                """,
+                (
+                    f"run-c{int(claim_epoch)}",
+                    urow["project_id"],
+                    unit_key,
+                    int(claim_epoch),
+                    str(status),
+                    int(duration_ms),
+                    agg["input_tokens"],
+                    agg["output_tokens"],
+                    agg["cache_read_tokens"],
+                    agg["cache_write_tokens"],
+                    agg["thinking_tokens"],
+                    agg["cost_usd"],
+                    1 if agg["cost_known"] else 0,
+                    agg["cost_known_turns"],
+                    agg["total_turns"],
+                    ts,
+                ),
+            )
+
+    def mark_unit_published(
+        self,
+        unit_key: str,
+        *,
+        duration_ms: int = 0,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        thinking_tokens: int = 0,
+        cost_usd: float | None = None,
+        cost_known: bool | None = None,
+        claim_epoch: int | None = None,
+    ) -> None:
+        with self.immediate_tx():
+            urow = self._conn.execute("SELECT project_id FROM work_units WHERE unit_key = ?", (unit_key,)).fetchone()
+            if urow is None:
+                return
+            eff_in = 0
+            eff_out = 0
+            eff_cr = max(0, int(cache_read_tokens))
+            eff_cw = max(0, int(cache_write_tokens))
+            eff_thk = max(0, int(thinking_tokens))
+            eff_cost = 0.0
+            eff_cost_known = 0
+            eff_ck_turns = 0
+            eff_tot_turns = 0
+            if claim_epoch is not None and input_tokens is None and output_tokens is None:
+                agg = self.summarize_claim_usage(claim_epoch)
+                eff_in = agg["input_tokens"]
+                eff_out = agg["output_tokens"]
+                eff_cr = agg["cache_read_tokens"]
+                eff_cw = agg["cache_write_tokens"]
+                eff_thk = agg["thinking_tokens"]
+                eff_cost = agg["cost_usd"]
+                eff_cost_known = 1 if agg["cost_known"] else 0
+                eff_ck_turns = agg["cost_known_turns"]
+                eff_tot_turns = agg["total_turns"]
+            else:
+                eff_in = max(0, int(input_tokens or 0))
+                eff_out = max(0, int(output_tokens or 0))
+                if cost_usd is not None and not isinstance(cost_usd, bool) and math.isfinite(float(cost_usd)) and float(cost_usd) >= 0.0:
+                    eff_cost = float(cost_usd)
+                    eff_cost_known = 1 if (cost_known is None or cost_known) else 0
+                    eff_ck_turns = 1 if eff_cost_known else 0
+                    eff_tot_turns = 1
+                elif cost_known:
+                    eff_cost_known = 1
             ts = now_iso()
             self._conn.execute(
                 "UPDATE work_units SET status = 'published', failure_streak = 0, updated_at = ? WHERE unit_key = ?",
                 (ts, unit_key),
             )
+            if claim_epoch is not None:
+                existing = self._conn.execute(
+                    "SELECT run_id, status FROM run_history WHERE claim_epoch = ?",
+                    (int(claim_epoch),),
+                ).fetchone()
+                if existing is not None:
+                    if str(existing["status"]) == "published":
+                        return
+                    self._conn.execute(
+                        """
+                        UPDATE run_history
+                        SET status = 'published', duration_ms = ?, input_tokens = ?, output_tokens = ?,
+                            cache_read_tokens = ?, cache_write_tokens = ?, thinking_tokens = ?,
+                            cost_usd = ?, cost_known = ?, cost_known_turns = ?, total_turns = ?, completed_at = ?
+                        WHERE claim_epoch = ?
+                        """,
+                        (
+                            int(duration_ms),
+                            eff_in,
+                            eff_out,
+                            eff_cr,
+                            eff_cw,
+                            eff_thk,
+                            eff_cost,
+                            eff_cost_known,
+                            eff_ck_turns,
+                            eff_tot_turns,
+                            ts,
+                            int(claim_epoch),
+                        ),
+                    )
+                    return
             self._conn.execute(
-                "INSERT INTO run_history(run_id, project_id, unit_key, status, duration_ms, completed_at, matured_clean) VALUES (?, ?, ?, 'published', ?, ?, 0)",
-                (f"run-{uuid.uuid4().hex[:14]}", urow["project_id"], unit_key, int(duration_ms), ts),
+                """
+                INSERT INTO run_history(
+                    run_id, project_id, unit_key, claim_epoch, status, duration_ms,
+                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, thinking_tokens,
+                    cost_usd, cost_known, cost_known_turns, total_turns, completed_at, matured_clean
+                ) VALUES (?, ?, ?, ?, 'published', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                """,
+                (
+                    f"run-c{int(claim_epoch)}" if claim_epoch is not None else f"run-{uuid.uuid4().hex[:14]}",
+                    urow["project_id"],
+                    unit_key,
+                    int(claim_epoch) if claim_epoch is not None else None,
+                    int(duration_ms),
+                    eff_in,
+                    eff_out,
+                    eff_cr,
+                    eff_cw,
+                    eff_thk,
+                    eff_cost,
+                    eff_cost_known,
+                    eff_ck_turns,
+                    eff_tot_turns,
+                    ts,
+                ),
             )
 
     def mark_unit_done(self, unit_key: str) -> None:
@@ -2270,17 +2796,52 @@ class AutopilotDB:
         ui_verified: bool,
         artifact_dir: str,
         touched_paths: list[str] | tuple[str, ...] = (),
+        claim_epoch: int | None = None,
     ) -> None:
         with self.immediate_tx():
+            if claim_epoch is None:
+                # Unattributed audit-only verify receipt: store in isolated audit log so it NEVER overwrites active claim receipts!
+                self._conn.execute(
+                    """
+                    INSERT INTO receipt_audit_log(audit_id, kind, unit_key, candidate_sha, payload_json, created_at)
+                    VALUES (?, 'verify', ?, ?, ?, ?)
+                    """,
+                    (
+                        f"aud-{uuid.uuid4().hex[:16]}",
+                        unit_key,
+                        candidate_sha,
+                        json.dumps(
+                            {
+                                "dod_cmd": dod_cmd,
+                                "exit_code": int(exit_code),
+                                "ui_verified": bool(ui_verified),
+                                "touched_paths": list(touched_paths),
+                                "artifact_dir": artifact_dir,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        now_iso(),
+                    ),
+                )
+                return
+            crow = self._conn.execute(
+                "SELECT state, unit_key FROM run_claims WHERE claim_epoch = ?",
+                (int(claim_epoch),),
+            ).fetchone()
+            if crow is None or crow["state"] != "active" or str(crow["unit_key"]) != unit_key:
+                raise AutopilotError(
+                    f"Cannot record verify_receipt: inactive or mismatched claim_epoch={claim_epoch} for {unit_key}"
+                )
             self._conn.execute(
                 """
                 INSERT OR REPLACE INTO verify_receipts(
-                    unit_key, candidate_sha, dod_cmd, exit_code, ui_verified, touched_paths_json, artifact_dir, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    unit_key, candidate_sha, claim_epoch, dod_cmd, exit_code, ui_verified, touched_paths_json, artifact_dir, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     unit_key,
                     candidate_sha,
+                    int(claim_epoch),
                     dod_cmd,
                     int(exit_code),
                     int(ui_verified),
@@ -2309,6 +2870,262 @@ class AutopilotDB:
             )
             return nxt
 
+    def _parse_claim_frozen_families(self, crow: sqlite3.Row) -> tuple[str, tuple[str, ...]]:
+        """Extract and validate `(frozen_writer_family, frozen_referee_families)` from `run_claims`."""
+        keys = set(crow.keys())
+        raw_w = str(crow["frozen_writer_family"] or "").strip() if "frozen_writer_family" in keys else ""
+        raw_refs_json = str(crow["frozen_referee_families_json"] or "[]").strip() if "frozen_referee_families_json" in keys else "[]"
+        if raw_w and raw_w not in VALID_MODEL_FAMILIES:
+            raise AutopilotError(f"Corrupt frozen_writer_family={raw_w!r} on claim_epoch={crow['claim_epoch']}")
+        try:
+            parsed_refs = json.loads(raw_refs_json or "[]")
+        except json.JSONDecodeError as exc:
+            raise AutopilotError(f"Corrupt frozen_referee_families_json on claim_epoch={crow['claim_epoch']}") from exc
+        if not isinstance(parsed_refs, list):
+            raise AutopilotError(f"frozen_referee_families_json must be a list on claim_epoch={crow['claim_epoch']}")
+        refs: list[str] = []
+        for rf in parsed_refs:
+            if not isinstance(rf, str) or rf not in VALID_MODEL_FAMILIES:
+                raise AutopilotError(f"Invalid frozen referee family {rf!r} on claim_epoch={crow['claim_epoch']}")
+            if raw_w and rf == raw_w:
+                raise AutopilotError(f"Cross-family invariant violated in frozen claim: writer={raw_w!r} == referee={rf!r}")
+            if rf not in refs:
+                refs.append(rf)
+        return raw_w, tuple(refs)
+
+    def reserve_review_attempt(
+        self,
+        *,
+        unit_key: str,
+        claim_epoch: int,
+        candidate_sha: str,
+    ) -> tuple[str, int, str, tuple[str, ...]] | None:
+        """Atomically reserve one non-reusable `attempt_id` bound to active `claim_epoch` + `candidate_sha` + frozen families."""
+        max_rounds = int(POLICY_MANIFEST["chef_pipeline"]["max_review_rounds"])
+        with self.immediate_tx():
+            crow = self._conn.execute(
+                "SELECT * FROM run_claims WHERE claim_epoch = ? AND unit_key = ? AND state = 'active'",
+                (int(claim_epoch), unit_key),
+            ).fetchone()
+            if crow is None:
+                raise AutopilotError(f"Cannot reserve review attempt: inactive or mismatched claim_epoch={claim_epoch} for {unit_key}")
+            frozen_writer, frozen_refs = self._parse_claim_frozen_families(crow)
+            if not frozen_writer or not frozen_refs:
+                raise AutopilotError(
+                    f"Claim claim_epoch={claim_epoch} lacks frozen writer/referee families; refusing review attempt"
+                )
+            urow = self._conn.execute(
+                "SELECT review_rounds_used, current_candidate_sha FROM work_units WHERE unit_key = ?",
+                (unit_key,),
+            ).fetchone()
+            if urow is None:
+                raise AutopilotError(f"Unknown unit_key: {unit_key}")
+            if str(urow["current_candidate_sha"] or "") != str(candidate_sha):
+                raise AutopilotError(
+                    f"Cannot reserve review attempt for stale candidate_sha={candidate_sha!r} != {urow['current_candidate_sha']!r}"
+                )
+            # Never invalidate review authorization while an in_flight / unknown_paused external_op exists in scope!
+            scope = self.resolve_unit_scope_and_pending(unit_key, statuses=("in_flight", "unknown_paused"))
+            if scope.pending_cnt != 0:
+                raise AutopilotError(
+                    f"Cannot reserve new review attempt on {unit_key}: {scope.pending_cnt} in_flight/unknown_paused ops in scope"
+                )
+            used = int(urow["review_rounds_used"])
+            if used >= max_rounds:
+                return None
+            nxt = used + 1
+            att_id = f"att-{uuid.uuid4().hex[:16]}"
+            ts = now_iso()
+            # Supersede any prior open attempt on this unit so only ONE current_review_attempt_id can ever authorize!
+            self._conn.execute(
+                "UPDATE review_attempts SET state = 'failed', settled_at = ? WHERE unit_key = ? AND state = 'open'",
+                (ts, unit_key),
+            )
+            # Abort stale worker prepared_local ops whose prior approval is being superseded by this new review attempt.
+            seq_ab = self._next_counter_in_tx("op_seq")
+            self._conn.execute(
+                """
+                UPDATE external_ops
+                SET status = 'aborted_pre_send', op_seq = ?, updated_at = ?
+                WHERE unit_key = ? AND owner_kind = 'worker' AND status = 'prepared_local'
+                """,
+                (seq_ab, ts, unit_key),
+            )
+            self._conn.execute(
+                "UPDATE work_units SET review_rounds_used = ?, current_review_attempt_id = ?, current_approved_attempt_id = NULL, updated_at = ? WHERE unit_key = ?",
+                (nxt, att_id, ts, unit_key),
+            )
+            self._conn.execute(
+                """
+                INSERT INTO review_attempts(
+                    attempt_id, unit_key, claim_epoch, candidate_sha, round_index,
+                    writer_family, required_referees_json, state, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)
+                """,
+                (att_id, unit_key, int(claim_epoch), str(candidate_sha), nxt, frozen_writer, json.dumps(list(frozen_refs)), ts),
+            )
+            return att_id, nxt, frozen_writer, frozen_refs
+
+    def settle_review_attempt(
+        self,
+        *,
+        attempt_id: str,
+        outcomes: list[dict[str, Any]],
+        refund_on_quota: bool = False,
+        quota_wake_at: str | None = None,
+        quota_reason: str = "referee_quota_window",
+        force_failed: bool = False,
+    ) -> dict[str, Any]:
+        """Atomically persist all valid referee receipts for `attempt_id` and seal consensus state (`approved`/`revise`/`aborted_quota`/`failed`)."""
+        with self.immediate_tx():
+            att = self._conn.execute("SELECT * FROM review_attempts WHERE attempt_id = ?", (attempt_id,)).fetchone()
+            if att is None:
+                raise AutopilotError(f"Unknown review attempt_id: {attempt_id!r}")
+            unit_key = str(att["unit_key"])
+            claim_epoch = int(att["claim_epoch"])
+            candidate_sha = str(att["candidate_sha"])
+            round_idx = int(att["round_index"])
+            writer_family = str(att["writer_family"])
+            required_refs = tuple(json.loads(str(att["required_referees_json"])))
+            if not required_refs or writer_family not in VALID_MODEL_FAMILIES or writer_family in required_refs:
+                raise AutopilotError(f"Corrupt review_attempt {attempt_id!r} family binding")
+
+            if att["state"] != "open":
+                raise AutopilotError(f"Review attempt {attempt_id!r} is already settled in state={att['state']!r}")
+
+            crow = self._conn.execute(
+                "SELECT state, unit_key FROM run_claims WHERE claim_epoch = ?",
+                (claim_epoch,),
+            ).fetchone()
+            if crow is None or crow["state"] != "active" or str(crow["unit_key"]) != unit_key:
+                raise AutopilotError(f"Cannot settle attempt {attempt_id!r}: claim_epoch={claim_epoch} is no longer active")
+
+            urow = self._conn.execute(
+                "SELECT current_candidate_sha, current_review_attempt_id FROM work_units WHERE unit_key = ?",
+                (unit_key,),
+            ).fetchone()
+            if urow is None or str(urow["current_candidate_sha"] or "") != candidate_sha:
+                raise AutopilotError(f"Cannot settle attempt {attempt_id!r}: candidate_sha drifted")
+            is_current_attempt = str(urow["current_review_attempt_id"] or "") == attempt_id
+
+            ts = now_iso()
+            seen_refs: set[str] = set()
+            valid_verdicts: dict[str, tuple[str, int]] = {}
+            for item in outcomes:
+                rfam = str(item.get("referee_family") or "").strip()
+                if rfam not in required_refs:
+                    raise AutopilotError(f"Unexpected referee_family {rfam!r} for attempt {attempt_id!r} (required {list(required_refs)})")
+                if rfam == writer_family:
+                    raise AutopilotError(f"Cross-family referee violation: writer={writer_family!r} == referee={rfam!r}")
+                if rfam in seen_refs:
+                    raise AutopilotError(f"Duplicate referee outcome for {rfam!r} in attempt {attempt_id!r}")
+                seen_refs.add(rfam)
+
+                verdict = str(item.get("verdict") or "").strip()
+                if verdict not in ("APPROVE", "REVISE"):
+                    raise AutopilotError(f"Invalid verdict {verdict!r} for referee {rfam!r}")
+                raw_dc = item.get("defect_count")
+                if isinstance(raw_dc, bool) or not isinstance(raw_dc, int) or raw_dc < 0:
+                    raise AutopilotError(f"Invalid defect_count {raw_dc!r} for referee {rfam!r}")
+                defects = item.get("defects")
+                if not isinstance(defects, list) or len(defects) != raw_dc:
+                    raise AutopilotError(f"defect_count={raw_dc} mismatches len(defects) for referee {rfam!r}")
+                if verdict == "APPROVE" and raw_dc != 0:
+                    raise AutopilotError(f"Referee {rfam!r} cannot APPROVE with defect_count={raw_dc}")
+                if verdict == "REVISE" and raw_dc == 0:
+                    raise AutopilotError(f"Referee {rfam!r} REVISE must report >= 1 defect")
+
+                self._conn.execute(
+                    """
+                    INSERT INTO review_receipts(
+                        unit_key, candidate_sha, round_index, attempt_id, claim_epoch, writer_family, referee_family,
+                        referee_model, verdict, defect_count, defects_json, raw_path, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        unit_key,
+                        candidate_sha,
+                        round_idx,
+                        attempt_id,
+                        claim_epoch,
+                        writer_family,
+                        rfam,
+                        str(item.get("referee_model") or ""),
+                        verdict,
+                        raw_dc,
+                        json.dumps(defects, ensure_ascii=False),
+                        str(item.get("raw_path") or ""),
+                        ts,
+                    ),
+                )
+                valid_verdicts[rfam] = (verdict, raw_dc)
+
+            all_present = set(valid_verdicts.keys()) == set(required_refs)
+            if not is_current_attempt:
+                # Stale/superseded attempt: keep valid receipts for audit ONLY, NEVER overwrite current approval or refund!
+                final_state = "failed"
+                self._conn.execute(
+                    "UPDATE review_attempts SET state = ?, settled_at = ? WHERE attempt_id = ?",
+                    (final_state, ts, attempt_id),
+                )
+            elif refund_on_quota:
+                final_state = "aborted_quota"
+                self._conn.execute(
+                    "UPDATE review_attempts SET state = ?, settled_at = ? WHERE attempt_id = ?",
+                    (final_state, ts, attempt_id),
+                )
+                self._conn.execute(
+                    """
+                    UPDATE work_units
+                    SET status = 'waiting_quota',
+                        waiting_until = ?,
+                        last_error = ?,
+                        current_approved_attempt_id = NULL,
+                        review_rounds_used = CASE WHEN review_rounds_used = ? THEN MAX(0, review_rounds_used - 1) ELSE review_rounds_used END,
+                        updated_at = ?
+                    WHERE unit_key = ? AND current_review_attempt_id = ?
+                    """,
+                    (quota_wake_at, quota_reason, round_idx, ts, unit_key, attempt_id),
+                )
+            elif force_failed or not all_present:
+                final_state = "failed"
+                self._conn.execute(
+                    "UPDATE review_attempts SET state = ?, settled_at = ? WHERE attempt_id = ?",
+                    (final_state, ts, attempt_id),
+                )
+                self._conn.execute(
+                    "UPDATE work_units SET current_approved_attempt_id = NULL, updated_at = ? WHERE unit_key = ? AND current_review_attempt_id = ?",
+                    (ts, unit_key, attempt_id),
+                )
+            elif all(v == "APPROVE" and dc == 0 for v, dc in valid_verdicts.values()):
+                final_state = "approved"
+                self._conn.execute(
+                    "UPDATE review_attempts SET state = ?, settled_at = ? WHERE attempt_id = ?",
+                    (final_state, ts, attempt_id),
+                )
+                self._conn.execute(
+                    "UPDATE work_units SET current_approved_attempt_id = ?, updated_at = ? WHERE unit_key = ? AND current_review_attempt_id = ?",
+                    (attempt_id, ts, unit_key, attempt_id),
+                )
+            else:
+                final_state = "revise"
+                self._conn.execute(
+                    "UPDATE review_attempts SET state = ?, settled_at = ? WHERE attempt_id = ?",
+                    (final_state, ts, attempt_id),
+                )
+                self._conn.execute(
+                    "UPDATE work_units SET current_approved_attempt_id = NULL, updated_at = ? WHERE unit_key = ? AND current_review_attempt_id = ?",
+                    (ts, unit_key, attempt_id),
+                )
+
+            return {
+                "attempt_id": attempt_id,
+                "round_index": round_idx,
+                "state": final_state,
+                "referees_recorded": sorted(valid_verdicts.keys()),
+                "required_referees": list(required_refs),
+            }
+
     def record_review_receipt(
         self,
         *,
@@ -2322,13 +3139,63 @@ class AutopilotDB:
         defects: list[dict[str, str]],
         raw_path: str,
         reserved_round_index: int | None = None,
+        attempt_id: str = "",
+        claim_epoch: int | None = None,
     ) -> int:
-        expected_ref = resolve_cross_family_referee(writer_family)
-        if referee_family != expected_ref:
+        if writer_family not in VALID_MODEL_FAMILIES:
+            raise AutopilotError(f"Unsupported writer_family: {writer_family!r}")
+        if referee_family not in VALID_MODEL_FAMILIES:
+            raise AutopilotError(f"Unsupported referee_family: {referee_family!r}")
+        if referee_family == writer_family:
             raise AutopilotError(
-                f"Cross-family referee violation: writer={writer_family!r} requires referee={expected_ref!r}, got {referee_family!r}"
+                f"Cross-family referee violation: writer={writer_family!r} MUST differ from referee={referee_family!r}"
             )
+        if verdict not in ("APPROVE", "REVISE"):
+            raise AutopilotError(f"Invalid review verdict: {verdict!r}")
+        if isinstance(defect_count, bool) or not isinstance(defect_count, int) or defect_count < 0:
+            raise AutopilotError(f"Invalid defect_count: {defect_count!r}")
+        if verdict == "APPROVE" and defect_count != 0:
+            raise AutopilotError(f"Cannot record APPROVE with defect_count={defect_count}")
+        if verdict == "REVISE" and defect_count == 0:
+            raise AutopilotError("Cannot record REVISE with defect_count=0")
         with self.immediate_tx():
+            if claim_epoch is None:
+                # Unattributed audit-only review receipt: archive cleanly WITHOUT consuming review_rounds_used or colliding with review_receipts PK!
+                self._conn.execute(
+                    """
+                    INSERT INTO receipt_audit_log(audit_id, kind, unit_key, candidate_sha, payload_json, created_at)
+                    VALUES (?, 'review', ?, ?, ?, ?)
+                    """,
+                    (
+                        f"aud-{uuid.uuid4().hex[:16]}",
+                        unit_key,
+                        candidate_sha,
+                        json.dumps(
+                            {
+                                "writer_family": writer_family,
+                                "referee_family": referee_family,
+                                "referee_model": referee_model,
+                                "verdict": verdict,
+                                "defect_count": defect_count,
+                                "defects": defects,
+                                "raw_path": raw_path,
+                                "reserved_round_index": reserved_round_index,
+                                "attempt_id": str(attempt_id or ""),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        now_iso(),
+                    ),
+                )
+                return 0
+            crow = self._conn.execute(
+                "SELECT state, unit_key FROM run_claims WHERE claim_epoch = ?",
+                (int(claim_epoch),),
+            ).fetchone()
+            if crow is None or crow["state"] != "active" or str(crow["unit_key"]) != unit_key:
+                raise AutopilotError(
+                    f"Cannot record review_receipt: inactive or mismatched claim_epoch={claim_epoch} for {unit_key}"
+                )
             max_rounds = int(POLICY_MANIFEST["chef_pipeline"]["max_review_rounds"])
             if reserved_round_index is not None:
                 round_idx = int(reserved_round_index)
@@ -2343,19 +3210,21 @@ class AutopilotDB:
             self._conn.execute(
                 """
                 INSERT INTO review_receipts(
-                    unit_key, candidate_sha, round_index, writer_family, referee_family,
+                    unit_key, candidate_sha, round_index, attempt_id, claim_epoch, writer_family, referee_family,
                     referee_model, verdict, defect_count, defects_json, raw_path, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     unit_key,
                     candidate_sha,
                     round_idx,
+                    str(attempt_id or ""),
+                    int(claim_epoch),
                     writer_family,
                     referee_family,
                     referee_model,
                     verdict,
-                    int(defect_count),
+                    defect_count,
                     json.dumps(defects, ensure_ascii=False),
                     raw_path,
                     ts,
@@ -2363,30 +3232,177 @@ class AutopilotDB:
             )
             return round_idx
 
-    def _verify_publish_receipts_in_tx(self, unit_key: str, candidate_sha: str) -> None:
+    def _verify_publish_receipts_in_tx(
+        self,
+        unit_key: str,
+        candidate_sha: str,
+        *,
+        claim_epoch: int,
+        expected_attempt_id: str | None = None,
+    ) -> str | None:
+        if claim_epoch is None or isinstance(claim_epoch, bool):
+            raise AutopilotError(
+                f"Cannot verify publish receipts for ({unit_key}, {candidate_sha}) without explicit claim_epoch"
+            )
+        claim_epoch_int = int(claim_epoch)
+        crow = self._conn.execute(
+            "SELECT * FROM run_claims WHERE claim_epoch = ? AND unit_key = ? AND state = 'active'",
+            (claim_epoch_int, unit_key),
+        ).fetchone()
+        if crow is None:
+            raise AutopilotError(f"Inactive or mismatched claim_epoch={claim_epoch_int} for ({unit_key}, {candidate_sha})")
         if not POLICY_MANIFEST["chef_pipeline"]["publish_requires_current_candidate_verify_and_review_receipts"]:
-            return
+            return None
         vrow = self._conn.execute(
-            "SELECT exit_code FROM verify_receipts WHERE unit_key = ? AND candidate_sha = ?",
+            "SELECT exit_code, claim_epoch FROM verify_receipts WHERE unit_key = ? AND candidate_sha = ?",
             (unit_key, candidate_sha),
         ).fetchone()
         if vrow is None or int(vrow["exit_code"]) != 0:
             raise AutopilotError(
                 f"Missing passing verify_receipts for ({unit_key}, {candidate_sha})"
             )
-        rrow = self._conn.execute(
+        if vrow["claim_epoch"] is None or int(vrow["claim_epoch"]) != claim_epoch_int:
+            raise AutopilotError(
+                f"Verify receipt for ({unit_key}, {candidate_sha}) belongs to claim_epoch={vrow['claim_epoch']!r} != active {claim_epoch_int}"
+            )
+
+        frozen_writer, frozen_refs = self._parse_claim_frozen_families(crow)
+
+        # If ANY review_attempts exist for this `(unit_key, candidate_sha)` (on ANY claim!), attempt-bound
+        # authorization is strictly mandatory (NEVER fall back to legacy cross-claim receipt queries!).
+        has_attempts = bool(
+            self._conn.execute(
+                "SELECT 1 FROM review_attempts WHERE unit_key = ? AND candidate_sha = ? LIMIT 1",
+                (unit_key, candidate_sha),
+            ).fetchone()
+        )
+        urow = self._conn.execute(
+            "SELECT current_approved_attempt_id FROM work_units WHERE unit_key = ?",
+            (unit_key,),
+        ).fetchone()
+        cur_att_id = str(urow["current_approved_attempt_id"] or "") if urow else ""
+
+        if has_attempts or expected_attempt_id or cur_att_id:
+            target_att_id = str(expected_attempt_id or cur_att_id)
+            if not target_att_id or cur_att_id != target_att_id:
+                raise AutopilotError(
+                    f"Missing or invalidated approved review_attempt for ({unit_key}, {candidate_sha})"
+                )
+            att = self._conn.execute(
+                "SELECT * FROM review_attempts WHERE attempt_id = ?",
+                (target_att_id,),
+            ).fetchone()
+            if (
+                att is None
+                or att["state"] != "approved"
+                or str(att["unit_key"]) != unit_key
+                or str(att["candidate_sha"]) != candidate_sha
+                or int(att["claim_epoch"]) != claim_epoch_int
+            ):
+                raise AutopilotError(
+                    f"Approved review_attempt {target_att_id!r} invalid or mismatched for ({unit_key}, {candidate_sha})"
+                )
+            att_writer = str(att["writer_family"])
+            att_req_refs = tuple(json.loads(str(att["required_referees_json"])))
+            if not att_req_refs or att_writer not in VALID_MODEL_FAMILIES or att_writer in att_req_refs:
+                raise AutopilotError(f"Corrupt review_attempt {target_att_id!r} family binding")
+            if frozen_writer and att_writer != frozen_writer:
+                raise AutopilotError(
+                    f"Review attempt writer {att_writer!r} mismatches frozen claim writer {frozen_writer!r}"
+                )
+            if frozen_refs and (set(att_req_refs) != set(frozen_refs) or len(att_req_refs) != len(frozen_refs)):
+                raise AutopilotError(
+                    f"Review attempt referees {list(att_req_refs)} mismatch frozen claim referees {list(frozen_refs)}"
+                )
+            rrows = self._conn.execute(
+                """
+                SELECT unit_key, candidate_sha, claim_epoch, writer_family, referee_family, verdict, defect_count
+                FROM review_receipts
+                WHERE attempt_id = ?
+                """,
+                (target_att_id,),
+            ).fetchall()
+            if len(rrows) != len(att_req_refs):
+                raise AutopilotError(
+                    f"Incomplete referee consensus on attempt {target_att_id!r}: {len(rrows)}/{len(att_req_refs)} receipts"
+                )
+            seen_refs: set[str] = set()
+            att_ce = int(att["claim_epoch"])
+            for r in rrows:
+                if (
+                    str(r["unit_key"]) != unit_key
+                    or str(r["candidate_sha"]) != candidate_sha
+                    or r["claim_epoch"] is None
+                    or int(r["claim_epoch"]) != att_ce
+                    or int(r["claim_epoch"]) != claim_epoch_int
+                    or str(r["writer_family"]) != att_writer
+                    or str(r["referee_family"]) == str(r["writer_family"])
+                    or str(r["verdict"]) != "APPROVE"
+                    or int(r["defect_count"]) != 0
+                ):
+                    raise AutopilotError(
+                        f"Review receipt on attempt {target_att_id!r} failed cross-family APPROVE consensus check"
+                    )
+                seen_refs.add(str(r["referee_family"]))
+            if seen_refs != set(att_req_refs):
+                raise AutopilotError(
+                    f"Referee consensus mismatch on attempt {target_att_id!r}: got {sorted(seen_refs)}, required {sorted(att_req_refs)}"
+                )
+            return target_att_id
+
+        # Legacy direct-DB path ONLY when ZERO `review_attempts` exist anywhere on `(unit_key, candidate_sha)`:
+        # Strictly require un-attempted (`attempt_id = ''`) rows explicitly bound to THIS `claim_epoch`
+        # (NULL/unattributed migrated rows from pre-v17 DBs are audit-only and NEVER authorize publish!).
+        if claim_epoch is None:
+            raise AutopilotError(
+                f"Cannot verify publish receipts for ({unit_key}, {candidate_sha}) without explicit claim_epoch"
+            )
+        max_r_row = self._conn.execute(
+            """
+            SELECT MAX(round_index) AS m
+            FROM review_receipts
+            WHERE unit_key = ? AND candidate_sha = ? AND attempt_id = '' AND claim_epoch = ?
+            """,
+            (unit_key, candidate_sha, int(claim_epoch)),
+        ).fetchone()
+        if max_r_row is None or max_r_row["m"] is None:
+            raise AutopilotError(
+                f"Missing cross-family APPROVE review_receipts for ({unit_key}, {candidate_sha}, claim_epoch={claim_epoch})"
+            )
+        latest_r = int(max_r_row["m"])
+        rrows = self._conn.execute(
             """
             SELECT writer_family, referee_family, verdict, defect_count
             FROM review_receipts
-            WHERE unit_key = ? AND candidate_sha = ? AND verdict = 'APPROVE' AND defect_count = 0
-            ORDER BY round_index DESC LIMIT 1
+            WHERE unit_key = ? AND candidate_sha = ? AND round_index = ? AND attempt_id = '' AND claim_epoch = ?
             """,
-            (unit_key, candidate_sha),
-        ).fetchone()
-        if rrow is None or rrow["writer_family"] == rrow["referee_family"]:
+            (unit_key, candidate_sha, latest_r, int(claim_epoch)),
+        ).fetchall()
+        if not rrows:
             raise AutopilotError(
                 f"Missing cross-family APPROVE review_receipts for ({unit_key}, {candidate_sha})"
             )
+        seen_legacy_refs: set[str] = set()
+        for r in rrows:
+            wf = str(r["writer_family"])
+            rf = str(r["referee_family"])
+            if (
+                wf not in VALID_MODEL_FAMILIES
+                or rf not in VALID_MODEL_FAMILIES
+                or wf == rf
+                or (frozen_writer and wf != frozen_writer)
+                or str(r["verdict"]) != "APPROVE"
+                or int(r["defect_count"]) != 0
+            ):
+                raise AutopilotError(
+                    f"Latest review round {latest_r} for ({unit_key}, {candidate_sha}) failed cross-family APPROVE check"
+                )
+            seen_legacy_refs.add(rf)
+        if frozen_refs and (seen_legacy_refs != set(frozen_refs) or len(rrows) != len(frozen_refs)):
+            raise AutopilotError(
+                f"Latest review round {latest_r} for ({unit_key}, {candidate_sha}) missing frozen referees: got {sorted(seen_legacy_refs)}, required {sorted(frozen_refs)}"
+            )
+        return None
 
     def get_op(self, op_id: str) -> dict[str, Any] | None:
         with self._lock:

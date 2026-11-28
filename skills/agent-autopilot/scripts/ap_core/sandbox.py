@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import errno
 import fcntl
 import json
+import math
 import os
 import pwd
 import re
@@ -15,6 +17,7 @@ import socket
 import stat
 import subprocess
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable
@@ -116,8 +119,15 @@ def resolve_elf_runtime_mounts(elf_path: Path, stage_lib_dir: Path) -> list[tupl
             else:
                 staged = stage_lib_dir / f"{len(mounts)}_{resolved.name}"
                 if not staged.exists():
-                    shutil.copyfile(resolved, staged)
-                    os.chmod(staged, 0o644)
+                    tmp_staged = stage_lib_dir / f".{staged.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+                    try:
+                        shutil.copyfile(resolved, tmp_staged)
+                        os.chmod(tmp_staged, 0o644)
+                        os.replace(tmp_staged, staged)
+                    finally:
+                        with contextlib.suppress(OSError):
+                            if tmp_staged.exists():
+                                tmp_staged.unlink()
                 mounts.append((str(staged), target_p))
     return mounts
 
@@ -229,6 +239,107 @@ def _project_codex_auth_for_sandbox(raw_auth: Any) -> dict[str, Any]:
     return {}
 
 
+def _project_agy_auth_for_sandbox(raw_auth: Any, *, now: dt.datetime | None = None) -> dict[str, Any]:
+    """Project AGY consumer OAuth token strictly stripping `refresh_token` and `id_token_email`."""
+    if not isinstance(raw_auth, dict):
+        return {}
+    tok = raw_auth.get("token")
+    if not isinstance(tok, dict):
+        return {}
+    access_token = tok.get("access_token")
+    if not isinstance(access_token, str) or not access_token.strip():
+        return {}
+    expiry_raw = tok.get("expiry")
+    if "expiry" in tok:
+        if not isinstance(expiry_raw, str) or not expiry_raw.strip():
+            raise SandboxError("AGY OAuth token has malformed non-string/null/empty expiry")
+        try:
+            exp_dt = dt.datetime.fromisoformat(expiry_raw.strip().replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise SandboxError(f"AGY OAuth token has unparseable expiry timestamp: {expiry_raw!r}") from exc
+        if exp_dt.tzinfo is None:
+            raise SandboxError(f"AGY OAuth token expiry must include explicit timezone offset: {expiry_raw!r}")
+        ref_now = now or dt.datetime.now(dt.timezone.utc)
+        # Reject tokens that are already expired OR within the 60s pre-expiry refresh window (sandbox has no refresh_token!)
+        if exp_dt <= ref_now + dt.timedelta(seconds=60):
+            raise SandboxError(
+                f"AGY OAuth access_token expired or within 60s refresh window ({expiry_raw}); refresh on host before invoking sandbox"
+            )
+    projected_tok: dict[str, Any] = {
+        "access_token": access_token.strip(),
+        "token_type": str(tok.get("token_type") or "Bearer"),
+    }
+    if isinstance(expiry_raw, str) and expiry_raw.strip():
+        projected_tok["expiry"] = expiry_raw.strip()
+    expires_in = tok.get("expires_in")
+    if isinstance(expires_in, int) and not isinstance(expires_in, bool) and expires_in >= 0:
+        projected_tok["expires_in"] = expires_in
+    return {
+        "auth_method": str(raw_auth.get("auth_method") or "consumer"),
+        "token": projected_tok,
+    }
+
+
+def _read_host_agy_oauth_nofollow(host_home: Path) -> dict[str, Any]:
+    """Open `~/.gemini/antigravity-cli/antigravity-oauth-token` via O_NOFOLLOW with type/size checks."""
+    from .models import AutopilotError, open_dir_nofollow
+
+    tok_dir = host_home / ".gemini" / "antigravity-cli"
+    try:
+        dfd = open_dir_nofollow(tok_dir, create=False)
+    except (AutopilotError, OSError) as exc:
+        raise SandboxError(f"AGY OAuth directory unavailable or unsafe ({tok_dir}): {exc}") from exc
+    try:
+        try:
+            ffd = os.open("antigravity-oauth-token", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+        except OSError as exc:
+            raise SandboxError(f"AGY OAuth token file unavailable or symlinked in {tok_dir}: {exc}") from exc
+        try:
+            st = os.fstat(ffd)
+            if not stat.S_ISREG(st.st_mode):
+                raise SandboxError("AGY OAuth token entry is not a regular file")
+            if st.st_size <= 0 or st.st_size > 65536:
+                raise SandboxError(f"AGY OAuth token file has unexpected size: {st.st_size}")
+            raw_bytes = os.read(ffd, 65537)
+            if len(raw_bytes) > 65536:
+                raise SandboxError("AGY OAuth token file exceeded 64 KiB cap")
+            try:
+                parsed = json.loads(raw_bytes.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise SandboxError(f"AGY OAuth token file is not valid JSON: {exc}") from exc
+            if not isinstance(parsed, dict):
+                raise SandboxError("AGY OAuth token JSON must be an object")
+            return parsed
+        finally:
+            os.close(ffd)
+    finally:
+        os.close(dfd)
+
+
+def resolve_family_proxy_allowlist(family: str) -> set[str]:
+    """Return strict per-family CONNECT proxy allowlist from policy_manifest.json (fail closed if missing)."""
+    fam_map = POLICY_MANIFEST.get("family_llm_proxy_allowlist_domains")
+    if not isinstance(fam_map, dict) or family not in fam_map:
+        raise SandboxError(f"No proxy domain allowlist configured for model family: {family!r}")
+    domains = {str(d).strip().lower() for d in fam_map[family] if str(d).strip()}
+    if not domains:
+        raise SandboxError(f"Empty proxy domain allowlist for model family: {family!r}")
+    return domains
+
+
+def _flock_shared_with_deadline(fd: int, *, timeout_sec: float = 10.0, label: str = "credential lock") -> None:
+    """Acquire non-blocking LOCK_SH within a bounded deadline so a wedged lock can never stall worker/referee shutdown."""
+    deadline = time.monotonic() + max(0.1, float(timeout_sec))
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return
+        except BlockingIOError as exc:
+            if time.monotonic() >= deadline:
+                raise SandboxError(f"Timed out after {timeout_sec:.1f}s waiting for {label}") from exc
+            time.sleep(0.05)
+
+
 def prepare_sandbox_home_memfds(
     family: str,
     *,
@@ -246,7 +357,7 @@ def prepare_sandbox_home_memfds(
                 lock_path.parent.mkdir(parents=True, exist_ok=True)
                 lfd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
                 try:
-                    fcntl.flock(lfd, fcntl.LOCK_SH)
+                    _flock_shared_with_deadline(lfd, label="claude credentials lock")
                     raw = json.loads(cred_src.read_text(encoding="utf-8"))
                 finally:
                     with contextlib.suppress(OSError):
@@ -283,7 +394,7 @@ def prepare_sandbox_home_memfds(
                 lock_path.parent.mkdir(parents=True, exist_ok=True)
                 lfd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
                 try:
-                    fcntl.flock(lfd, fcntl.LOCK_SH)
+                    _flock_shared_with_deadline(lfd, label="codex auth lock")
                     raw_auth = json.loads(auth_src.read_text(encoding="utf-8"))
                 finally:
                     with contextlib.suppress(OSError):
@@ -300,6 +411,32 @@ def prepare_sandbox_home_memfds(
             out["/home/sandbox/.codex/config.toml"] = _make_memfd_with_bytes(
                 "ap_codex_cfg", b"[features]\nmulti_agent = false\n"
             )
+        elif family == "agy":
+            raw_agy = _read_host_agy_oauth_nofollow(hhome)
+            projected_agy = _project_agy_auth_for_sandbox(raw_agy)
+            if not projected_agy:
+                raise SandboxError("AGY OAuth token missing valid access_token for sandbox projection")
+            out["/home/sandbox/.gemini/antigravity-cli/antigravity-oauth-token"] = _make_memfd_with_bytes(
+                "ap_agy_oauth", (json.dumps(projected_agy, indent=2) + "\n").encode("utf-8")
+            )
+            role_spec = POLICY_MANIFEST["role_matrix"].get(role_key or "agy:readonly_model", {})
+            deny_rules = [
+                *list(POLICY_MANIFEST.get("agy_permission_deny") or []),
+                *list(role_spec.get("agy_extra_permission_deny") or []),
+            ]
+            allow_rules = list(role_spec.get("agy_permission_allow") or [])
+            agy_settings = {
+                "permissions": {
+                    "allow": allow_rules,
+                    "deny": deny_rules,
+                }
+            }
+            out["/home/sandbox/.gemini/antigravity-cli/settings.json"] = _make_memfd_with_bytes(
+                "ap_agy_settings", (json.dumps(agy_settings, indent=2) + "\n").encode("utf-8")
+            )
+            # Mount empty MCP/hooks configs so no host MCP servers or hooks can load inside sandbox!
+            out["/home/sandbox/.gemini/config/mcp_config.json"] = _make_memfd_with_bytes("ap_agy_mcp", b"{}\n")
+            out["/home/sandbox/.gemini/config/hooks.json"] = _make_memfd_with_bytes("ap_agy_hooks", b"{}\n")
         else:
             raise SandboxError(f"Unsupported model family: {family!r}")
         ret_out = out
@@ -887,7 +1024,12 @@ def build_model_ring_bwrap(
             mounted_exec_targets.append(cmh_dst)
 
     if spec.get("dynamic_elf_libs"):
-        main_slot = "claude_cli" if role_key.startswith("claude:") else "codex_cli"
+        if role_key.startswith("claude:"):
+            main_slot = "claude_cli"
+        elif role_key.startswith("agy:"):
+            main_slot = "agy_cli"
+        else:
+            main_slot = "codex_cli"
         st_dir = elf_lib_stage_dir or (sandbox_home.parent / "elf_libs_stage")
         st_prefix = str(st_dir).rstrip("/") + "/"
         for host_lib, target_lib in resolve_elf_runtime_mounts(host_binaries[main_slot], st_dir):
@@ -904,61 +1046,136 @@ def build_model_ring_bwrap(
 
     from .models import AutopilotError, get_sub_intent_token, open_dir_nofollow, verify_cred_owner_token, verify_owned_file_token
 
+    role_is_agy = role_key.startswith("agy:")
+    writable_set = set(spec["writable_mounts"])
+
+    if role_is_agy and (retain_fds is None or sandbox_file_fds is None):
+        raise SandboxError("agy roles require retain_fds and memfd-projected sandbox_file_fds (host-disk HOME fallback forbidden)")
+
     if retain_fds is not None:
         try:
             role_is_claude = role_key.startswith("claude:")
-            exp_sub_nm = ".claude" if role_is_claude else ".codex"
-            allowed_fnames = (
-                {".credentials.json", "settings.json"}
-                if role_is_claude
-                else {"auth.json", "models_cache.json", "config.toml"}
-            )
-            argv.extend(["--tmpfs", "/home/sandbox", "--dir", f"/home/sandbox/{exp_sub_nm}"])
-            if sandbox_file_fds is not None:
-                for dst_p, src_mfd in sorted(sandbox_file_fds.items()):
-                    if Path(dst_p).parent != Path(f"/home/sandbox/{exp_sub_nm}") or Path(dst_p).name not in allowed_fnames:
+            if role_is_agy:
+                agy_allowed_dsts = {
+                    "/home/sandbox/.gemini/antigravity-cli/antigravity-oauth-token",
+                    "/home/sandbox/.gemini/antigravity-cli/settings.json",
+                    "/home/sandbox/.gemini/config/mcp_config.json",
+                    "/home/sandbox/.gemini/config/hooks.json",
+                    "/home/sandbox/.gemini/config/config.json",
+                }
+                argv.extend([
+                    "--tmpfs", "/home/sandbox",
+                    "--dir", "/home/sandbox/.gemini",
+                    "--dir", "/home/sandbox/.gemini/antigravity-cli",
+                    "--dir", "/home/sandbox/.gemini/config",
+                ])
+                assert sandbox_file_fds is not None
+                if "/home/sandbox/.gemini/antigravity-cli/antigravity-oauth-token" not in sandbox_file_fds:
+                    raise SandboxError(f"Missing projected AGY OAuth memfd for role {role_key}")
+                for dst_p in sandbox_file_fds:
+                    if dst_p not in agy_allowed_dsts:
                         raise SandboxError(f"Unauthorized sandbox_file_fds destination {dst_p!r} for role {role_key}")
-                    dup_mfd = os.dup(src_mfd)
-                    os.lseek(dup_mfd, 0, os.SEEK_SET)
-                    retain_fds.append(dup_mfd)
-                    argv.extend(["--ro-bind-data", str(dup_mfd), dst_p])
-            else:
-                sbh_b_fd = os.dup(sandbox_home_fd) if sandbox_home_fd is not None else open_dir_nofollow(sandbox_home, create=True, mode=0o700)
+                # Validate caller OAuth payload and re-synthesize a fresh canonical host-owned memfd (never binding raw FD!)
+                src_tok_fd = sandbox_file_fds["/home/sandbox/.gemini/antigravity-cli/antigravity-oauth-token"]
+                dup_read_fd = os.dup(src_tok_fd)
                 try:
+                    os.lseek(dup_read_fd, 0, os.SEEK_SET)
+                    raw_tok_b = os.read(dup_read_fd, 65537)
+                    if len(raw_tok_b) > 65536:
+                        raise SandboxError("AGY OAuth memfd exceeds 64 KiB cap")
                     try:
-                        sub_b_fd = os.open(exp_sub_nm, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=sbh_b_fd)
-                    except FileNotFoundError:
-                        sub_b_fd = None
-                    if sub_b_fd is not None:
-                        try:
-                            try:
-                                exp_sub_tok = os.getxattr(sbh_b_fd, b"user.ap_sub_id").decode("ascii", errors="replace")
-                            except OSError as exc_xt:
-                                raise SandboxError(
-                                    f"Missing or unreadable user.ap_sub_id on sandbox_home_fd; refusing unverified {exp_sub_nm}: {exc_xt}"
-                                ) from exc_xt
-                            if not exp_sub_tok or not verify_cred_owner_token(sub_b_fd, exp_sub_tok):
-                                raise SandboxError(f"Refusing replaced/foreign {exp_sub_nm} directory inside sandbox_home")
-                            with os.scandir(sub_b_fd) as s_it:
-                                fnames = sorted(e.name for e in s_it if not e.name.startswith(".ap-qbox-"))
-                            for fn in fnames:
-                                if fn not in allowed_fnames:
-                                    raise SandboxError(f"Unauthorized file {fn!r} inside sandbox_home/{exp_sub_nm} for {role_key}")
-                                f_ro_fd = os.open(fn, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=sub_b_fd)
-                                if not stat.S_ISREG(os.fstat(f_ro_fd).st_mode) or not verify_owned_file_token(f_ro_fd, exp_sub_tok):
-                                    os.close(f_ro_fd)
-                                    raise SandboxError(f"Foreign or non-regular file inside sandbox_home/{exp_sub_nm}: {fn!r}")
-                                retain_fds.append(f_ro_fd)
-                                argv.extend(["--ro-bind-fd", str(f_ro_fd), f"/home/sandbox/{exp_sub_nm}/{fn}"])
-                        finally:
-                            os.close(sub_b_fd)
+                        tok_doc = json.loads(raw_tok_b.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError) as exc_j:
+                        raise SandboxError(f"Invalid AGY OAuth memfd JSON: {exc_j}") from exc_j
+                    if not isinstance(tok_doc, dict) or "id_token_email" in tok_doc:
+                        raise SandboxError("Unprojected AGY OAuth payload rejected at sandbox boundary (id_token_email present)")
+                    tok_inner = tok_doc.get("token")
+                    if not isinstance(tok_inner, dict) or "refresh_token" in tok_inner:
+                        raise SandboxError("Unprojected AGY OAuth payload rejected at sandbox boundary (refresh_token present)")
+                    canon_oauth = _project_agy_auth_for_sandbox(tok_doc)
+                    if not canon_oauth:
+                        raise SandboxError("AGY OAuth projection empty or missing access_token at sandbox boundary")
                 finally:
-                    os.close(sbh_b_fd)
-            obox_b_fd = os.dup(outbox_fd) if outbox_fd is not None else open_dir_nofollow(outbox_dir, create=True, mode=0o700)
-            retain_fds.append(obox_b_fd)
-            argv.extend(["--bind-fd", str(obox_b_fd), "/ap-outbox"])
+                    os.close(dup_read_fd)
 
-            writable_set = set(spec["writable_mounts"])
+                # Always synthesize canonical OAuth, role-authoritative settings.json, and empty MCP/hooks memfds here!
+                deny_rules = [
+                    *list(POLICY_MANIFEST.get("agy_permission_deny") or []),
+                    *list(spec.get("agy_extra_permission_deny") or []),
+                ]
+                allow_rules = list(spec.get("agy_permission_allow") or [])
+                canon_settings = {"permissions": {"allow": allow_rules, "deny": deny_rules}}
+                synth_files: list[tuple[str, str, bytes]] = [
+                    (
+                        "/home/sandbox/.gemini/antigravity-cli/antigravity-oauth-token",
+                        "ap_agy_oauth_canon",
+                        (json.dumps(canon_oauth, indent=2) + "\n").encode("utf-8"),
+                    ),
+                    (
+                        "/home/sandbox/.gemini/antigravity-cli/settings.json",
+                        "ap_agy_settings_canon",
+                        (json.dumps(canon_settings, indent=2) + "\n").encode("utf-8"),
+                    ),
+                    ("/home/sandbox/.gemini/config/hooks.json", "ap_agy_hooks_canon", b"{}\n"),
+                    ("/home/sandbox/.gemini/config/mcp_config.json", "ap_agy_mcp_canon", b"{}\n"),
+                ]
+                for dst_p, mname, payload_b in synth_files:
+                    mfd = _make_memfd_with_bytes(mname, payload_b)
+                    retain_fds.append(mfd)
+                    argv.extend(["--ro-bind-data", str(mfd), dst_p])
+            else:
+                exp_sub_nm = ".claude" if role_is_claude else ".codex"
+                allowed_fnames = (
+                    {".credentials.json", "settings.json"}
+                    if role_is_claude
+                    else {"auth.json", "models_cache.json", "config.toml"}
+                )
+                argv.extend(["--tmpfs", "/home/sandbox", "--dir", f"/home/sandbox/{exp_sub_nm}"])
+                if sandbox_file_fds is not None:
+                    for dst_p, src_mfd in sorted(sandbox_file_fds.items()):
+                        if Path(dst_p).parent != Path(f"/home/sandbox/{exp_sub_nm}") or Path(dst_p).name not in allowed_fnames:
+                            raise SandboxError(f"Unauthorized sandbox_file_fds destination {dst_p!r} for role {role_key}")
+                        dup_mfd = os.dup(src_mfd)
+                        os.lseek(dup_mfd, 0, os.SEEK_SET)
+                        retain_fds.append(dup_mfd)
+                        argv.extend(["--ro-bind-data", str(dup_mfd), dst_p])
+                else:
+                    sbh_b_fd = os.dup(sandbox_home_fd) if sandbox_home_fd is not None else open_dir_nofollow(sandbox_home, create=True, mode=0o700)
+                    try:
+                        try:
+                            sub_b_fd = os.open(exp_sub_nm, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=sbh_b_fd)
+                        except FileNotFoundError:
+                            sub_b_fd = None
+                        if sub_b_fd is not None:
+                            try:
+                                try:
+                                    exp_sub_tok = os.getxattr(sbh_b_fd, b"user.ap_sub_id").decode("ascii", errors="replace")
+                                except OSError as exc_xt:
+                                    raise SandboxError(
+                                        f"Missing or unreadable user.ap_sub_id on sandbox_home_fd; refusing unverified {exp_sub_nm}: {exc_xt}"
+                                    ) from exc_xt
+                                if not exp_sub_tok or not verify_cred_owner_token(sub_b_fd, exp_sub_tok):
+                                    raise SandboxError(f"Refusing replaced/foreign {exp_sub_nm} directory inside sandbox_home")
+                                with os.scandir(sub_b_fd) as s_it:
+                                    fnames = sorted(e.name for e in s_it if not e.name.startswith(".ap-qbox-"))
+                                for fn in fnames:
+                                    if fn not in allowed_fnames:
+                                        raise SandboxError(f"Unauthorized file {fn!r} inside sandbox_home/{exp_sub_nm} for {role_key}")
+                                    f_ro_fd = os.open(fn, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=sub_b_fd)
+                                    if not stat.S_ISREG(os.fstat(f_ro_fd).st_mode) or not verify_owned_file_token(f_ro_fd, exp_sub_tok):
+                                        os.close(f_ro_fd)
+                                        raise SandboxError(f"Foreign or non-regular file inside sandbox_home/{exp_sub_nm}: {fn!r}")
+                                    retain_fds.append(f_ro_fd)
+                                    argv.extend(["--ro-bind-fd", str(f_ro_fd), f"/home/sandbox/{exp_sub_nm}/{fn}"])
+                            finally:
+                                os.close(sub_b_fd)
+                    finally:
+                        os.close(sbh_b_fd)
+            if "outbox" in writable_set:
+                obox_b_fd = os.dup(outbox_fd) if outbox_fd is not None else open_dir_nofollow(outbox_dir, create=True, mode=0o700)
+                retain_fds.append(obox_b_fd)
+                argv.extend(["--bind-fd", str(obox_b_fd), "/ap-outbox"])
+
             if "shared_tmp" in writable_set:
                 if shared_tmp is None:
                     raise SandboxError(f"{role_key} requires shared_tmp")
@@ -981,6 +1198,21 @@ def build_model_ring_bwrap(
                     dg_fd = os.open(".git", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=wt_fd_m)
                     retain_fds.append(dg_fd)
                     argv.extend(["--ro-bind-fd", str(dg_fd), f"{wt_real}/.git"])
+                if role_is_agy:
+                    # Always mask ALL 4 AGY workspace customization dirs (`.agents`, `.agent`, `_agent`, `_agents`)
+                    # with host-owned empty read-only dirs (creating empty mountpoints if absent, refusing symlinks/non-dirs)!
+                    for ag_dir_name in (".agents", ".agent", "_agent", "_agents"):
+                        try:
+                            st_ag = os.stat(ag_dir_name, dir_fd=wt_fd_m, follow_symlinks=False)
+                        except FileNotFoundError:
+                            os.mkdir(ag_dir_name, 0o700, dir_fd=wt_fd_m)
+                            st_ag = os.stat(ag_dir_name, dir_fd=wt_fd_m, follow_symlinks=False)
+                        if stat.S_ISLNK(st_ag.st_mode) or not stat.S_ISDIR(st_ag.st_mode):
+                            raise SandboxError(f"Refusing symlinked or non-directory {ag_dir_name} in worktree for AGY")
+                        empty_ag_dir = ensure_secure_dir(sandbox_home.parent / f".ap-empty-agents-{uuid.uuid4().hex[:8]}", 0o500)
+                        empty_ag_fd = open_dir_nofollow(empty_ag_dir, create=False)
+                        retain_fds.append(empty_ag_fd)
+                        argv.extend(["--ro-bind-fd", str(empty_ag_fd), f"{wt_real}/{ag_dir_name}"])
             elif spec.get("readonly_review_bundle_mount"):
                 if review_bundle_dir is None:
                     raise SandboxError(f"{role_key} requires existing review_bundle_dir")
@@ -988,15 +1220,28 @@ def build_model_ring_bwrap(
                 retain_fds.append(rb_b_fd)
                 mnt = str(spec["readonly_review_bundle_mount"])
                 argv.extend(["--ro-bind-fd", str(rb_b_fd), mnt, "--chdir", mnt])
+                if role_is_agy:
+                    for ag_dir_name in (".agents", ".agent", "_agent", "_agents"):
+                        try:
+                            st_rb_ag = os.stat(ag_dir_name, dir_fd=rb_b_fd, follow_symlinks=False)
+                        except FileNotFoundError:
+                            st_rb_ag = None
+                        if st_rb_ag is not None:
+                            if stat.S_ISLNK(st_rb_ag.st_mode) or not stat.S_ISDIR(st_rb_ag.st_mode):
+                                raise SandboxError(f"Refusing symlinked or non-directory {ag_dir_name} in review_bundle for AGY")
+                            empty_rb_ag = ensure_secure_dir(sandbox_home.parent / f".ap-empty-agents-{uuid.uuid4().hex[:8]}", 0o500)
+                            empty_rb_fd = open_dir_nofollow(empty_rb_ag, create=False)
+                            retain_fds.append(empty_rb_fd)
+                            argv.extend(["--ro-bind-fd", str(empty_rb_fd), f"{mnt}/{ag_dir_name}"])
         except (AutopilotError, OSError) as exc:
             raise SandboxError(f"Failed to bind-fd model_ring directories for {role_key}: {exc}") from exc
     else:
         ensure_secure_dir(sandbox_home, 0o700)
-        ensure_secure_dir(outbox_dir, 0o700)
         argv.extend(["--bind", str(sandbox_home.resolve()), "/home/sandbox"])
-        argv.extend(["--bind", str(outbox_dir.resolve()), "/ap-outbox"])
+        if "outbox" in writable_set:
+            ensure_secure_dir(outbox_dir, 0o700)
+            argv.extend(["--bind", str(outbox_dir.resolve()), "/ap-outbox"])
 
-        writable_set = set(spec["writable_mounts"])
         if "shared_tmp" in writable_set:
             if shared_tmp is None:
                 raise SandboxError(f"{role_key} requires shared_tmp")
@@ -1043,19 +1288,26 @@ def build_model_ring_bwrap(
             "--setenv",
             "LANG",
             "C.UTF-8",
-            "--setenv",
-            "AP_OUTBOX_DIR",
-            "/ap-outbox",
         ]
     )
+    if "outbox" in writable_set:
+        argv.extend(["--setenv", "AP_OUTBOX_DIR", "/ap-outbox"])
 
     # ap-sandbox-init wrapper + Landlock allowlist derived strictly from mounted container executables
     allowed_manifest_set = set(spec["landlock_allow_exec"])
+    known_linux_loaders = {
+        "/usr/lib64/ld-linux-x86-64.so.2",
+        "/usr/lib/ld-linux-aarch64.so.1",
+        "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+        "/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
+    }
+    if spec.get("dynamic_elf_libs"):
+        allowed_manifest_set |= known_linux_loaders
     init_args = ["/usr/local/bin/ap-sandbox-init"]
     if proxy_sock is not None:
         init_args.extend(["--proxy-sock", "/run/ap/proxy.sock"])
     for allow_p in mounted_exec_targets:
-        if allow_p in allowed_manifest_set or "ld-linux" in allow_p:
+        if allow_p in allowed_manifest_set:
             init_args.extend(["--allow-exec", allow_p])
     init_args.append("--")
 
@@ -1068,8 +1320,51 @@ def build_model_ring_bwrap(
             if fl not in rest:
                 rest = [*mandatory_flags, *rest]
                 break
-        if tools_csv and "--tools" not in rest and "--version" not in rest:
+        if tools_csv and "--tools" not in rest and rest != ["--version"]:
             rest = ["--tools", tools_csv, *rest]
+        init_args.extend([cli_bin, *rest])
+    elif role_key.startswith("agy:"):
+        cli_bin = inner_cmd[0]
+        rest = list(inner_cmd[1:])
+        is_version_probe = rest == ["--version"]
+        if not is_version_probe:
+            # Parse flags strictly by flag name AND value (both `--flag` and `--flag=val`)
+            forbidden_all = {"--remote-agent", "--remote-control", "--settings", "--dangerously-skip-permissions"}
+            forbidden_ro = forbidden_all | {"--add-dir", "--continue", "-c", "--conversation", "--prompt-interactive", "-i"}
+            forbidden_set = forbidden_ro if role_key == "agy:readonly_model" else forbidden_all
+            expected_mode = "plan" if role_key == "agy:readonly_model" else "accept-edits"
+            cleaned_rest: list[str] = []
+            i = 0
+            while i < len(rest):
+                tok = rest[i]
+                fname = tok.split("=", 1)[0]
+                if fname in forbidden_set:
+                    raise SandboxError(f"Forbidden flag {fname!r} for role {role_key}")
+                if fname == "--mode":
+                    if "=" in tok:
+                        mval = tok.split("=", 1)[1]
+                    elif i + 1 < len(rest):
+                        mval = rest[i + 1]
+                        i += 1
+                    else:
+                        raise SandboxError(f"Missing value for --mode in role {role_key}")
+                    if mval != expected_mode:
+                        raise SandboxError(f"{role_key} requires --mode {expected_mode}, got {mval!r}")
+                    # Host emits canonical `--mode <expected_mode>` once below!
+                    i += 1
+                    continue
+                if fname == "--disable-slash-commands":
+                    if "=" in tok:
+                        dval = tok.split("=", 1)[1].strip().lower()
+                        if dval not in ("true", "1"):
+                            raise SandboxError(f"{role_key} forbids disabling --disable-slash-commands (got {tok!r})")
+                    # Host emits canonical `--disable-slash-commands` once below!
+                    i += 1
+                    continue
+                cleaned_rest.append(tok)
+                i += 1
+            mandatory_flags = list(spec.get("agy_cli_flags", []))
+            rest = [*mandatory_flags, *cleaned_rest]
         init_args.extend([cli_bin, *rest])
     else:
         init_args.extend(inner_cmd)
@@ -1606,6 +1901,7 @@ def build_execution_ring_bwrap(
     trusted_base_cache_fd: int | None = None,
     repo_main_dir: Path | None = None,
     ro_workspace_deps: tuple[str, ...] | list[str] = (),
+    mask_ro_empty_dirs: tuple[str, ...] | list[str] = (),
 ) -> list[str]:
     """Assemble network-isolated, credential-free execution rings (tool_ring, git_ops_ring, verify_ring)."""
     if (clean_tree_fd is not None or verify_out_fd is not None or trusted_base_cache_fd is not None or bool(ro_workspace_deps)) and retain_fds is None:
@@ -1794,6 +2090,48 @@ def build_execution_ring_bwrap(
                     retain_fds=retain_fds,
                 )
             )
+        if mask_ro_empty_dirs:
+            if retain_fds is None or wt_fd_tool is None:
+                raise SandboxError("tool_ring mask_ro_empty_dirs requires retain_fds")
+            # Host-only empty directory strictly OUTSIDE `/ap-tool-cache`, `worktree`, and `/tmp` so tool_ring cannot mutate it!
+            writable_roots = (wt_real, ephemeral_tool_cache.resolve(), shared_tmp.resolve())
+            rt_mask_base = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+            mask_candidates: list[Path] = []
+            if rt_mask_base.is_dir() and os.access(rt_mask_base, os.W_OK):
+                mask_candidates.append(rt_mask_base / "ap-ro-masks")
+            mask_candidates.append(Path.home() / ".cache" / "ap-ro-masks")
+            mask_parent: Path | None = None
+            for cand_mp in mask_candidates:
+                cand_res = cand_mp.resolve()
+                if any(cand_res == wr or cand_res.is_relative_to(wr) or wr.is_relative_to(cand_res) for wr in writable_roots):
+                    continue
+                mask_parent = cand_mp
+                break
+            if mask_parent is None:
+                raise SandboxError(
+                    "Refusing tool_ring RO mask: all candidate mask roots overlap writable worktree/cache/shared_tmp"
+                )
+            ensure_secure_dir(mask_parent, 0o700)
+            empty_t_dir = ensure_secure_dir(mask_parent / "empty", 0o500)
+            empty_t_res = empty_t_dir.resolve()
+            if any(empty_t_res == wr or empty_t_res.is_relative_to(wr) or wr.is_relative_to(empty_t_res) for wr in writable_roots):
+                raise SandboxError(f"Refusing tool_ring RO mask overlapping writable mount: {empty_t_res}")
+            for mdir_name in mask_ro_empty_dirs:
+                if "/" in mdir_name or "\\" in mdir_name or mdir_name in ("", ".", ".."):
+                    raise SandboxError(f"Invalid mask_ro_empty_dirs entry: {mdir_name!r}")
+                try:
+                    st_m = os.stat(mdir_name, dir_fd=wt_fd_tool, follow_symlinks=False)
+                except FileNotFoundError:
+                    os.mkdir(mdir_name, 0o700, dir_fd=wt_fd_tool)
+                    st_m = os.stat(mdir_name, dir_fd=wt_fd_tool, follow_symlinks=False)
+                if stat.S_ISLNK(st_m.st_mode) or not stat.S_ISDIR(st_m.st_mode):
+                    raise SandboxError(f"Refusing symlinked or non-directory {mdir_name} in tool_ring worktree")
+                empty_t_fd = open_dir_nofollow(empty_t_dir, create=False)
+                if any(os.scandir(empty_t_fd)):
+                    os.close(empty_t_fd)
+                    raise SandboxError(f"Host RO empty mask directory is not empty: {empty_t_dir}")
+                retain_fds.append(empty_t_fd)
+                argv.extend(["--ro-bind-fd", str(empty_t_fd), f"{wt_real}/{mdir_name}"])
         if shell_snapshots and shell_snapshots.exists():
             argv.extend(["--ro-bind", str(shell_snapshots.resolve()), "/ap-shell-snapshots"])
         argv.extend(["--bind", str(ephemeral_tool_cache.resolve()), "/ap-tool-cache"])
@@ -2758,42 +3096,337 @@ def verify_unit_terminated(unit_name: str, expected_cgroup_dir: Path | str, *, u
     return False
 
 
+def _safe_nonneg_int(val: Any) -> int | None:
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, int) and val >= 0:
+        return val
+    return None
+
+
+def _safe_nonneg_float(val: Any) -> float | None:
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        f = float(val)
+        if math.isfinite(f) and f >= 0.0:
+            return f
+    return None
+
+
+def parse_cli_turn_output(
+    family: str,
+    raw_stdout: str,
+    *,
+    raw_stderr: str = "",
+    exit_code: int = 0,
+    strict_envelope: bool = False,
+    output_format: str = "",
+) -> dict[str, Any]:
+    """Decode CLI protocol envelope (Claude JSON/JSONL, Codex JSONL, AGY JSON/stream-json) into normalized text + token/cost usage."""
+    base: dict[str, Any] = {
+        "ok": exit_code == 0,
+        "status": "ok" if exit_code == 0 else "error",
+        "text": raw_stdout or "",
+        "model_reported": "",
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "thinking_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "cost_usd": None,
+        "cost_known": False,
+        "usage_known": False,
+        "error_detail": "",
+        "envelope_detected": False,
+    }
+    stripped = (raw_stdout or "").strip()
+    if not stripped:
+        if strict_envelope:
+            base["ok"] = False
+            base["status"] = "error"
+            base["error_detail"] = f"{family} CLI produced empty stdout"
+        return base
+
+    if family == "agy":
+        res_obj: dict[str, Any] | None = None
+        model_rep = ""
+        # Accept bare single JSON object ONLY when not explicitly in stream-json mode
+        if output_format != "stream-json" and stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                cand = json.loads(stripped)
+                if isinstance(cand, dict):
+                    if cand.get("event") == "result" and isinstance(cand.get("result"), dict):
+                        res_obj = cand["result"]
+                    elif "status" in cand and ("response" in cand or "usage" in cand or "error" in cand):
+                        res_obj = cand
+            except json.JSONDecodeError:
+                pass
+        # NDJSON (`--output-format stream-json`): accept ONLY explicit `event == "result"` terminal objects!
+        # Split strictly on `\n` (NOT str.splitlines(), which breaks legal RFC 8259 U+2028/U+2029 inside JSON strings!).
+        if res_obj is None:
+            for line in stripped.split("\n"):
+                s = line.strip()
+                if not s.startswith("{"):
+                    continue
+                try:
+                    ev = json.loads(s)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(ev, dict):
+                    continue
+                if ev.get("event") == "init" and isinstance(ev.get("init"), dict):
+                    m0 = ev["init"].get("model")
+                    if isinstance(m0, str) and m0.strip():
+                        model_rep = m0.strip()
+                elif ev.get("event") == "result" and isinstance(ev.get("result"), dict):
+                    res_obj = ev["result"]
+        if res_obj is None:
+            if strict_envelope:
+                base["ok"] = False
+                base["status"] = "error"
+                base["error_detail"] = "AGY CLI output missing terminal JSON result envelope"
+            return base
+        base["envelope_detected"] = True
+        if model_rep:
+            base["model_reported"] = model_rep
+        st_str = str(res_obj.get("status") or "").strip().upper()
+        base["text"] = str(res_obj.get("response") or "")
+        err_str = str(res_obj.get("error") or "").strip()
+        if err_str:
+            base["error_detail"] = err_str
+        usage = res_obj.get("usage")
+        if isinstance(usage, dict):
+            in_t = _safe_nonneg_int(usage.get("input_tokens"))
+            out_t = _safe_nonneg_int(usage.get("output_tokens"))
+            thk_t = _safe_nonneg_int(usage.get("thinking_tokens"))
+            cr_t = _safe_nonneg_int(usage.get("cache_read_tokens"))
+            cw_t = _safe_nonneg_int(usage.get("cache_write_tokens"))
+            if in_t is not None or out_t is not None:
+                base["input_tokens"] = in_t or 0
+                base["output_tokens"] = out_t or 0
+                base["thinking_tokens"] = thk_t or 0
+                base["cache_read_tokens"] = cr_t or 0
+                base["cache_write_tokens"] = cw_t or 0
+                base["usage_known"] = True
+        cost_val = _safe_nonneg_float(res_obj.get("total_cost_usd"))
+        if cost_val is None:
+            cost_val = _safe_nonneg_float(res_obj.get("cost_usd"))
+        base["cost_usd"] = cost_val
+        base["cost_known"] = cost_val is not None
+        if exit_code != 0 or st_str != "SUCCESS":
+            base["ok"] = False
+            base["status"] = "error"
+            if not base["error_detail"]:
+                base["error_detail"] = f"AGY terminal status={st_str or 'UNKNOWN'}"
+        return base
+
+    if family == "claude":
+        ev_res: dict[str, Any] | None = None
+        _claude_res_keys = ("result", "usage", "is_error", "total_cost_usd", "cost_usd")
+        # Try single JSON object first; on JSONDecodeError (e.g. multi-line JSONL starting/ending with braces!), scan lines!
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                single = json.loads(stripped)
+                if isinstance(single, dict) and single.get("type") == "result" and any(k in single for k in _claude_res_keys):
+                    ev_res = single
+            except json.JSONDecodeError:
+                pass
+        if ev_res is None:
+            for line in stripped.split("\n"):
+                s = line.strip()
+                if not s.startswith("{"):
+                    continue
+                try:
+                    obj = json.loads(s)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(obj, dict) and obj.get("type") == "result" and any(k in obj for k in _claude_res_keys):
+                    ev_res = obj
+        if ev_res is None:
+            if strict_envelope:
+                base["ok"] = False
+                base["status"] = "error"
+                base["error_detail"] = "Claude CLI output missing terminal result JSON envelope"
+            return base
+        base["envelope_detected"] = True
+        res_txt = ev_res.get("result")
+        base["text"] = res_txt if isinstance(res_txt, str) else (json.dumps(res_txt) if res_txt is not None else "")
+        is_err = bool(ev_res.get("is_error"))
+        subtype = str(ev_res.get("subtype") or "").strip().lower()
+        usage = ev_res.get("usage")
+        if isinstance(usage, dict):
+            raw_in = _safe_nonneg_int(usage.get("input_tokens")) or 0
+            cr = _safe_nonneg_int(usage.get("cache_read_input_tokens")) or 0
+            cw = _safe_nonneg_int(usage.get("cache_creation_input_tokens")) or 0
+            out_t = _safe_nonneg_int(usage.get("output_tokens"))
+            if out_t is not None or raw_in > 0 or cr > 0 or cw > 0:
+                base["input_tokens"] = raw_in + cr + cw
+                base["output_tokens"] = out_t or 0
+                base["cache_read_tokens"] = cr
+                base["cache_write_tokens"] = cw
+                base["usage_known"] = True
+        claude_cost = _safe_nonneg_float(ev_res.get("total_cost_usd"))
+        if claude_cost is None:
+            claude_cost = _safe_nonneg_float(ev_res.get("cost_usd"))
+        base["cost_usd"] = claude_cost
+        base["cost_known"] = claude_cost is not None
+        if exit_code != 0 or is_err or (subtype and subtype != "success"):
+            base["ok"] = False
+            base["status"] = "error"
+            base["error_detail"] = str(ev_res.get("error") or base["text"] or f"Claude result subtype={subtype or 'error'}")[:500]
+        return base
+
+    if family == "codex":
+        # Codex emits thread-cumulative token snapshots on `turn.completed`; keep latest snapshot per thread_id!
+        thread_snapshots: dict[str, tuple[int, int, int, int, int]] = {}
+        thread_costs: dict[str, float] = {}
+        thread_cost_complete: dict[str, bool] = {}
+        started_threads: set[str] = set()
+        completed_threads: set[str] = set()
+        current_thread_id = "default"
+        saw_codex_event = False
+        saw_turn_completed = False
+        last_turn_terminal = ""
+        last_err_msg = ""
+        last_agent_msg: str | None = None
+        for line in stripped.split("\n"):
+            s = line.strip()
+            if not s.startswith("{"):
+                continue
+            try:
+                ev = json.loads(s)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(ev, dict):
+                continue
+            etype = ev.get("type")
+            if not isinstance(etype, str):
+                continue
+            if etype in ("thread.started", "turn.started", "turn.completed", "turn.failed", "item.started", "item.completed", "error"):
+                saw_codex_event = True
+            if etype == "thread.started":
+                tid_val = ev.get("thread_id")
+                if isinstance(tid_val, str) and tid_val.strip():
+                    current_thread_id = tid_val.strip()
+            elif etype == "turn.started":
+                # Reset terminal status, message, and cost completeness on each new turn so timeout/failure keeps subtotal marked incomplete!
+                last_turn_terminal = "started"
+                last_agent_msg = None
+                started_threads.add(current_thread_id)
+                thread_cost_complete[current_thread_id] = False
+            elif etype == "item.completed" and isinstance(ev.get("item"), dict):
+                item = ev["item"]
+                if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
+                    last_agent_msg = item["text"]
+            elif etype == "turn.completed":
+                saw_turn_completed = True
+                last_turn_terminal = "completed"
+                completed_threads.add(current_thread_id)
+                cv = _safe_nonneg_float(ev.get("cost_usd"))
+                if cv is None:
+                    cv = _safe_nonneg_float(ev.get("total_cost_usd"))
+                if cv is not None:
+                    prev_c = thread_costs.get(current_thread_id)
+                    thread_costs[current_thread_id] = max(prev_c, cv) if prev_c is not None else cv
+                    thread_cost_complete[current_thread_id] = True
+                else:
+                    # Latest completed turn on this thread omitted cumulative cost -> subtotal is incomplete!
+                    thread_cost_complete[current_thread_id] = False
+                if isinstance(ev.get("usage"), dict):
+                    u = ev["usage"]
+                    in_v = _safe_nonneg_int(u.get("input_tokens"))
+                    out_v = _safe_nonneg_int(u.get("output_tokens"))
+                    cr_v = _safe_nonneg_int(u.get("cached_input_tokens"))
+                    cw_v = _safe_nonneg_int(u.get("cache_write_input_tokens"))
+                    thk_v = _safe_nonneg_int(u.get("reasoning_output_tokens"))
+                    if in_v is not None or out_v is not None:
+                        prev = thread_snapshots.get(current_thread_id)
+                        if prev is None:
+                            thread_snapshots[current_thread_id] = (
+                                in_v or 0,
+                                out_v or 0,
+                                cr_v or 0,
+                                cw_v or 0,
+                                thk_v or 0,
+                            )
+                        else:
+                            # Keep monotonic latest cumulative thread snapshot (prevents double-counting replays & multi-turn snapshots!)
+                            thread_snapshots[current_thread_id] = (
+                                max(prev[0], in_v or 0),
+                                max(prev[1], out_v or 0),
+                                max(prev[2], cr_v or 0),
+                                max(prev[3], cw_v or 0),
+                                max(prev[4], thk_v or 0),
+                            )
+            elif etype == "turn.failed":
+                last_turn_terminal = "failed"
+                started_threads.add(current_thread_id)
+                thread_cost_complete[current_thread_id] = False
+                err_obj = ev.get("error")
+                if isinstance(err_obj, dict) and err_obj.get("message"):
+                    last_err_msg = str(err_obj["message"])
+                elif isinstance(ev.get("message"), str):
+                    last_err_msg = str(ev["message"])
+            elif etype == "error":
+                # Transient mid-turn error is diagnostic only; final turn.completed / turn.failed + exit_code decides outcome!
+                err_obj = ev.get("error")
+                if isinstance(err_obj, dict) and err_obj.get("message"):
+                    last_err_msg = str(err_obj["message"])
+                elif isinstance(ev.get("message"), str):
+                    last_err_msg = str(ev["message"])
+        if not saw_codex_event:
+            if strict_envelope:
+                base["ok"] = False
+                base["status"] = "error"
+                base["error_detail"] = "Codex CLI output missing JSONL event stream"
+            return base
+        base["envelope_detected"] = True
+        if last_agent_msg is not None:
+            base["text"] = last_agent_msg
+        if thread_snapshots:
+            base["input_tokens"] = sum(s[0] for s in thread_snapshots.values())
+            base["output_tokens"] = sum(s[1] for s in thread_snapshots.values())
+            base["cache_read_tokens"] = sum(s[2] for s in thread_snapshots.values())
+            base["cache_write_tokens"] = sum(s[3] for s in thread_snapshots.values())
+            base["thinking_tokens"] = sum(s[4] for s in thread_snapshots.values())
+            base["usage_known"] = True
+        all_threads = set(thread_snapshots.keys()) | completed_threads | started_threads | set(thread_costs.keys())
+        base["cost_usd"] = sum(thread_costs.values()) if thread_costs else None
+        base["cost_known"] = bool(all_threads) and all(thread_cost_complete.get(tid, False) for tid in all_threads)
+        # Require confirmed successful `turn.completed` on the FINAL turn (turn.started-only or trailing unfinished turn MUST fail!)
+        if exit_code != 0 or not saw_turn_completed or last_turn_terminal != "completed":
+            base["ok"] = False
+            base["status"] = "error"
+            base["error_detail"] = last_err_msg or "Codex JSONL stream missing successful terminal turn.completed event"
+        return base
+
+    return base
+
+
 def parse_session_usage(jsonl_lines: list[str]) -> dict[str, Any]:
-    """Parse full-session deduplicated token usage & cost from Claude or Codex JSONL streams."""
-    seen_ids: set[str] = set()
-    in_tok = 0
-    out_tok = 0
-    cost_usd = 0.0
-    for raw in jsonl_lines:
-        s = raw.strip()
-        if not s.startswith("{"):
-            continue
-        try:
-            ev = json.loads(s)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(ev, dict):
-            continue
-        if ev.get("type") == "result" and isinstance(ev.get("usage"), dict):
-            u = ev["usage"]
+    """Parse full-session deduplicated token usage & cost from Claude, Codex, or AGY JSON/JSONL streams."""
+    raw = "\n".join(jsonl_lines)
+    for fam in ("claude", "agy", "codex"):
+        parsed = parse_cli_turn_output(fam, raw, exit_code=0, strict_envelope=False)
+        if parsed["envelope_detected"] and (parsed["usage_known"] or parsed["cost_usd"] is not None):
             return {
-                "input_tokens": int(u.get("input_tokens", 0))
-                + int(u.get("cache_read_input_tokens", 0))
-                + int(u.get("cache_creation_input_tokens", 0)),
-                "output_tokens": int(u.get("output_tokens", 0)),
-                "cost_usd": float(ev.get("total_cost_usd") or 0.0),
+                "input_tokens": int(parsed["input_tokens"]),
+                "output_tokens": int(parsed["output_tokens"]),
+                "cache_read_tokens": int(parsed["cache_read_tokens"]),
+                "cache_write_tokens": int(parsed["cache_write_tokens"]),
+                "thinking_tokens": int(parsed["thinking_tokens"]),
+                "cost_usd": float(parsed["cost_usd"]) if parsed["cost_usd"] is not None else 0.0,
+                "cost_known": bool(parsed["cost_known"]),
             }
-        if ev.get("type") == "turn.completed" and isinstance(ev.get("usage"), dict):
-            uid = str(ev.get("turn_id") or len(seen_ids))
-            if uid not in seen_ids:
-                seen_ids.add(uid)
-                u = ev["usage"]
-                in_tok += int(u.get("input_tokens", 0))
-                out_tok += int(u.get("output_tokens", 0))
     return {
-        "input_tokens": in_tok,
-        "output_tokens": out_tok,
-        "cost_usd": cost_usd,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "thinking_tokens": 0,
+        "cost_usd": 0.0,
+        "cost_known": False,
     }
 
 

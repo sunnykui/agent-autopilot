@@ -108,6 +108,7 @@ def onboard_project(
     branch_prefix: str = "agent/",
     trust_tier: str = "T1",
     writer_family: str = "codex",
+    referee_families: list[str] | tuple[str, ...] | None = None,
     verify_cmd: str | None = None,
     write_scope: list[str] | None = None,
     routine_driver: str = "",
@@ -155,6 +156,7 @@ def onboard_project(
         write_scope=eff_scope,
         verify_cmd=eff_verify,
         writer_family=writer_family,
+        referee_families=tuple(str(x).strip() for x in (referee_families or []) if str(x).strip()),
         schedule_interval_sec=schedule_interval_sec,
         routine_driver=routine_driver or ("custom" if kind == "routine" else ""),
         delegated_cmd=delegated_cmd,
@@ -166,8 +168,28 @@ def onboard_project(
     )
 
     if overwrite or not workflow_path.exists():
-        workflow_path.write_text(render_workflow_markdown(cfg), encoding="utf-8")
-        os.chmod(workflow_path, 0o600)
+        import uuid as _uuid
+        from .models import parse_workflow_file
+
+        rendered = render_workflow_markdown(cfg)
+        tmp_wf = proj_cfg_dir / f".WORKFLOW.md.{_uuid.uuid4().hex[:8]}.tmp"
+        try:
+            tmp_wf.write_text(rendered, encoding="utf-8")
+            os.chmod(tmp_wf, 0o600)
+            # Validate candidate WORKFLOW.md with the authoritative parser BEFORE publishing!
+            parse_workflow_file(tmp_wf)
+            if overwrite:
+                os.replace(tmp_wf, workflow_path)
+            else:
+                try:
+                    # Atomic non-overwriting publish so concurrent first-time onboard cannot clobber!
+                    os.link(tmp_wf, workflow_path)
+                except FileExistsError:
+                    pass
+        finally:
+            with contextlib.suppress(OSError):
+                if tmp_wf.exists():
+                    tmp_wf.unlink()
 
     # Non-authoritative advisory files (Principle 02 + 03 + 05)
     adv_dir = ensure_secure_dir(sroot / "advisory" / project_id, 0o700)

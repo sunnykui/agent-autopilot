@@ -46,6 +46,7 @@ from ap_core.models import (  # noqa: E402
     POLICY_MANIFEST,
     AutopilotError,
     QuotaExhaustedError,
+    SandboxError,
     ScopeConflictError,
     ScopeViolationError,
     WorkflowConfig,
@@ -60,6 +61,7 @@ from ap_core.models import (  # noqa: E402
     parse_workflow_file,
     pinned_proc_fd_path,
     read_nonempty_token_file,
+    resolve_cross_family_referees,
     sanitize_terminal_text,
 )
 from ap_core.host_guard import (  # noqa: E402
@@ -79,9 +81,11 @@ from ap_core.sandbox import (  # noqa: E402
     cleanup_sandbox_home,
     cleanup_sandbox_home_at_dirfd,
     expected_transient_cgroup_dir,
+    parse_cli_turn_output,
     prepare_sandbox_home,
     prepare_sandbox_home_fd,
     prepare_sandbox_home_memfds,
+    resolve_family_proxy_allowlist,
     safe_read_outbox_file,
     safe_read_outbox_file_fd,
     spawn_transient_unit_under_flock,
@@ -120,6 +124,9 @@ def resolve_host_binaries() -> dict[str, Path]:
     claude_p = shutil.which("claude")
     if claude_p:
         out["claude_cli"] = Path(claude_p).resolve()
+    agy_p = shutil.which("agy")
+    if agy_p:
+        out["agy_cli"] = Path(agy_p).resolve()
     return out
 
 
@@ -296,17 +303,21 @@ class LiveSandboxedModelRunner:
         sb_memfds: dict[str, int] = {}
         obox_fd: int | None = None
         model_retain_fds: list[int] = []
-        obox = outbox_dir or ensure_secure_dir(eff_run_dir / f"outbox_{uuid.uuid4().hex[:6]}", 0o700)
-        obox_fd = open_dir_nofollow(obox, create=True, mode=0o700)
+        call_id = uuid.uuid4().hex[:8]
+        role_spec = POLICY_MANIFEST["role_matrix"].get(role_key, {})
+        needs_outbox = "outbox" in set(role_spec.get("writable_mounts") or [])
+        obox = outbox_dir or ensure_secure_dir(eff_run_dir / f"outbox_{call_id}", 0o700)
+        if needs_outbox:
+            obox_fd = open_dir_nofollow(obox, create=True, mode=0o700)
         shared_tmp = ensure_secure_dir(eff_run_dir / "shared_tmp", 0o700)
         snaps = ensure_secure_dir(eff_run_dir / "shell_snapshots", 0o700)
         eph_cache = ensure_secure_dir(eff_run_dir / "ephemeral_tool_cache", 0o700)
-        elf_stage = ensure_secure_dir(eff_run_dir / "elf_libs_stage", 0o700)
+        elf_stage = ensure_secure_dir(eff_run_dir / f"elf_libs_stage_{call_id}", 0o700)
         sock_dir = _create_short_socket_dir()
         proxy_sock = sock_dir / "p.sock"
         tool_sock = sock_dir / "t.sock"
 
-        proxy = AllowlistConnectProxyServer(proxy_sock)
+        proxy = AllowlistConnectProxyServer(proxy_sock, allowed_domains=resolve_family_proxy_allowlist(family))
         proxy.start()
         tool_srv: ToolExecServer | None = None
         try:
@@ -330,6 +341,7 @@ class LiveSandboxedModelRunner:
                             trusted_base_cache_fd=self.trusted_base_cache_fd,
                             repo_main_dir=self.repo_main_dir,
                             ro_workspace_deps=self.ro_workspace_deps,
+                            mask_ro_empty_dirs=(".agents", ".agent", "_agent", "_agents") if family == "agy" else (),
                         )
                         return t_argv, t_fds
                     except BaseException:
@@ -345,10 +357,12 @@ class LiveSandboxedModelRunner:
                 )
                 tool_srv.start()
 
+            stdin_payload = prompt
             if family == "codex":
                 inner = [
                     "/usr/local/bin/codex",
                     "exec",
+                    "--json",
                     "-m",
                     model,
                     "--dangerously-bypass-approvals-and-sandbox",
@@ -361,15 +375,30 @@ class LiveSandboxedModelRunner:
                     "/ap-outbox/verdict.json",
                     "-",
                 ]
-            else:
+            elif family == "claude":
                 inner = [
                     "/usr/local/bin/claude",
                     "-p",
                     "--model",
                     model,
                     "--output-format",
-                    "text",
+                    "json",
                 ]
+            elif family == "agy":
+                # Use paired stream-json stdin/stdout so large prompts never hit ARG_MAX or leak in /proc/cmdline!
+                inner = [
+                    "/usr/local/bin/agy",
+                    "--model",
+                    model,
+                    "--input-format",
+                    "stream-json",
+                    "--output-format",
+                    "stream-json",
+                    "--print=",
+                ]
+                stdin_payload = json.dumps({"event": "user", "message": {"content": prompt}}, ensure_ascii=False) + "\n"
+            else:
+                raise AutopilotError(f"Unsupported model family: {family!r}")
 
             argv = build_model_ring_bwrap(
                 role_key=role_key,
@@ -385,25 +414,94 @@ class LiveSandboxedModelRunner:
                 review_bundle_dir=review_bundle_dir,
                 elf_lib_stage_dir=elf_stage,
                 sandbox_file_fds=sb_memfds,
-                outbox_fd=obox_fd,
+                outbox_fd=obox_fd if needs_outbox else None,
                 retain_fds=model_retain_fds,
             )
-            proc = subprocess.run(
-                argv,
-                input=prompt,
-                capture_output=True,
-                text=True,
-                pass_fds=tuple(model_retain_fds),
-                timeout=2400,
-                check=False,
-            )
-            obox_txt = safe_read_outbox_file_fd(obox_fd, "verdict.json") if family == "codex" else None
-            return ModelTurnResult(
-                raw_stdout=proc.stdout or "",
-                raw_stderr=proc.stderr or "",
-                outbox_verdict_json=obox_txt,
+            out_fmt = "jsonl" if family == "codex" else ("stream-json" if family == "agy" else "json")
+            try:
+                proc = subprocess.run(
+                    argv,
+                    input=stdin_payload,
+                    capture_output=True,
+                    text=True,
+                    pass_fds=tuple(model_retain_fds),
+                    timeout=2400,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as texc:
+                def _dec_full(v: Any) -> str:
+                    if v is None:
+                        return ""
+                    return v.decode("utf-8", errors="replace") if isinstance(v, (bytes, bytearray)) else str(v)
+
+                # Decode FULL stdout BEFORE truncating diagnostics so a terminal usage event after long tool output is not lost!
+                full_out = _dec_full(texc.stdout)
+                partial_err = _dec_full(texc.stderr)[:262144]
+                salvaged = parse_cli_turn_output(
+                    family,
+                    full_out,
+                    raw_stderr=partial_err,
+                    exit_code=124,
+                    strict_envelope=False,
+                    output_format=out_fmt,
+                )
+                return ModelTurnResult(
+                    raw_stdout="",
+                    raw_stderr=partial_err + f"\nerror: {family} model turn timed out after 2400s\n",
+                    outbox_verdict_json=None,
+                    exit_code=124,
+                    model_used=str(salvaged.get("model_reported") or model),
+                    status="timeout",
+                    input_tokens=int(salvaged["input_tokens"]),
+                    output_tokens=int(salvaged["output_tokens"]),
+                    cache_read_tokens=int(salvaged["cache_read_tokens"]),
+                    cache_write_tokens=int(salvaged["cache_write_tokens"]),
+                    thinking_tokens=int(salvaged["thinking_tokens"]),
+                    cost_usd=salvaged["cost_usd"],
+                    cost_known=bool(salvaged["cost_known"]),
+                    usage_known=bool(salvaged["usage_known"]),
+                    protocol_decoded=True,
+                )
+            raw_out = proc.stdout or ""
+            raw_err = proc.stderr or ""
+            parsed = parse_cli_turn_output(
+                family,
+                raw_out,
+                raw_stderr=raw_err,
                 exit_code=proc.returncode,
-                model_used=model,
+                strict_envelope=(proc.returncode == 0),
+                output_format=out_fmt,
+            )
+            obox_txt: str | None = None
+            obox_err = ""
+            if family == "codex" and obox_fd is not None:
+                try:
+                    obox_txt = safe_read_outbox_file_fd(obox_fd, "verdict.json")
+                except (SandboxError, OSError, UnicodeDecodeError) as oexc:
+                    obox_txt = None
+                    obox_err = f"outbox verdict read error: {oexc}"
+            eff_ok = bool(parsed["ok"]) and not obox_err
+            eff_stderr = raw_err
+            if not parsed["ok"] and parsed.get("error_detail") and parsed["error_detail"] not in eff_stderr:
+                eff_stderr = (eff_stderr + "\n" + str(parsed["error_detail"])).strip()
+            if obox_err:
+                eff_stderr = (eff_stderr + "\n" + obox_err).strip()
+            return ModelTurnResult(
+                raw_stdout=str(parsed["text"]),
+                raw_stderr=eff_stderr,
+                outbox_verdict_json=obox_txt,
+                exit_code=proc.returncode if (proc.returncode != 0 or eff_ok) else 1,
+                model_used=str(parsed.get("model_reported") or model),
+                status="ok" if eff_ok else "error",
+                input_tokens=int(parsed["input_tokens"]),
+                output_tokens=int(parsed["output_tokens"]),
+                cache_read_tokens=int(parsed["cache_read_tokens"]),
+                cache_write_tokens=int(parsed["cache_write_tokens"]),
+                thinking_tokens=int(parsed["thinking_tokens"]),
+                cost_usd=parsed["cost_usd"],
+                cost_known=bool(parsed["cost_known"]),
+                usage_known=bool(parsed["usage_known"]),
+                protocol_decoded=True,
             )
         finally:
             for _mfd in model_retain_fds:
@@ -1930,21 +2028,52 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     gh_ok = shutil.which("gh") is not None
     lark_ok = shutil.which("lark-cli") is not None
     workflows = load_all_workflows()
+    needed_slots: set[str] = set()
+    missing_tools: set[str] = set()
+    for w in workflows:
+        if not w.enabled:
+            continue
+        if w.kind == "issue":
+            needed_slots.add(f"{w.writer_family}_cli")
+            for rf in resolve_cross_family_referees(w.writer_family, w.referee_families):
+                needed_slots.add(f"{rf}_cli")
+            if not gh_ok:
+                missing_tools.add("gh_cli")
+        elif w.kind == "routine":
+            if w.routine_driver == "lark_payments":
+                needed_slots.add("codex_cli")
+                if not lark_ok:
+                    missing_tools.add("lark_cli")
+            elif w.routine_driver in ("custom", ""):
+                has_shell = bool(str(w.extra.get("routine_cmd") or "").strip())
+                if not has_shell:
+                    needed_slots.add("codex_cli")
+    missing_workflow_clis = sorted({*(s for s in needed_slots if s not in bins), *missing_tools})
+    any_cli = any(k in bins for k in ("codex_cli", "claude_cli", "agy_cli"))
 
     report = {
         "version": __version__,
         "schema_version": SCHEMA_VERSION,
-        "ready": bool(native_ok and linger_ok and bwrap_ok and sd_run_ok and ("codex_cli" in bins or "claude_cli" in bins)),
+        "ready": bool(native_ok and linger_ok and bwrap_ok and sd_run_ok and any_cli and not missing_workflow_clis),
         "linger_enabled": linger_ok,
         "bwrap": bwrap_ok,
         "systemd_run": sd_run_ok,
         "gh_cli": gh_ok,
         "lark_cli": lark_ok,
+        "agy_cli": "agy_cli" in bins,
+        "missing_workflow_clis": missing_workflow_clis,
         "native_binaries_ok": native_ok,
         "native_error": native_err or None,
         "binaries": {k: str(v) for k, v in bins.items()},
         "projects": [
-            {"project_id": w.project_id, "kind": w.kind, "enabled": w.enabled, "tier": w.trust_tier}
+            {
+                "project_id": w.project_id,
+                "kind": w.kind,
+                "enabled": w.enabled,
+                "tier": w.trust_tier,
+                "writer_family": w.writer_family,
+                "referee_families": list(resolve_cross_family_referees(w.writer_family, w.referee_families)),
+            }
             for w in workflows
         ],
     }
@@ -2038,6 +2167,7 @@ def cmd_onboard(args: argparse.Namespace) -> int:
         branch_prefix=args.branch_prefix,
         trust_tier=args.tier,
         writer_family=args.writer_family,
+        referee_families=[s.strip() for s in (getattr(args, "referee_families", "") or "").split(",") if s.strip()] or None,
         verify_cmd=args.verify_cmd,
         write_scope=scope,
         routine_driver=args.routine_driver,
@@ -2770,7 +2900,8 @@ def build_parser() -> argparse.ArgumentParser:
     ob.add_argument("--base-ref", default="main")
     ob.add_argument("--branch-prefix", default="agent/")
     ob.add_argument("--tier", choices=["T1", "T2", "T3", "T4"], default="T1")
-    ob.add_argument("--writer-family", choices=["codex", "claude"], default="codex")
+    ob.add_argument("--writer-family", choices=["codex", "claude", "agy"], default="codex")
+    ob.add_argument("--referee-families", default="", help="Optional comma-separated distinct cross-family referees (e.g. 'claude,agy').")
     ob.add_argument("--verify-cmd", default=None)
     ob.add_argument("--write-scope", default="")
     ob.add_argument("--routine-driver", default="")

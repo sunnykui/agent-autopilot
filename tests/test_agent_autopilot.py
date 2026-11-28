@@ -101,9 +101,9 @@ def _init_git_repo(repo_dir: Path) -> str:
 class TestPolicyManifestAndGitGates(unittest.TestCase):
     def test_policy_manifest_samples_and_backslash_in_real_git_tree(self) -> None:
         m = POLICY_MANIFEST
-        self.assertEqual(m["schema_version"], 16)
+        self.assertEqual(m["schema_version"], 17)
         self.assertTrue(m["one_mutation_per_op_id"])
-        self.assertEqual(len(m["global_hard_stop_anchored"]), 69)
+        self.assertEqual(len(m["global_hard_stop_anchored"]), 79)
         self.assertEqual(len(m["global_hard_stop_basenames"]), 36)
         self.assertEqual(len(m["action_transport_map"]), 10)
         self.assertEqual(len(m["external_op_statuses"]), 11)
@@ -395,10 +395,10 @@ class TestTransactionalStateMachineAndReconciliation(unittest.TestCase):
         self.db.close()
         self.tmp.cleanup()
 
-    def _seed_receipts(self, unit_key: str, cand: str, *, touched: tuple[str, ...] = ("src/calc.py",), pr_id: str | None = None, seed_ready: bool = False) -> None:
+    def _seed_receipts(self, unit_key: str, cand: str, *, claim_epoch: int, touched: tuple[str, ...] = ("src/calc.py",), pr_id: str | None = None, seed_ready: bool = False) -> None:
         self.db.record_verify_receipt(
             unit_key=unit_key, candidate_sha=cand, dod_cmd="pytest", exit_code=0,
-            ui_verified=False, artifact_dir="/tmp", touched_paths=touched,
+            ui_verified=False, artifact_dir="/tmp", touched_paths=touched, claim_epoch=claim_epoch,
         )
         self.db.record_review_receipt(
             unit_key=unit_key,
@@ -410,6 +410,7 @@ class TestTransactionalStateMachineAndReconciliation(unittest.TestCase):
             defect_count=0,
             defects=[],
             raw_path="/tmp/r.json",
+            claim_epoch=claim_epoch,
         )
         if seed_ready and pr_id:
             with self.db.immediate_tx():
@@ -454,13 +455,13 @@ class TestTransactionalStateMachineAndReconciliation(unittest.TestCase):
             ephemeral_token_file="/tmp/ap-test.tok",
         )
         self.db.set_current_candidate(unit_key="A", candidate_sha="aaaaaaa111", claim_epoch=ce_a)
-        self._seed_receipts("A", "aaaaaaa111")
+        self._seed_receipts("A", "aaaaaaa111", claim_epoch=ce_a)
 
         # When ONLY A has its own worker prepared_local, set_current_candidate(A) aborts it and switches cleanly!
         op_a_self = self.db.prepare_op(unit_key="A", op_type="post_comment", claim_epoch=ce_a)
         self.db.set_current_candidate(unit_key="A", candidate_sha="aaaaaaa222", claim_epoch=ce_a)
         self.assertEqual(self.db.get_op(op_a_self)["status"], "aborted_pre_send")
-        self._seed_receipts("A", "aaaaaaa222")
+        self._seed_receipts("A", "aaaaaaa222", claim_epoch=ce_a)
 
         # Prepare an op on A so we can test promote_op_to_in_flight(A) once B adds a pending op
         op_a_ready = self.db.prepare_op(unit_key="A", op_type="post_comment", claim_epoch=ce_a)
@@ -536,7 +537,7 @@ class TestTransactionalStateMachineAndReconciliation(unittest.TestCase):
             bound_gh_login="autopilot-bot", ephemeral_token_file="/tmp/ap-test.tok",
         )
         self.db.set_current_candidate(unit_key="U1", candidate_sha="cand111", claim_epoch=ce)
-        self._seed_receipts("U1", "cand111")
+        self._seed_receipts("U1", "cand111", claim_epoch=ce)
         op_r = self.db.prepare_op(unit_key="U1", op_type="mark_pr_ready", claim_epoch=ce, candidate_sha="cand111")
         g = self.db.promote_op_to_in_flight(op_r, caller_owner_kind="worker", caller_epoch=ce)
         self.assertTrue(g.granted)
@@ -664,7 +665,7 @@ class TestTransactionalStateMachineAndReconciliation(unittest.TestCase):
             bound_gh_login="autopilot-bot", ephemeral_token_file="/tmp/ap-test.tok",
         )
         self.db.set_current_candidate(unit_key="U2", candidate_sha=cand, claim_epoch=ce2)
-        self._seed_receipts("U2", cand)
+        self._seed_receipts("U2", cand, claim_epoch=ce2)
         tr.sent_ops_log.clear()
         tr.prs["PR_2"] = PrSnapshot(**{**tr.prs["PR_2"].__dict__, "is_draft": False})
         op_p1 = self.db.prepare_op(unit_key="U2", op_type="push_branch", claim_epoch=ce2, candidate_sha=cand, payload={"expected_old_oid": base_sha})
@@ -749,7 +750,7 @@ class TestTransactionalStateMachineAndReconciliation(unittest.TestCase):
             bound_gh_login="autopilot-bot", ephemeral_token_file="/tmp/ap-test.tok",
         )
         self.db.set_current_candidate(unit_key="U3", candidate_sha=cand, claim_epoch=ce3)
-        self._seed_receipts("U3", cand)
+        self._seed_receipts("U3", cand, claim_epoch=ce3)
         op_cd1 = self.db.prepare_op(unit_key="U3", op_type="create_draft_pr", claim_epoch=ce3, candidate_sha=cand, ref_id_hmac="ap-ref3")
         g_cd1 = self.db.promote_op_to_in_flight(op_cd1, caller_owner_kind="worker", caller_epoch=ce3)
         self.db.consume_send_grant(g_cd1)
@@ -815,7 +816,7 @@ class TestTransactionalStateMachineAndReconciliation(unittest.TestCase):
             bound_gh_login="autopilot-bot", ephemeral_token_file="/tmp/ap-test.tok",
         )
         self.db.set_current_candidate(unit_key="UM", candidate_sha="candM1234567", claim_epoch=ce)
-        self._seed_receipts("UM", "candM1234567", pr_id="PR_M", seed_ready=True)
+        self._seed_receipts("UM", "candM1234567", claim_epoch=ce, pr_id="PR_M", seed_ready=True)
         op_eq1 = self.db.prepare_op(unit_key="UM", op_type="enqueue_pr", claim_epoch=ce, candidate_sha="candM1234567")
         g_eq1 = self.db.promote_op_to_in_flight(op_eq1, caller_owner_kind="worker", caller_epoch=ce)
         self.db.consume_send_grant(g_eq1)
@@ -1225,12 +1226,12 @@ class TestCodeReviewHardeningInvariants(unittest.TestCase):
                 db.set_current_candidate(unit_key="U_ONCE", candidate_sha="cand5555555", claim_epoch=ce)
                 db.record_verify_receipt(
                     unit_key="U_ONCE", candidate_sha="cand5555555", dod_cmd="true", exit_code=0,
-                    ui_verified=False, artifact_dir="/tmp", touched_paths=("src/calc.py",),
+                    ui_verified=False, artifact_dir="/tmp", touched_paths=("src/calc.py",), claim_epoch=ce,
                 )
                 db.record_review_receipt(
                     unit_key="U_ONCE", candidate_sha="cand5555555", writer_family="codex",
                     referee_family="claude", referee_model="claude-fable-5-2", verdict="APPROVE",
-                    defect_count=0, defects=[], raw_path="/tmp/r.json",
+                    defect_count=0, defects=[], raw_path="/tmp/r.json", claim_epoch=ce,
                 )
                 tr = FakeGitHubTransport()
                 tr.fail_op_types_unknown.add("create_draft_pr")
@@ -1493,8 +1494,8 @@ class TestCodeReviewHardeningInvariants(unittest.TestCase):
 
                 # 3. Unbound mark_pr_ready with caller-supplied pullRequestId MUST be rejected!
                 upg_db.set_current_candidate(unit_key="UC1", candidate_sha="cand1010", claim_epoch=ce_c1)
-                upg_db.record_verify_receipt(unit_key="UC1", candidate_sha="cand1010", dod_cmd="true", exit_code=0, ui_verified=False, artifact_dir="/tmp", touched_paths=("src/a.py",))
-                upg_db.record_review_receipt(unit_key="UC1", candidate_sha="cand1010", writer_family="codex", referee_family="claude", referee_model="claude-fable-5-2", verdict="APPROVE", defect_count=0, defects=[], raw_path="/tmp/r.json")
+                upg_db.record_verify_receipt(unit_key="UC1", candidate_sha="cand1010", dod_cmd="true", exit_code=0, ui_verified=False, artifact_dir="/tmp", touched_paths=("src/a.py",), claim_epoch=ce_c1)
+                upg_db.record_review_receipt(unit_key="UC1", candidate_sha="cand1010", writer_family="codex", referee_family="claude", referee_model="claude-fable-5-2", verdict="APPROVE", defect_count=0, defects=[], raw_path="/tmp/r.json", claim_epoch=ce_c1)
                 with self.assertRaises(AutopilotError):
                     upg_db.prepare_op(unit_key="UC1", op_type="mark_pr_ready", claim_epoch=ce_c1, candidate_sha="cand1010", payload={"pullRequestId": "OTHER_PR"})
 
@@ -1535,8 +1536,8 @@ class TestCodeReviewHardeningInvariants(unittest.TestCase):
                     bound_gh_login="autopilot-bot", ephemeral_token_file="/tmp/ap-test.tok",
                 )
                 upg_db.set_current_candidate(unit_key="UV", candidate_sha="candV20", claim_epoch=ce_v)
-                upg_db.record_verify_receipt(unit_key="UV", candidate_sha="candV20", dod_cmd="true", exit_code=0, ui_verified=False, artifact_dir="/tmp", touched_paths=("src/a.py",))
-                upg_db.record_review_receipt(unit_key="UV", candidate_sha="candV20", writer_family="codex", referee_family="claude", referee_model="claude-fable-5-2", verdict="APPROVE", defect_count=0, defects=[], raw_path="/tmp/r.json")
+                upg_db.record_verify_receipt(unit_key="UV", candidate_sha="candV20", dod_cmd="true", exit_code=0, ui_verified=False, artifact_dir="/tmp", touched_paths=("src/a.py",), claim_epoch=ce_v)
+                upg_db.record_review_receipt(unit_key="UV", candidate_sha="candV20", writer_family="codex", referee_family="claude", referee_model="claude-fable-5-2", verdict="APPROVE", defect_count=0, defects=[], raw_path="/tmp/r.json", claim_epoch=ce_v)
                 op_vr = upg_db.prepare_op(unit_key="UV", op_type="mark_pr_ready", claim_epoch=ce_v, candidate_sha="candV20")
                 g_vr = upg_db.promote_op_to_in_flight(op_vr, caller_owner_kind="worker", caller_epoch=ce_v)
                 upg_db.consume_send_grant(g_vr)
@@ -1779,8 +1780,8 @@ class TestCodeReviewHardeningInvariants(unittest.TestCase):
                     bound_gh_login="autopilot-bot", ephemeral_token_file="/tmp/ap-test.tok",
                 )
                 db4.set_current_candidate(unit_key="U4", candidate_sha="cand4000", claim_epoch=ce4)
-                db4.record_verify_receipt(unit_key="U4", candidate_sha="cand4000", dod_cmd="true", exit_code=0, ui_verified=False, artifact_dir="/tmp", touched_paths=("src/a.py",))
-                db4.record_review_receipt(unit_key="U4", candidate_sha="cand4000", writer_family="codex", referee_family="claude", referee_model="claude-fable-5-2", verdict="APPROVE", defect_count=0, defects=[], raw_path="/tmp/r.json")
+                db4.record_verify_receipt(unit_key="U4", candidate_sha="cand4000", dod_cmd="true", exit_code=0, ui_verified=False, artifact_dir="/tmp", touched_paths=("src/a.py",), claim_epoch=ce4)
+                db4.record_review_receipt(unit_key="U4", candidate_sha="cand4000", writer_family="codex", referee_family="claude", referee_model="claude-fable-5-2", verdict="APPROVE", defect_count=0, defects=[], raw_path="/tmp/r.json", claim_epoch=ce4)
                 op_w_ready = db4.prepare_op(unit_key="U4", op_type="mark_pr_ready", claim_epoch=ce4, candidate_sha="cand4000")
                 g_wr = db4.promote_op_to_in_flight(op_w_ready, caller_owner_kind="worker", caller_epoch=ce4)
                 db4.consume_send_grant(g_wr)
@@ -1908,8 +1909,8 @@ class TestCodeReviewHardeningInvariants(unittest.TestCase):
                     bound_gh_login="bot-a", ephemeral_token_file="/tmp/ap-test.tok",
                 )
                 db7.set_current_candidate(unit_key="U_ENQ_A", candidate_sha="cand7100", claim_epoch=ce_a)
-                db7.record_verify_receipt(unit_key="U_ENQ_A", candidate_sha="cand7100", dod_cmd="true", exit_code=0, ui_verified=False, artifact_dir="/tmp", touched_paths=("src/a.py",))
-                db7.record_review_receipt(unit_key="U_ENQ_A", candidate_sha="cand7100", writer_family="codex", referee_family="claude", referee_model="claude-fable-5-2", verdict="APPROVE", defect_count=0, defects=[], raw_path="/tmp/r.json")
+                db7.record_verify_receipt(unit_key="U_ENQ_A", candidate_sha="cand7100", dod_cmd="true", exit_code=0, ui_verified=False, artifact_dir="/tmp", touched_paths=("src/a.py",), claim_epoch=ce_a)
+                db7.record_review_receipt(unit_key="U_ENQ_A", candidate_sha="cand7100", writer_family="codex", referee_family="claude", referee_model="claude-fable-5-2", verdict="APPROVE", defect_count=0, defects=[], raw_path="/tmp/r.json", claim_epoch=ce_a)
                 op_rdy71 = db7.prepare_op(unit_key="U_ENQ_A", op_type="mark_pr_ready", claim_epoch=ce_a, candidate_sha="cand7100")
                 g_rdy71 = db7.promote_op_to_in_flight(op_rdy71, caller_owner_kind="worker", caller_epoch=ce_a)
                 tr_a = FakeGitHubTransport()
@@ -2294,8 +2295,8 @@ class TestCodeReviewHardeningInvariants(unittest.TestCase):
                     bound_gh_login="autopilot-bot", ephemeral_token_file="/tmp/ap-test.tok",
                 )
                 db9.set_current_candidate(unit_key="UA9", candidate_sha="cand9100", claim_epoch=ce9)
-                db9.record_verify_receipt(unit_key="UA9", candidate_sha="cand9100", dod_cmd="true", exit_code=0, ui_verified=False, artifact_dir="/tmp", touched_paths=("src/a.py",))
-                db9.record_review_receipt(unit_key="UA9", candidate_sha="cand9100", writer_family="codex", referee_family="claude", referee_model="claude-fable-5-2", verdict="APPROVE", defect_count=0, defects=[], raw_path="/tmp/r.json")
+                db9.record_verify_receipt(unit_key="UA9", candidate_sha="cand9100", dod_cmd="true", exit_code=0, ui_verified=False, artifact_dir="/tmp", touched_paths=("src/a.py",), claim_epoch=ce9)
+                db9.record_review_receipt(unit_key="UA9", candidate_sha="cand9100", writer_family="codex", referee_family="claude", referee_model="claude-fable-5-2", verdict="APPROVE", defect_count=0, defects=[], raw_path="/tmp/r.json", claim_epoch=ce9)
                 op_r9 = db9.prepare_op(unit_key="UA9", op_type="mark_pr_ready", claim_epoch=ce9, candidate_sha="cand9100")
                 g_r9 = db9.promote_op_to_in_flight(op_r9, caller_owner_kind="worker", caller_epoch=ce9)
                 self.assertTrue(g_r9.granted)
@@ -2400,8 +2401,8 @@ class TestCodeReviewHardeningInvariants(unittest.TestCase):
                     bound_gh_login="autopilot-bot", ephemeral_token_file="/tmp/ap-test.tok",
                 )
                 db10.set_current_candidate(unit_key="UA_NEW", candidate_sha="cand1040", claim_epoch=ce10)
-                db10.record_verify_receipt(unit_key="UA_NEW", candidate_sha="cand1040", dod_cmd="true", exit_code=0, ui_verified=False, artifact_dir="/tmp", touched_paths=("src/a.py",))
-                db10.record_review_receipt(unit_key="UA_NEW", candidate_sha="cand1040", writer_family="codex", referee_family="claude", referee_model="claude-fable-5-2", verdict="APPROVE", defect_count=0, defects=[], raw_path="/tmp/r.json")
+                db10.record_verify_receipt(unit_key="UA_NEW", candidate_sha="cand1040", dod_cmd="true", exit_code=0, ui_verified=False, artifact_dir="/tmp", touched_paths=("src/a.py",), claim_epoch=ce10)
+                db10.record_review_receipt(unit_key="UA_NEW", candidate_sha="cand1040", writer_family="codex", referee_family="claude", referee_model="claude-fable-5-2", verdict="APPROVE", defect_count=0, defects=[], raw_path="/tmp/r.json", claim_epoch=ce10)
                 op_cd10 = db10.prepare_op(unit_key="UA_NEW", op_type="create_draft_pr", claim_epoch=ce10, candidate_sha="cand1040", payload={"title": "t", "body": "b"})
                 g_cd10 = db10.promote_op_to_in_flight(op_cd10, caller_owner_kind="worker", caller_epoch=ce10)
                 db10.consume_send_grant(g_cd10)
@@ -2474,8 +2475,8 @@ class TestCodeReviewHardeningInvariants(unittest.TestCase):
                     bound_gh_login="autopilot-bot", ephemeral_token_file="/tmp/ap-test.tok",
                 )
                 db11.set_current_candidate(unit_key="UA_CRASH", candidate_sha="cand1110", claim_epoch=ce11)
-                db11.record_verify_receipt(unit_key="UA_CRASH", candidate_sha="cand1110", dod_cmd="true", exit_code=0, ui_verified=False, artifact_dir="/tmp", touched_paths=("src/a.py",))
-                db11.record_review_receipt(unit_key="UA_CRASH", candidate_sha="cand1110", writer_family="codex", referee_family="claude", referee_model="claude-fable-5-2", verdict="APPROVE", defect_count=0, defects=[], raw_path="/tmp/r.json")
+                db11.record_verify_receipt(unit_key="UA_CRASH", candidate_sha="cand1110", dod_cmd="true", exit_code=0, ui_verified=False, artifact_dir="/tmp", touched_paths=("src/a.py",), claim_epoch=ce11)
+                db11.record_review_receipt(unit_key="UA_CRASH", candidate_sha="cand1110", writer_family="codex", referee_family="claude", referee_model="claude-fable-5-2", verdict="APPROVE", defect_count=0, defects=[], raw_path="/tmp/r.json", claim_epoch=ce11)
                 op_cd11 = db11.prepare_op(
                     unit_key="UA_CRASH", op_type="create_draft_pr", claim_epoch=ce11,
                     candidate_sha="cand1110", ref_id_hmac="ap-ref111", payload={"title": "t", "body": "b"},
@@ -6321,6 +6322,1229 @@ class TestProtectedPathApproval(unittest.TestCase):
             self.assertEqual(db1.get_unit("o/r#64")["status"], "queued")
         finally:
             db1.close()
+
+
+class TestThreeFamilyCrossReviewAndTelemetry(unittest.TestCase):
+    def setUp(self) -> None:
+        self._td = tempfile.TemporaryDirectory()
+        self.base = Path(self._td.name)
+
+    def tearDown(self) -> None:
+        self._td.cleanup()
+
+    def test_agy_workflow_config_and_cross_family_invariants(self) -> None:
+        from ap_core.models import (
+            PolicyFreezeError,
+            parse_workflow_file,
+            render_workflow_markdown,
+            resolve_cross_family_referee,
+            resolve_cross_family_referees,
+            validate_referee_output,
+        )
+
+        # Default backward-compatible cross-family mapping + new agy -> claude
+        self.assertEqual(resolve_cross_family_referee("codex"), "claude")
+        self.assertEqual(resolve_cross_family_referee("claude"), "codex")
+        self.assertEqual(resolve_cross_family_referee("agy"), "claude")
+        self.assertEqual(resolve_cross_family_referees("codex"), ("claude",))
+        self.assertEqual(resolve_cross_family_referees("agy"), ("claude",))
+        self.assertEqual(resolve_cross_family_referees("codex", ["claude", "agy", "claude"]), ("claude", "agy"))
+
+        # Same-family referee MUST be rejected everywhere!
+        for fam in ("codex", "claude", "agy"):
+            with self.assertRaises(AutopilotError):
+                resolve_cross_family_referees(fam, [fam])
+        with self.assertRaises(AutopilotError):
+            resolve_cross_family_referees("agy", ["claude", "agy"])
+
+        # Valid AGY workflow + dual-referee WORKFLOW.md parsing
+        wf_ok = self.base / "ok.md"
+        wf_ok.write_text(
+            render_workflow_markdown(
+                WorkflowConfig(
+                    project_id="proj-agy",
+                    kind="issue",
+                    enabled=True,
+                    repos=("org/demo",),
+                    workspace_path=str(self.base),
+                    writer_family="codex",
+                    referee_families=("claude", "agy"),
+                    write_scope=("src/**",),
+                )
+            ),
+            encoding="utf-8",
+        )
+        parsed = parse_workflow_file(wf_ok)
+        self.assertEqual(parsed.writer_family, "codex")
+        self.assertEqual(parsed.referee_families, ("claude", "agy"))
+
+        # Invalid same-family WORKFLOW.md rejected at PolicyFreezeError
+        wf_bad = self.base / "bad.md"
+        wf_bad.write_text(
+            render_workflow_markdown(
+                WorkflowConfig(
+                    project_id="proj-bad",
+                    kind="issue",
+                    enabled=True,
+                    repos=("org/demo",),
+                    workspace_path=str(self.base),
+                    writer_family="agy",
+                    referee_families=("agy",),
+                    write_scope=("src/**",),
+                )
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaises(PolicyFreezeError):
+            parse_workflow_file(wf_bad)
+
+        # Conflicting top-level vs extra.referee_families rejected
+        wf_conf = self.base / "conf.md"
+        wf_conf.write_text(
+            "---\n"
+            + json.dumps(
+                {
+                    "project_id": "proj-conf",
+                    "kind": "issue",
+                    "write_scope": ["src/**"],
+                    "writer_family": "codex",
+                    "referee_families": ["claude"],
+                    "extra": {"referee_families": ["agy"]},
+                }
+            )
+            + "\n---\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(PolicyFreezeError):
+            parse_workflow_file(wf_conf)
+
+        # Boolean trap in validate_referee_output rejected
+        with self.assertRaises(AutopilotError):
+            validate_referee_output(
+                {"verdict": "APPROVE", "round_index": 1, "defect_count": False, "three_col_defects": [], "uncertainties": []},
+                expected_round=1,
+            )
+        with self.assertRaises(AutopilotError):
+            validate_referee_output(
+                {"verdict": "APPROVE", "round_index": True, "defect_count": 0, "three_col_defects": [], "uncertainties": []},
+                expected_round=1,
+            )
+
+        # Hard-stop blocks .agents, .agent, _agent, _agents, and .gemini configs
+        for bad_path in (
+            ".agents/hooks.json",
+            "sub/.agents/hooks.json",
+            ".agent/hooks.json",
+            "_agent/hooks.json",
+            "_agents/mcp_config.json",
+            ".gemini/config.json",
+        ):
+            with self.assertRaises(ScopeViolationError):
+                check_autopilot_scope([bad_path], ["**"])
+
+    def test_agy_sandbox_projection_bwrap_and_proxy_allowlist(self) -> None:
+        from ap_core.models import SandboxError
+        from ap_core.sandbox import (
+            _project_agy_auth_for_sandbox,
+            build_model_ring_bwrap,
+            prepare_sandbox_home_memfds,
+            resolve_family_proxy_allowlist,
+        )
+
+        # Strict per-family proxy allowlist scoping (no cross-family domain bleed)
+        cl_doms = resolve_family_proxy_allowlist("claude")
+        cx_doms = resolve_family_proxy_allowlist("codex")
+        ag_doms = resolve_family_proxy_allowlist("agy")
+        self.assertIn("api.anthropic.com", cl_doms)
+        self.assertNotIn("www.googleapis.com", cl_doms)
+        self.assertIn("api.openai.com", cx_doms)
+        self.assertNotIn("www.googleapis.com", cx_doms)
+        self.assertIn("daily-cloudcode-pa.googleapis.com", ag_doms)
+        self.assertNotIn("www.googleapis.com", ag_doms)
+        self.assertNotIn("api.openai.com", ag_doms)
+        self.assertNotIn("github.com", ag_doms)
+
+        # OAuth projection strips refresh_token and id_token_email, rejects expired tokens
+        proj = _project_agy_auth_for_sandbox(
+            {
+                "auth_method": "consumer",
+                "id_token_email": "redacted@example.invalid",
+                "token": {
+                    "access_token": "ya29.fake-short-lived-token",
+                    "token_type": "Bearer",
+                    "refresh_token": "1//SECRET_REFRESH_MUST_BE_STRIPPED",
+                    "expiry": "2099-01-01T00:00:00Z",
+                    "expires_in": 3599,
+                },
+            }
+        )
+        self.assertNotIn("id_token_email", proj)
+        self.assertNotIn("refresh_token", proj["token"])
+        self.assertEqual(proj["token"]["access_token"], "ya29.fake-short-lived-token")
+
+        # Reject expired, null expiry, and naive (tz-less) expiry!
+        for bad_exp in ("2020-01-01T00:00:00Z", None, "2099-01-01T00:00:00"):
+            with self.assertRaises(SandboxError):
+                _project_agy_auth_for_sandbox(
+                    {
+                        "auth_method": "consumer",
+                        "token": {
+                            "access_token": "ya29.bad",
+                            "expiry": bad_exp,
+                        },
+                    }
+                )
+
+        # memfd projection + agy:readonly_model bwrap assembly (no shells, no outbox, memfd-only, flag enforcement)
+        fake_home = self.base / "fake_home"
+        tok_dir = fake_home / ".gemini" / "antigravity-cli"
+        tok_dir.mkdir(parents=True)
+        (tok_dir / "antigravity-oauth-token").write_text(
+            json.dumps(
+                {
+                    "auth_method": "consumer",
+                    "id_token_email": "redacted@example.invalid",
+                    "token": {"access_token": "ya29.test", "refresh_token": "secret", "expiry": "2099-01-01T00:00:00Z"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        memfds = prepare_sandbox_home_memfds("agy", role_key="agy:readonly_model", host_home=fake_home)
+        try:
+            self.assertIn("/home/sandbox/.gemini/antigravity-cli/antigravity-oauth-token", memfds)
+            self.assertIn("/home/sandbox/.gemini/antigravity-cli/settings.json", memfds)
+            self.assertIn("/home/sandbox/.gemini/config/mcp_config.json", memfds)
+            self.assertIn("/home/sandbox/.gemini/config/hooks.json", memfds)
+            # Verify projected settings.json denies credential and /proc reads!
+            set_mfd = memfds["/home/sandbox/.gemini/antigravity-cli/settings.json"]
+            os.lseek(set_mfd, 0, os.SEEK_SET)
+            set_doc = json.loads(os.read(set_mfd, 65536).decode("utf-8"))
+            self.assertIn("read_file(/home/sandbox/.gemini)", set_doc["permissions"]["deny"])
+            self.assertIn("write_file(*)", set_doc["permissions"]["deny"])
+            # Verify projected token bytes in memfd contain NO refresh_token or email
+            tok_mfd = memfds["/home/sandbox/.gemini/antigravity-cli/antigravity-oauth-token"]
+            os.lseek(tok_mfd, 0, os.SEEK_SET)
+            raw_proj = os.read(tok_mfd, 65536).decode("utf-8")
+            self.assertNotIn("refresh_token", raw_proj)
+            self.assertNotIn("redacted@example.invalid", raw_proj)
+
+            # Create distinct executable stub binaries for bwrap argv inspection
+            b_init = self.base / "ap-sandbox-init"
+            b_sh = self.base / "ap-safe-sh"
+            b_agy = self.base / "agy-bin"
+            for bp in (b_init, b_sh, b_agy):
+                bp.write_bytes(b"#!/bin/sh\nexit 0\n")
+                os.chmod(bp, 0o755)
+            bins = {"ap_sandbox_init": b_init, "ap_safe_sh": b_sh, "agy_cli": b_agy}
+            rb_dir = self.base / "review-bundle"
+            rb_dir.mkdir()
+            obox_dir = self.base / "obox"
+            obox_dir.mkdir()
+
+            # Disk fallback (retain_fds=None) MUST be rejected for agy roles!
+            with self.assertRaises(SandboxError):
+                build_model_ring_bwrap(
+                    role_key="agy:readonly_model",
+                    host_binaries=bins,
+                    sandbox_home=self.base / "sbh",
+                    outbox_dir=obox_dir,
+                    proxy_sock=None,
+                    inner_cmd=["/usr/local/bin/agy", "--print="],
+                    review_bundle_dir=rb_dir,
+                )
+
+            # Forbidden flag (including `--flag=value` and `--disable-slash-commands=false`) MUST be rejected!
+            for bad_flags in (
+                ["--dangerously-skip-permissions", "--print="],
+                ["--remote-agent=evil", "--print="],
+                ["--mode=auto", "--print="],
+                ["--disable-slash-commands=false", "--print="],
+            ):
+                retain_bad: list[int] = []
+                try:
+                    with self.assertRaises(SandboxError):
+                        build_model_ring_bwrap(
+                            role_key="agy:readonly_model",
+                            host_binaries=bins,
+                            sandbox_home=self.base / "sbh",
+                            outbox_dir=obox_dir,
+                            proxy_sock=None,
+                            inner_cmd=["/usr/local/bin/agy", *bad_flags],
+                            review_bundle_dir=rb_dir,
+                            sandbox_file_fds=memfds,
+                            retain_fds=retain_bad,
+                        )
+                finally:
+                    for fd in retain_bad:
+                        os.close(fd)
+
+            # Unprojected OAuth memfd containing refresh_token MUST be rejected at bwrap boundary!
+            raw_bad_mfd = os.memfd_create("bad_oauth")
+            try:
+                os.write(raw_bad_mfd, json.dumps({"token": {"access_token": "x", "refresh_token": "leak"}}).encode("utf-8"))
+                os.lseek(raw_bad_mfd, 0, os.SEEK_SET)
+                bad_memfds = dict(memfds)
+                bad_memfds["/home/sandbox/.gemini/antigravity-cli/antigravity-oauth-token"] = raw_bad_mfd
+                retain_leak: list[int] = []
+                try:
+                    with self.assertRaises(SandboxError):
+                        build_model_ring_bwrap(
+                            role_key="agy:readonly_model",
+                            host_binaries=bins,
+                            sandbox_home=self.base / "sbh",
+                            outbox_dir=obox_dir,
+                            proxy_sock=None,
+                            inner_cmd=["/usr/local/bin/agy", "--print="],
+                            review_bundle_dir=rb_dir,
+                            sandbox_file_fds=bad_memfds,
+                            retain_fds=retain_leak,
+                        )
+                finally:
+                    for fd in retain_leak:
+                        os.close(fd)
+            finally:
+                os.close(raw_bad_mfd)
+
+            retain_ok: list[int] = []
+            try:
+                argv = build_model_ring_bwrap(
+                    role_key="agy:readonly_model",
+                    host_binaries=bins,
+                    sandbox_home=self.base / "sbh",
+                    outbox_dir=obox_dir,
+                    proxy_sock=None,
+                    inner_cmd=["/usr/local/bin/agy", "--model", "gemini-4-neon-high", "--print="],
+                    review_bundle_dir=rb_dir,
+                    sandbox_file_fds=memfds,
+                    retain_fds=retain_ok,
+                )
+            finally:
+                for fd in retain_ok:
+                    os.close(fd)
+            self.assertIn("/ap-review-bundle", argv)
+            self.assertNotIn("/ap-outbox", argv)
+            self.assertNotIn("/usr/bin/bash", argv)
+            self.assertNotIn("/usr/bin/sh", argv)
+            self.assertIn("--mode", argv)
+            self.assertIn("plan", argv)
+            self.assertIn("--disable-slash-commands", argv)
+
+            # agy:issue_model masks entire workspace `.agents` dir (hooks.json + mcp_config.json) and refuses symlinked `.agents`!
+            wt_dir = self.base / "wt_hooks"
+            (wt_dir / ".agents").mkdir(parents=True)
+            (wt_dir / ".agents" / "hooks.json").write_text('{"PreToolUse":[]}', encoding="utf-8")
+            (wt_dir / ".agents" / "mcp_config.json").write_text('{}', encoding="utf-8")
+            (wt_dir / ".git").write_text("gitdir: /tmp/fake\n", encoding="utf-8")
+            tsock = self.base / "t.sock"
+            tsock.write_text("", encoding="utf-8")
+            retain_iss: list[int] = []
+            try:
+                argv_iss = build_model_ring_bwrap(
+                    role_key="agy:issue_model",
+                    host_binaries=bins,
+                    sandbox_home=self.base / "sbh",
+                    outbox_dir=obox_dir,
+                    proxy_sock=None,
+                    inner_cmd=["/usr/local/bin/agy", "--model", "gemini-4-neon-high", "--print="],
+                    worktree=wt_dir,
+                    shared_tmp=self.base / "stmp",
+                    tool_sock=tsock,
+                    sandbox_file_fds=memfds,
+                    retain_fds=retain_iss,
+                )
+            finally:
+                for fd in retain_iss:
+                    os.close(fd)
+            self.assertIn(f"{wt_dir.resolve()}/.agents", argv_iss)
+            self.assertIn(f"{wt_dir.resolve()}/.agent", argv_iss)
+            self.assertIn(f"{wt_dir.resolve()}/_agent", argv_iss)
+            self.assertIn(f"{wt_dir.resolve()}/_agents", argv_iss)
+            self.assertIn("--mode", argv_iss)
+            self.assertIn("accept-edits", argv_iss)
+
+            # tool_ring ALSO masks all 4 AGY customization dirs read-only using host-only empty dirs OUTSIDE /ap-tool-cache!
+            etc_tool = self.base / "etc_tool"
+            retain_tool: list[int] = []
+            try:
+                argv_tool = build_execution_ring_bwrap(
+                    ring_kind="tool_ring",
+                    inner_cmd=["/usr/bin/true"],
+                    cwd=wt_dir,
+                    worktree=wt_dir,
+                    ephemeral_tool_cache=etc_tool,
+                    shared_tmp=self.base / "stmp",
+                    mask_ro_empty_dirs=(".agents", ".agent", "_agent", "_agents"),
+                    retain_fds=retain_tool,
+                )
+                etc_resolved = str(etc_tool.resolve())
+                for fd in retain_tool:
+                    target_path = os.readlink(f"/proc/self/fd/{fd}")
+                    self.assertFalse(
+                        target_path.startswith(etc_resolved),
+                        f"tool_ring RO mask fd MUST NOT live inside writable ephemeral_tool_cache: {target_path}",
+                    )
+            finally:
+                for fd in retain_tool:
+                    os.close(fd)
+            for cname in (".agents", ".agent", "_agent", "_agents"):
+                self.assertIn(f"{wt_dir.resolve()}/{cname}", argv_tool)
+
+            # Symlinked `.agents` in worktree MUST fail closed!
+            wt_sym = self.base / "wt_sym_agents"
+            wt_sym.mkdir()
+            (wt_sym / ".git").write_text("gitdir: /tmp/fake\n", encoding="utf-8")
+            os.symlink(str(self.base), str(wt_sym / ".agents"))
+            retain_sym: list[int] = []
+            try:
+                with self.assertRaises(SandboxError):
+                    build_model_ring_bwrap(
+                        role_key="agy:issue_model",
+                        host_binaries=bins,
+                        sandbox_home=self.base / "sbh",
+                        outbox_dir=obox_dir,
+                        proxy_sock=None,
+                        inner_cmd=["/usr/local/bin/agy", "--model", "gemini-4-neon-high", "--print="],
+                        worktree=wt_sym,
+                        shared_tmp=self.base / "stmp",
+                        tool_sock=tsock,
+                        sandbox_file_fds=memfds,
+                        retain_fds=retain_sym,
+                    )
+            finally:
+                for fd in retain_sym:
+                    os.close(fd)
+        finally:
+            for fd in memfds.values():
+                os.close(fd)
+
+    def test_cli_turn_output_and_session_usage_parsers(self) -> None:
+        from ap_core.sandbox import parse_cli_turn_output, parse_session_usage
+
+        # 1. AGY --output-format json
+        agy_json = json.dumps(
+            {
+                "conversation_id": "conv-1",
+                "status": "SUCCESS",
+                "response": '{"round_index":1,"verdict":"APPROVE","defect_count":0,"three_col_defects":[],"uncertainties":[]}\n',
+                "duration_seconds": 1.8,
+                "num_turns": 1,
+                "usage": {
+                    "input_tokens": 1200,
+                    "output_tokens": 80,
+                    "thinking_tokens": 40,
+                    "cache_read_tokens": 300,
+                    "total_tokens": 1280,
+                },
+            }
+        )
+        p_agy = parse_cli_turn_output("agy", agy_json)
+        self.assertTrue(p_agy["ok"])
+        self.assertTrue(p_agy["usage_known"])
+        self.assertEqual(p_agy["input_tokens"], 1200)
+        self.assertEqual(p_agy["output_tokens"], 80)
+        self.assertEqual(p_agy["thinking_tokens"], 40)
+        self.assertEqual(p_agy["cache_read_tokens"], 300)
+        self.assertIsNone(p_agy["cost_usd"])
+        self.assertIn('"verdict":"APPROVE"', p_agy["text"])
+
+        # AGY non-SUCCESS terminal status MUST fail closed!
+        agy_wait = json.dumps({"status": "WAITING", "response": '{"verdict":"APPROVE"}', "usage": {"input_tokens": 10, "output_tokens": 2}})
+        self.assertFalse(parse_cli_turn_output("agy", agy_wait)["ok"])
+
+        # AGY stream-json reads ONLY terminal result (never double-counting step usage!)
+        agy_stream = "\n".join(
+            [
+                json.dumps({"event": "init", "init": {"model": "gemini-4-neon-high"}}),
+                json.dumps({"event": "step", "usage": {"input_tokens": 500, "output_tokens": 20}}),
+                json.dumps(
+                    {
+                        "event": "result",
+                        "result": {
+                            "status": "SUCCESS",
+                            "response": '{"ok":true}',
+                            "usage": {"input_tokens": 900, "output_tokens": 35, "thinking_tokens": 15, "cache_read_tokens": 100},
+                        },
+                    }
+                ),
+            ]
+        )
+        p_as = parse_cli_turn_output("agy", agy_stream)
+        self.assertTrue(p_as["ok"])
+        self.assertEqual(p_as["model_reported"], "gemini-4-neon-high")
+        self.assertEqual(p_as["input_tokens"], 900)
+        self.assertEqual(p_as["output_tokens"], 35)
+        self.assertEqual(p_as["thinking_tokens"], 15)
+
+        # 2. Claude --output-format json AND multi-line stream JSONL
+        claude_json = json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": '{"verdict":"APPROVE"}',
+                "total_cost_usd": 0.0425,
+                "usage": {
+                    "input_tokens": 500,
+                    "cache_read_input_tokens": 1000,
+                    "cache_creation_input_tokens": 200,
+                    "output_tokens": 150,
+                },
+            }
+        )
+        p_cl = parse_cli_turn_output("claude", claude_json)
+        self.assertTrue(p_cl["ok"])
+        self.assertEqual(p_cl["input_tokens"], 1700)
+        self.assertEqual(p_cl["cache_read_tokens"], 1000)
+        self.assertEqual(p_cl["cache_write_tokens"], 200)
+        self.assertEqual(p_cl["output_tokens"], 150)
+        self.assertAlmostEqual(p_cl["cost_usd"], 0.0425)
+
+        claude_jsonl = "\n".join(
+            [
+                json.dumps({"type": "system", "subtype": "init"}),
+                json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "ok", "usage": {"input_tokens": 20, "output_tokens": 5}}),
+            ]
+        )
+        p_cl_ml = parse_cli_turn_output("claude", claude_jsonl)
+        self.assertTrue(p_cl_ml["ok"])
+        self.assertEqual(p_cl_ml["input_tokens"], 20)
+        self.assertEqual(p_cl_ml["output_tokens"], 5)
+
+        # 3. Codex JSONL: deduplicates replayed turn.completed in same turn slot, counts distinct turns,
+        # preserves cache_write/reasoning, recovers after mid-turn error, and rejects incomplete turn.started-only stream!
+        dup_turn = json.dumps(
+            {
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 100,
+                    "cached_input_tokens": 40,
+                    "cache_write_input_tokens": 10,
+                    "output_tokens": 30,
+                    "reasoning_output_tokens": 12,
+                },
+            }
+        )
+        codex_jsonl = "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "t1"}),
+                json.dumps({"type": "turn.started"}),
+                json.dumps({"type": "error", "message": "transient retry"}),
+                json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": '{"summary":"done"}'}}),
+                dup_turn,
+                dup_turn,
+            ]
+        )
+        p_cx = parse_cli_turn_output("codex", codex_jsonl, strict_envelope=True, output_format="jsonl")
+        self.assertTrue(p_cx["ok"])
+        self.assertEqual(p_cx["input_tokens"], 100)
+        self.assertEqual(p_cx["cache_read_tokens"], 40)
+        self.assertEqual(p_cx["cache_write_tokens"], 10)
+        self.assertEqual(p_cx["output_tokens"], 30)
+        self.assertEqual(p_cx["thinking_tokens"], 12)
+        self.assertIsNone(p_cx["cost_usd"])
+        self.assertEqual(p_cx["text"], '{"summary":"done"}')
+
+        # Codex cumulative thread snapshots (100 -> 180 == 180, NOT 280!) AND trailing unfinished turn.started fails closed!
+        codex_multi_turn = "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "t-cum"}),
+                json.dumps({"type": "turn.started"}),
+                json.dumps({"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 20}}),
+                json.dumps({"type": "turn.started"}),
+                json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": '{"final":true}'}}),
+                json.dumps({"type": "turn.completed", "usage": {"input_tokens": 180, "output_tokens": 45}}),
+            ]
+        )
+        p_cx_cum = parse_cli_turn_output("codex", codex_multi_turn, strict_envelope=True, output_format="jsonl")
+        self.assertTrue(p_cx_cum["ok"])
+        self.assertEqual(p_cx_cum["input_tokens"], 180)
+        self.assertEqual(p_cx_cum["output_tokens"], 45)
+        self.assertEqual(p_cx_cum["text"], '{"final":true}')
+
+        codex_trailing_unfinished = "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "t-inc"}),
+                json.dumps({"type": "turn.started"}),
+                json.dumps({"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 20}}),
+                json.dumps({"type": "turn.started"}),
+            ]
+        )
+        p_cx_trail = parse_cli_turn_output("codex", codex_trailing_unfinished, strict_envelope=True, output_format="jsonl")
+        self.assertFalse(p_cx_trail["ok"])
+
+        # Codex incomplete stream (turn.started without turn.completed) MUST fail!
+        p_cx_inc = parse_cli_turn_output("codex", json.dumps({"type": "turn.started"}), strict_envelope=True, output_format="jsonl")
+        self.assertFalse(p_cx_inc["ok"])
+        # Empty stdout under strict_envelope MUST fail!
+        self.assertFalse(parse_cli_turn_output("agy", "", strict_envelope=True, output_format="stream-json")["ok"])
+        # AGY stream-json ignores non-result records even with status+response!
+        fake_non_res = json.dumps({"event": "log", "status": "SUCCESS", "response": '{"verdict":"APPROVE"}'})
+        self.assertFalse(parse_cli_turn_output("agy", fake_non_res, strict_envelope=True, output_format="stream-json")["ok"])
+
+        # parse_session_usage supports AGY too, preserves cost-only Claude result,
+        # and refuses to mark partial multi-thread Codex cost as cost_known=True!
+        su = parse_session_usage(agy_stream.splitlines())
+        self.assertEqual(su["input_tokens"], 900)
+        self.assertEqual(su["output_tokens"], 35)
+        self.assertFalse(su["cost_known"])
+
+        claude_cost_only = json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "ok", "total_cost_usd": 0.25})
+        p_cc = parse_cli_turn_output("claude", claude_cost_only)
+        self.assertTrue(p_cc["ok"])
+        self.assertFalse(p_cc["usage_known"])
+        self.assertAlmostEqual(p_cc["cost_usd"], 0.25)
+        su_cc = parse_session_usage([claude_cost_only])
+        self.assertAlmostEqual(su_cc["cost_usd"], 0.25)
+        self.assertTrue(su_cc["cost_known"])
+
+        # Claude cost_usd alias (without total_cost_usd or usage) MUST also be recognized!
+        claude_cost_alias = json.dumps({"type": "result", "result": "ok", "cost_usd": 0.25})
+        su_ca = parse_session_usage([claude_cost_alias])
+        self.assertAlmostEqual(su_ca["cost_usd"], 0.25)
+        self.assertTrue(su_ca["cost_known"])
+
+        # AGY stream-json with RFC-8259 legal U+2028 line separator inside JSON string MUST NOT split the event!
+        agy_u2028 = (
+            '{"event":"result","result":{"status":"SUCCESS","response":"line1\u2028line2","usage":{"input_tokens":50,"output_tokens":10}}}'
+        )
+        p_u2028 = parse_cli_turn_output("agy", agy_u2028, strict_envelope=True, output_format="stream-json")
+        self.assertTrue(p_u2028["ok"])
+        self.assertEqual(p_u2028["input_tokens"], 50)
+        self.assertIn("line1\u2028line2", p_u2028["text"])
+
+        # Multi-thread Codex: 2nd thread without cost OR without usage MUST keep cost_known=False!
+        codex_partial_cost = [
+            json.dumps({"type": "thread.started", "thread_id": "t1"}),
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 50, "output_tokens": 10}, "total_cost_usd": 0.10}),
+            json.dumps({"type": "thread.started", "thread_id": "t2"}),
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 70, "output_tokens": 20}}),
+        ]
+        su_pc = parse_session_usage(codex_partial_cost)
+        self.assertEqual(su_pc["input_tokens"], 120)
+        self.assertEqual(su_pc["output_tokens"], 30)
+        self.assertAlmostEqual(su_pc["cost_usd"], 0.10)
+        self.assertFalse(su_pc["cost_known"])
+
+        codex_no_usage_t2 = [
+            json.dumps({"type": "thread.started", "thread_id": "t1"}),
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 50, "output_tokens": 10}, "cost_usd": 0.10}),
+            json.dumps({"type": "thread.started", "thread_id": "t2"}),
+            json.dumps({"type": "turn.completed"}),
+        ]
+        su_nu = parse_session_usage(codex_no_usage_t2)
+        self.assertAlmostEqual(su_nu["cost_usd"], 0.10)
+        self.assertFalse(su_nu["cost_known"])
+
+        # Same Codex thread: turn 1 reports $0.10, turn 2 starts and times out OR fails -> $0.10 subtotal, cost_known=False!
+        codex_turn2_timeout = [
+            json.dumps({"type": "thread.started", "thread_id": "t-to"}),
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 50, "output_tokens": 10}, "cost_usd": 0.10}),
+            json.dumps({"type": "turn.started"}),
+        ]
+        su_to = parse_session_usage(codex_turn2_timeout)
+        self.assertAlmostEqual(su_to["cost_usd"], 0.10)
+        self.assertFalse(su_to["cost_known"])
+
+        codex_turn2_failed = [
+            json.dumps({"type": "thread.started", "thread_id": "t-fail"}),
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 50, "output_tokens": 10}, "cost_usd": 0.10}),
+            json.dumps({"type": "turn.started"}),
+            json.dumps({"type": "turn.failed", "error": {"message": "boom"}}),
+        ]
+        su_tf = parse_session_usage(codex_turn2_failed)
+        self.assertAlmostEqual(su_tf["cost_usd"], 0.10)
+        self.assertFalse(su_tf["cost_known"])
+        codex_same_thread_missing_cost = [
+            json.dumps({"type": "thread.started", "thread_id": "t-same"}),
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 50, "output_tokens": 10}, "cost_usd": 0.10}),
+            json.dumps({"type": "turn.started"}),
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 120, "output_tokens": 30}}),
+        ]
+        su_st = parse_session_usage(codex_same_thread_missing_cost)
+        self.assertEqual(su_st["input_tokens"], 120)
+        self.assertAlmostEqual(su_st["cost_usd"], 0.10)
+        self.assertFalse(su_st["cost_known"])
+
+    def test_parallel_dual_referee_consensus_fail_closed_and_run_history_telemetry(self) -> None:
+        from ap_core.models import ensure_secure_dir
+
+        repo_main = self.base / "repo_dual"
+        base_sha = _init_git_repo(repo_main)
+        sroot = self.base / "state_dual"
+        adv_dir = ensure_secure_dir(sroot / "advisory" / "dual", 0o700)
+        db = AutopilotDB(sroot / "autopilot.db")
+        try:
+            cfg = WorkflowConfig(
+                project_id="dual",
+                kind="issue",
+                enabled=True,
+                repos=("org/dual",),
+                workspace_path=str(repo_main),
+                trust_tier="T2",
+                writer_family="codex",
+                referee_families=("claude", "agy"),
+                write_scope=("src/**",),
+            )
+            db.upsert_project(cfg)
+            db.ensure_lease_slots("dual", ["s1"], sroot / "locks")
+            mg = ensure_managed_bare_repo(repo_main, self.base / "mg_dual.git")
+            db.ensure_work_unit(unit_key="org/dual#7", project_id="dual", repo="org/dual", issue_number=7)
+            ce = db.claim_and_reserve(
+                unit_key="org/dual#7",
+                cfg=cfg,
+                slot_keys=["s1"],
+                worker_unit_name="w-dual-7.service",
+                expected_cgroup_dir="/cg/dual7",
+                base_sha=base_sha,
+                authorized_head_ref="agent/issue-7",
+                bound_gh_login="autopilot-bot",
+                ephemeral_token_file="/tmp/ap-test.tok",
+            )
+
+            class _DualRefRunner:
+                def __init__(self) -> None:
+                    self.writer_round = 0
+                    self.ref_calls: list[tuple[str, int]] = []
+                    self._lock = threading.Lock()
+
+                def run_scout(self, **kw: Any) -> ModelTurnResult:
+                    return ModelTurnResult(
+                        raw_stdout=json.dumps(
+                            {
+                                "root_cause": "add needs fix",
+                                "target_area": "calc",
+                                "exemplar_files": ["src/calc.py"],
+                                "dod_check": "python3 -c 'import src.calc; assert src.calc.add(2,3)==5'",
+                                "ui_verify_needed": False,
+                                "uncertainties": [],
+                            }
+                        ),
+                        model_used=kw["model"],
+                        input_tokens=400,
+                        output_tokens=50,
+                        usage_known=True,
+                    )
+
+                def run_writer(self, **kw: Any) -> ModelTurnResult:
+                    self.writer_round += 1
+                    (kw["worktree"] / "src" / "calc.py").write_text(
+                        f"# dual round {self.writer_round}\ndef add(a, b):\n    return a + b\n",
+                        encoding="utf-8",
+                    )
+                    return ModelTurnResult(
+                        raw_stdout=json.dumps(
+                            {
+                                "summary_le_300_chars": f"Dual fix round {self.writer_round}",
+                                "changed_files": ["src/calc.py"],
+                                "executed_checks": ["python3 -c 'assert True'"],
+                                "uncertainties": [],
+                            }
+                        ),
+                        model_used=kw["model"],
+                        input_tokens=600,
+                        output_tokens=120,
+                        usage_known=True,
+                    )
+
+                def run_referee(self, **kw: Any) -> ModelTurnResult:
+                    fam = kw["family"]
+                    rnum = self.writer_round
+                    with self._lock:
+                        self.ref_calls.append((fam, rnum))
+                    if fam == "claude":
+                        # Claude approves on both Round 1 AND Round 2!
+                        verdict_obj = {
+                            "round_index": rnum,
+                            "verdict": "APPROVE",
+                            "defect_count": 0,
+                            "three_col_defects": [],
+                            "uncertainties": [],
+                        }
+                        # Return raw Claude --output-format json envelope with cost_usd!
+                        return ModelTurnResult(
+                            raw_stdout=json.dumps(
+                                {
+                                    "type": "result",
+                                    "subtype": "success",
+                                    "is_error": False,
+                                    "result": json.dumps(verdict_obj),
+                                    "total_cost_usd": 0.015,
+                                    "usage": {
+                                        "input_tokens": 300,
+                                        "cache_read_input_tokens": 200,
+                                        "cache_creation_input_tokens": 50,
+                                        "output_tokens": 40,
+                                    },
+                                }
+                            ),
+                            model_used=kw["model"],
+                        )
+                    # AGY rejects Round 1 (forcing consensus -> REVISE!), approves Round 2!
+                    if rnum == 1:
+                        verdict_obj = {
+                            "round_index": 1,
+                            "verdict": "REVISE",
+                            "defect_count": 1,
+                            "three_col_defects": [
+                                {
+                                    "location": "src/calc.py:1",
+                                    "failure_case": "Missing edge-case comment check",
+                                    "minimal_fix": "Refine calc.py in round 2",
+                                }
+                            ],
+                            "uncertainties": [],
+                        }
+                    else:
+                        verdict_obj = {
+                            "round_index": 2,
+                            "verdict": "APPROVE",
+                            "defect_count": 0,
+                            "three_col_defects": [],
+                            "uncertainties": [],
+                        }
+                    # Return raw AGY --output-format json envelope!
+                    return ModelTurnResult(
+                        raw_stdout=json.dumps(
+                            {
+                                "conversation_id": f"agy-r{rnum}",
+                                "status": "SUCCESS",
+                                "response": json.dumps(verdict_obj),
+                                "usage": {
+                                    "input_tokens": 1000,
+                                    "output_tokens": 60,
+                                    "thinking_tokens": 25,
+                                    "cache_read_tokens": 150,
+                                    "total_tokens": 1060,
+                                },
+                            }
+                        ),
+                        model_used=kw["model"],
+                    )
+
+            runner = _DualRefRunner()
+            gh = FakeGitHubTransport()
+            res = execute_chef_issue_pipeline(
+                db=db,
+                cfg=cfg,
+                unit_key="org/dual#7",
+                repo="org/dual",
+                issue_summary="#7 Dual referee consensus test",
+                claim_epoch=ce,
+                managed_gitdir=mg,
+                worktree_dir=self.base / "wt_dual7",
+                repo_main=repo_main,
+                run_dir=self.base / "run_dual7",
+                advisory_dir=adv_dir,
+                model_runner=runner,
+                gh_transport=gh,
+                hmac_secret=b"dual-secret",
+            )
+            self.assertEqual(res["status"], "published")
+            # Round 1: claude APPROVE + agy REVISE(1) => merged REVISE(1); Round 2: APPROVE + APPROVE => 0!
+            self.assertEqual(res["defect_trajectory"], [1, 0])
+            self.assertEqual(res["referee_families"], ["claude", "agy"])
+            self.assertEqual([op for op, _ in gh.sent_ops_log], ["push_branch", "create_draft_pr", "mark_pr_ready"])
+
+            # Verify 4 review_receipts persisted (2 per round across 2 distinct attempt_ids) with portable relative raw_path!
+            rrows = db._conn.execute(
+                "SELECT round_index, referee_family, verdict, attempt_id, raw_path FROM review_receipts WHERE unit_key = 'org/dual#7' ORDER BY round_index, referee_family"
+            ).fetchall()
+            self.assertEqual(len(rrows), 4)
+            for rr in rrows:
+                self.assertFalse(str(rr["raw_path"]).startswith("/"), f"raw_path should be relative filename, got {rr['raw_path']!r}")
+                self.assertTrue(str(rr["raw_path"]).startswith("referee-"))
+            self.assertEqual([(r["round_index"], r["referee_family"], r["verdict"]) for r in rrows], [
+                (1, "agy", "REVISE"),
+                (1, "claude", "APPROVE"),
+                (2, "agy", "APPROVE"),
+                (2, "claude", "APPROVE"),
+            ])
+            self.assertNotEqual(rrows[0]["attempt_id"], rrows[2]["attempt_id"])
+
+            # Verify REAL non-zero token & cost telemetry persisted in run_history!
+            # Expected input: scout(400) + writer*2(1200) + claude*2((300+200+50)*2=1100) + agy*2(2000) = 4700
+            # Expected output: scout(50) + writer*2(240) + claude*2(80) + agy*2(120) = 490
+            # Expected cost_usd: claude*2(0.03)
+            hrow = db._conn.execute("SELECT * FROM run_history WHERE unit_key = 'org/dual#7'").fetchone()
+            self.assertIsNotNone(hrow)
+            self.assertEqual(int(hrow["input_tokens"]), 4700)
+            self.assertEqual(int(hrow["output_tokens"]), 490)
+            self.assertEqual(int(hrow["cache_read_tokens"]), 700)
+            self.assertEqual(int(hrow["cache_write_tokens"]), 100)
+            self.assertEqual(int(hrow["thinking_tokens"]), 50)
+            self.assertAlmostEqual(float(hrow["cost_usd"]), 0.03, places=6)
+            # Mixed-family coverage: 2 Claude turns reported cost out of 7 total turns -> cost_known=0 (partial subtotal!), cost_known_turns=2, total_turns=7!
+            self.assertEqual(int(hrow["cost_known"]), 0)
+            self.assertEqual(int(hrow["cost_known_turns"]), 2)
+            self.assertEqual(int(hrow["total_turns"]), 7)
+        finally:
+            db.close()
+
+    def test_publish_gate_blocks_partial_consensus_stale_attempt_and_migrates_legacy_db(self) -> None:
+        import sqlite3
+
+        # 1. Legacy 3-column PK review_receipts DB migration preserves existing rows
+        mig_path = self.base / "legacy_rr.db"
+        conn = sqlite3.connect(str(mig_path))
+        conn.execute(
+            """
+            CREATE TABLE review_receipts (
+                unit_key TEXT NOT NULL,
+                candidate_sha TEXT NOT NULL,
+                round_index INTEGER NOT NULL,
+                writer_family TEXT NOT NULL,
+                referee_family TEXT NOT NULL,
+                referee_model TEXT NOT NULL,
+                verdict TEXT NOT NULL,
+                defect_count INTEGER NOT NULL,
+                defects_json TEXT NOT NULL,
+                raw_path TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(unit_key, candidate_sha, round_index)
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO review_receipts VALUES ('o/r#1', 'aaaa1111', 1, 'codex', 'claude', 'claude-fable-5-2', 'APPROVE', 0, '[]', '/r.json', '2026-01-01T00:00:00Z')"
+        )
+        conn.commit()
+        conn.close()
+
+        db = AutopilotDB(mig_path)
+        try:
+            rr_info = db._conn.execute("PRAGMA table_info(review_receipts)").fetchall()
+            pk_cols = [str(r["name"]) for r in sorted((r for r in rr_info if int(r["pk"]) > 0), key=lambda r: int(r["pk"]))]
+            self.assertEqual(pk_cols, ["unit_key", "candidate_sha", "round_index", "referee_family", "attempt_id"])
+            # Legacy unattributed (claim_epoch IS NULL) rows are moved out of active tables into receipt_audit_log!
+            self.assertEqual(db._conn.execute("SELECT COUNT(*) FROM review_receipts WHERE unit_key = 'o/r#1'").fetchone()[0], 0)
+            aud_kept = db._conn.execute("SELECT * FROM receipt_audit_log WHERE kind = 'review' AND unit_key = 'o/r#1'").fetchall()
+            self.assertEqual(len(aud_kept), 1)
+            self.assertEqual(aud_kept[0]["candidate_sha"], "aaaa1111")
+
+            # 2. Same-family record_review_receipt rejected
+            with self.assertRaises(AutopilotError):
+                db.record_review_receipt(
+                    unit_key="o/r#1",
+                    candidate_sha="aaaa1111",
+                    writer_family="agy",
+                    referee_family="agy",
+                    referee_model="gemini-4-neon-high",
+                    verdict="APPROVE",
+                    defect_count=0,
+                    defects=[],
+                    raw_path="/x.json",
+                )
+
+            # 3. Publish gate blocks partial consensus & invalidated attempt (0 remote writes!)
+            cfg_dual = WorkflowConfig(
+                project_id="p-gate",
+                kind="issue",
+                enabled=True,
+                repos=("o/gate",),
+                workspace_path=str(self.base),
+                trust_tier="T2",
+                writer_family="codex",
+                referee_families=("claude", "agy"),
+                write_scope=("src/**",),
+            )
+            db.upsert_project(cfg_dual)
+            db.ensure_lease_slots("p-gate", ["s1"], self.base / "locks_gate")
+            db.ensure_work_unit(unit_key="o/gate#9", project_id="p-gate", repo="o/gate", issue_number=9)
+            ce = db.claim_and_reserve(
+                unit_key="o/gate#9",
+                cfg=cfg_dual,
+                slot_keys=["s1"],
+                worker_unit_name="w-gate.service",
+                expected_cgroup_dir="/cg/gate",
+                base_sha="base1111",
+                authorized_head_ref="agent/issue-9",
+                bound_gh_login="bot",
+                ephemeral_token_file="/tmp/tok",
+            )
+            db.set_current_candidate(unit_key="o/gate#9", candidate_sha="cand9999", claim_epoch=ce)
+            # Unattributed verify receipt (claim_epoch=None) is stored audit-only and MUST NOT authorize publish;
+            # invalid/inactive claim_epoch MUST raise AutopilotError!
+            db.record_verify_receipt(
+                unit_key="o/gate#9", candidate_sha="cand9999", dod_cmd="true", exit_code=0, ui_verified=False, artifact_dir="/tmp/v_null"
+            )
+            with self.assertRaises(AutopilotError):
+                db.record_verify_receipt(
+                    unit_key="o/gate#9", candidate_sha="cand9999", dod_cmd="true", exit_code=0, ui_verified=False, artifact_dir="/tmp/v_bad", claim_epoch=999999
+                )
+
+            # Attempt 1: only claude votes APPROVE, agy missing (failed/timeout) -> MUST block publish!
+            att1, r1, _, _ = db.reserve_review_attempt(unit_key="o/gate#9", claim_epoch=ce, candidate_sha="cand9999")
+            s1 = db.settle_review_attempt(
+                attempt_id=att1,
+                outcomes=[
+                    {"referee_family": "claude", "referee_model": "m1", "verdict": "APPROVE", "defect_count": 0, "defects": [], "raw_path": "/1.json"}
+                ],
+            )
+            self.assertEqual(s1["state"], "failed")
+            with self.assertRaises(AutopilotError):
+                db.prepare_op(unit_key="o/gate#9", op_type="push_branch", claim_epoch=ce, candidate_sha="cand9999")
+
+            # Attempt 2: both approve, yet ONLY unattributed verify receipt exists -> MUST still block publish!
+            att2, _, _, _ = db.reserve_review_attempt(unit_key="o/gate#9", claim_epoch=ce, candidate_sha="cand9999")
+            s2 = db.settle_review_attempt(
+                attempt_id=att2,
+                outcomes=[
+                    {"referee_family": "claude", "referee_model": "m1", "verdict": "APPROVE", "defect_count": 0, "defects": [], "raw_path": "/2a.json"},
+                    {"referee_family": "agy", "referee_model": "m2", "verdict": "APPROVE", "defect_count": 0, "defects": [], "raw_path": "/2b.json"},
+                ],
+            )
+            self.assertEqual(s2["state"], "approved")
+            with self.assertRaises(AutopilotError):
+                db.prepare_op(unit_key="o/gate#9", op_type="push_branch", claim_epoch=ce, candidate_sha="cand9999")
+            # Now record claim-bound verify receipt -> prepare_op succeeds!
+            db.record_verify_receipt(
+                unit_key="o/gate#9", candidate_sha="cand9999", dod_cmd="true", exit_code=0, ui_verified=False, artifact_dir="/tmp/v", claim_epoch=ce
+            )
+            # Writing an unattributed audit verify/review receipt AFTER a valid claim-bound receipt MUST NOT
+            # overwrite the valid verify receipt, consume review_rounds_used, or collide with review_receipts PK!
+            rounds_before_audit = int(db.get_unit("o/gate#9")["review_rounds_used"])
+            db.record_verify_receipt(
+                unit_key="o/gate#9", candidate_sha="cand9999", dod_cmd="true", exit_code=0, ui_verified=False, artifact_dir="/tmp/v_late_null"
+            )
+            aud_round = db.record_review_receipt(
+                unit_key="o/gate#9",
+                candidate_sha="cand9999",
+                writer_family="codex",
+                referee_family="claude",
+                referee_model="m1",
+                verdict="APPROVE",
+                defect_count=0,
+                defects=[],
+                raw_path="/audit.json",
+            )
+            self.assertEqual(aud_round, 0)
+            self.assertEqual(int(db.get_unit("o/gate#9")["review_rounds_used"]), rounds_before_audit)
+            # `_verify_publish_receipts_in_tx` MUST reject claim_epoch=None even when an approved attempt exists!
+            with self.assertRaises(AutopilotError):
+                with db.immediate_tx():
+                    db._verify_publish_receipts_in_tx("o/gate#9", "cand9999", claim_epoch=None)  # type: ignore[arg-type]
+            # Ledger MUST preserve partial turn cost_known=False without inflating summarize_claim_usage!
+            db.record_turn_usage(
+                turn_id="partial-codex-turn",
+                claim_epoch=ce,
+                unit_key="o/gate#9",
+                project_id="p-gate",
+                role="writer",
+                family="codex",
+                model="gpt-6.2-astra",
+                status="ok",
+                input_tokens=100,
+                output_tokens=20,
+                cost_usd=0.10,
+                cost_known=False,
+                usage_known=True,
+            )
+            agg_partial = db.summarize_claim_usage(ce)
+            self.assertAlmostEqual(agg_partial["cost_usd"], 0.10)
+            self.assertFalse(agg_partial["cost_known"])
+            self.assertTrue(agg_partial["cost_partial"])
+            self.assertEqual(agg_partial["cost_known_turns"], 0)
+            # expected_turns > persisted rows MUST prevent cost_known=True and preserve true total_turns!
+            agg_missing_turn = db.summarize_claim_usage(ce, expected_turns=3)
+            self.assertEqual(agg_missing_turn["total_turns"], 3)
+            self.assertFalse(agg_missing_turn["cost_known"])
+            self.assertTrue(agg_missing_turn["cost_partial"])
+            op_id = db.prepare_op(unit_key="o/gate#9", op_type="push_branch", claim_epoch=ce, candidate_sha="cand9999")
+            self.assertEqual(db.get_op(op_id)["authorized_attempt_id"], att2)
+
+            # Attempt 3 opened on SAME candidate -> invalidates att2; promote_op_to_in_flight MUST deny SendGrant!
+            att3, _, _, _ = db.reserve_review_attempt(unit_key="o/gate#9", claim_epoch=ce, candidate_sha="cand9999")
+            db.settle_review_attempt(
+                attempt_id=att3,
+                outcomes=[
+                    {"referee_family": "claude", "referee_model": "m1", "verdict": "APPROVE", "defect_count": 0, "defects": [], "raw_path": "/3a.json"}
+                ],
+                refund_on_quota=True,
+                quota_wake_at="2099-01-01T00:00:00+00:00",
+            )
+            # Round 3 was refunded cleanly back to 2, unit waiting_quota, and prior op CANNOT promote!
+            self.assertEqual(int(db.get_unit("o/gate#9")["review_rounds_used"]), 2)
+            self.assertEqual(db.get_unit("o/gate#9")["status"], "waiting_quota")
+            grant = db.promote_op_to_in_flight(op_id, caller_owner_kind="worker", caller_epoch=ce)
+            self.assertFalse(grant.granted)
+
+            # 4. In-flight op blocks reserving a new attempt that would invalidate its review authorization!
+            att4, _, _, _ = db.reserve_review_attempt(unit_key="o/gate#9", claim_epoch=ce, candidate_sha="cand9999")
+            s4 = db.settle_review_attempt(
+                attempt_id=att4,
+                outcomes=[
+                    {"referee_family": "claude", "referee_model": "m1", "verdict": "APPROVE", "defect_count": 0, "defects": [], "raw_path": "/4a.json"},
+                    {"referee_family": "agy", "referee_model": "m2", "verdict": "APPROVE", "defect_count": 0, "defects": [], "raw_path": "/4b.json"},
+                ],
+            )
+            self.assertEqual(s4["state"], "approved")
+            op2 = db.prepare_op(unit_key="o/gate#9", op_type="push_branch", claim_epoch=ce, candidate_sha="cand9999")
+            g2 = db.promote_op_to_in_flight(op2, caller_owner_kind="worker", caller_epoch=ce)
+            self.assertTrue(g2.granted)
+            with self.assertRaises(AutopilotError):
+                db.reserve_review_attempt(unit_key="o/gate#9", claim_epoch=ce, candidate_sha="cand9999")
+
+            # 5. Stale/superseded attempt CANNOT overwrite approval; onboard atomic validation protects existing WORKFLOW.md!
+            from ap_core.models import PolicyFreezeError
+
+            croot_ob = self.base / "ob_cfg"
+            sroot_ob = self.base / "ob_state"
+            onboard_project(
+                project_id="ob-safe",
+                kind="issue",
+                workspace_path=self.base,
+                repos=["o/r"],
+                writer_family="codex",
+                referee_families=["claude"],
+                write_scope=["src/**"],
+                config_root=croot_ob,
+                state_root=sroot_ob,
+            )
+            wf_file = croot_ob / "projects" / "ob-safe" / "WORKFLOW.md"
+            before_txt = wf_file.read_text(encoding="utf-8")
+            with self.assertRaises(PolicyFreezeError):
+                onboard_project(
+                    project_id="ob-safe",
+                    kind="issue",
+                    workspace_path=self.base,
+                    repos=["o/r"],
+                    writer_family="agy",
+                    referee_families=["agy"],
+                    write_scope=["src/**"],
+                    config_root=croot_ob,
+                    state_root=sroot_ob,
+                    overwrite=True,
+                )
+            self.assertEqual(wf_file.read_text(encoding="utf-8"), before_txt)
+        finally:
+            db.close()
+
+    def test_doctor_agy_optional_and_workflow_aware(self) -> None:
+        import argparse
+        import io
+        from unittest import mock
+        import agent_autopilot as ap_cli
+        from ap_core.models import render_workflow_markdown
+
+        croot = self.base / "cfg_doc"
+        sroot = self.base / "state_doc"
+        wf_dir = croot / "projects" / "p-codex"
+        wf_dir.mkdir(parents=True)
+        (wf_dir / "WORKFLOW.md").write_text(
+            render_workflow_markdown(
+                WorkflowConfig(
+                    project_id="p-codex",
+                    kind="issue",
+                    enabled=True,
+                    repos=("o/r",),
+                    workspace_path=str(self.base),
+                    writer_family="codex",
+                    write_scope=("src/**",),
+                )
+            ),
+            encoding="utf-8",
+        )
+        fake_bins_no_agy = {
+            "ap_sandbox_init": self.base / "init",
+            "ap_safe_sh": self.base / "sh",
+            "codex_cli": Path("/usr/bin/true"),
+            "claude_cli": Path("/usr/bin/true"),
+        }
+        buf = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {"AGENT_AUTOPILOT_CONFIG_DIR": str(croot), "AGENT_AUTOPILOT_STATE_DIR": str(sroot)}),
+            mock.patch.object(ap_cli, "resolve_host_binaries", return_value=fake_bins_no_agy),
+            mock.patch.object(ap_cli, "verify_native_binaries", return_value=None),
+            mock.patch.object(ap_cli, "check_linger_enabled", return_value=True),
+            mock.patch.object(shutil, "which", return_value="/usr/bin/true"),
+            mock.patch("sys.stdout", buf),
+        ):
+            rc = ap_cli.cmd_doctor(argparse.Namespace())
+        rep = json.loads(buf.getvalue())
+        self.assertEqual(rc, 0)
+        self.assertTrue(rep["ready"])
+        self.assertFalse(rep["agy_cli"])
+        self.assertEqual(rep["missing_workflow_clis"], [])
+
+        # If an enabled issue workflow opts into `agy` as referee while `agy` is missing -> ready=False!
+        (wf_dir / "WORKFLOW.md").write_text(
+            render_workflow_markdown(
+                WorkflowConfig(
+                    project_id="p-codex",
+                    kind="issue",
+                    enabled=True,
+                    repos=("o/r",),
+                    workspace_path=str(self.base),
+                    writer_family="codex",
+                    referee_families=("claude", "agy"),
+                    write_scope=("src/**",),
+                )
+            ),
+            encoding="utf-8",
+        )
+        buf2 = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {"AGENT_AUTOPILOT_CONFIG_DIR": str(croot), "AGENT_AUTOPILOT_STATE_DIR": str(sroot)}),
+            mock.patch.object(ap_cli, "resolve_host_binaries", return_value=fake_bins_no_agy),
+            mock.patch.object(ap_cli, "verify_native_binaries", return_value=None),
+            mock.patch.object(ap_cli, "check_linger_enabled", return_value=True),
+            mock.patch.object(shutil, "which", return_value="/usr/bin/true"),
+            mock.patch("sys.stdout", buf2),
+        ):
+            rc2 = ap_cli.cmd_doctor(argparse.Namespace())
+        rep2 = json.loads(buf2.getvalue())
+        self.assertEqual(rc2, 1)
+        self.assertFalse(rep2["ready"])
+        self.assertEqual(rep2["missing_workflow_clis"], ["agy_cli"])
+
+        # Missing `gh` CLI for an enabled issue workflow MUST mark doctor unready!
+        buf3 = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {"AGENT_AUTOPILOT_CONFIG_DIR": str(croot), "AGENT_AUTOPILOT_STATE_DIR": str(sroot)}),
+            mock.patch.object(ap_cli, "resolve_host_binaries", return_value={**fake_bins_no_agy, "agy_cli": Path("/usr/bin/true")}),
+            mock.patch.object(ap_cli, "verify_native_binaries", return_value=None),
+            mock.patch.object(ap_cli, "check_linger_enabled", return_value=True),
+            mock.patch.object(shutil, "which", side_effect=lambda name: None if name == "gh" else "/usr/bin/true"),
+            mock.patch("sys.stdout", buf3),
+        ):
+            rc3 = ap_cli.cmd_doctor(argparse.Namespace())
+        rep3 = json.loads(buf3.getvalue())
+        self.assertEqual(rc3, 1)
+        self.assertFalse(rep3["ready"])
+        self.assertIn("gh_cli", rep3["missing_workflow_clis"])
+
+        # Dream zero-token precheck ignores fresh (<48h) or non-published run_history rows!
+        from ap_core.routine_flow import probe_project_zero_token
+
+        db_dr = AutopilotDB(self.base / "dream_pre.db")
+        try:
+            cfg_dr = WorkflowConfig(
+                project_id="dream", kind="routine", routine_driver="dream", enabled=True, repos=(), workspace_path=str(self.base)
+            )
+            db_dr.upsert_project(cfg_dr)
+            for idx in (1, 2, 3):
+                db_dr.ensure_work_unit(unit_key=f"o/r#{idx}", project_id="p-codex", repo="o/r", issue_number=idx)
+            with db_dr.immediate_tx():
+                db_dr._conn.execute(
+                    """
+                    INSERT INTO run_history(run_id, project_id, unit_key, status, completed_at)
+                    VALUES ('r-fresh', 'p-codex', 'o/r#1', 'published', strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')),
+                           ('r-quota', 'p-codex', 'o/r#2', 'waiting_quota', '2020-01-01T00:05:00+00:00')
+                    """
+                )
+            p_fresh = probe_project_zero_token(cfg_dr, db_dr)
+            self.assertFalse(p_fresh["actionable"])
+            with db_dr.immediate_tx():
+                db_dr._conn.execute(
+                    """
+                    INSERT INTO run_history(run_id, project_id, unit_key, status, completed_at)
+                    VALUES ('r-mature', 'p-codex', 'o/r#3', 'published', '2020-01-01T00:05:00+00:00')
+                    """
+                )
+            p_mature = probe_project_zero_token(cfg_dr, db_dr)
+            self.assertTrue(p_mature["actionable"])
+        finally:
+            db_dr.close()
 
 
 if __name__ == "__main__":

@@ -103,7 +103,7 @@ def build_pnpm_exec_cmd(pnpm_bin: str | Path) -> list[str]:
 def load_policy_manifest(path: Path | None = None) -> dict[str, Any]:
     target = path or POLICY_MANIFEST_PATH
     data = json.loads(target.read_text(encoding="utf-8"))
-    if data.get("schema_version") != 16:
+    if data.get("schema_version") != 17:
         raise AutopilotError(f"Unexpected policy_manifest schema_version: {data.get('schema_version')}")
     if not data.get("one_mutation_per_op_id"):
         raise AutopilotError("policy_manifest must enforce one_mutation_per_op_id=true")
@@ -111,6 +111,7 @@ def load_policy_manifest(path: Path | None = None) -> dict[str, Any]:
 
 
 POLICY_MANIFEST: dict[str, Any] = load_policy_manifest()
+VALID_MODEL_FAMILIES: tuple[str, ...] = tuple(POLICY_MANIFEST["chef_pipeline"]["cross_family_referee_map"].keys())
 EXTERNAL_OP_STATUSES: tuple[str, ...] = tuple(POLICY_MANIFEST["external_op_statuses"])
 PENDING_OP_STATUSES: tuple[str, ...] = ("prepared_local", "in_flight", "unknown_paused")
 ACTION_TYPES: tuple[str, ...] = tuple(POLICY_MANIFEST["action_transport_map"].keys())
@@ -649,7 +650,7 @@ def empty_and_fsync_dirfd(
                                 )
                         with os.scandir(child_fd) as c_empty_it:
                             child_is_empty = not any(True for _ in c_empty_it)
-                        unpublished_empty_sub = bool(expected_owner_token) and name in (".codex", ".claude")
+                        unpublished_empty_sub = bool(expected_owner_token) and name in (".codex", ".claude", ".gemini")
                         if child_is_empty and (purged_tok_ok or intent_tok_ok or unpublished_empty_sub):
                             already_purged_empty_shell = True
                             child_tok = ""
@@ -873,6 +874,7 @@ class WorkflowConfig:
     enable_ui_verify: bool = False
     ui_verify_url: str = ""
     writer_family: str = "codex"
+    referee_families: tuple[str, ...] = ()
     schedule_interval_sec: int = 300
     routine_driver: str = ""
     delegated_cmd: str = ""
@@ -952,6 +954,29 @@ def _coerce_label_tuple(raw: Any, field_name: str) -> tuple[str, ...]:
     raise PolicyFreezeError(f"{field_name} must be a list of strings or comma-separated string")
 
 
+def _coerce_referee_families(raw: Any, *, writer_family: str, source_label: str) -> tuple[str, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, (list, tuple)):
+        raise PolicyFreezeError(f"referee_families in {source_label} must be a list of model family strings")
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            raise PolicyFreezeError(f"referee_families entry in {source_label} must be a string, got {type(item).__name__}")
+        fam = item.strip()
+        if not fam or fam not in VALID_MODEL_FAMILIES:
+            raise PolicyFreezeError(
+                f"Invalid referee_family {item!r} in {source_label}; allowed: {list(VALID_MODEL_FAMILIES)}"
+            )
+        if fam == writer_family:
+            raise PolicyFreezeError(
+                f"Cross-family referee violation in {source_label}: referee_family {fam!r} MUST differ from writer_family {writer_family!r}"
+            )
+        if fam not in out:
+            out.append(fam)
+    return tuple(out)
+
+
 def parse_workflow_file(path: Path) -> WorkflowConfig:
     if not path.is_file():
         raise PolicyFreezeError(f"Authoritative WORKFLOW.md not found: {path}")
@@ -977,8 +1002,19 @@ def parse_workflow_file(path: Path) -> WorkflowConfig:
     if trust_tier not in ("T1", "T2", "T3", "T4"):
         raise PolicyFreezeError(f"Invalid trust_tier in {path}: {trust_tier!r}")
     writer_family = str(fm.get("writer_family") or "codex").strip()
-    if writer_family not in ("codex", "claude"):
+    if writer_family not in VALID_MODEL_FAMILIES:
         raise PolicyFreezeError(f"Invalid writer_family in {path}: {writer_family!r}")
+
+    extra_dict = dict(fm.get("extra") or {})
+    has_top_refs = "referee_families" in fm and fm["referee_families"] is not None
+    has_extra_refs = "referee_families" in extra_dict and extra_dict["referee_families"] is not None
+    top_refs = _coerce_referee_families(fm["referee_families"], writer_family=writer_family, source_label=str(path)) if has_top_refs else ()
+    extra_refs = _coerce_referee_families(extra_dict["referee_families"], writer_family=writer_family, source_label=str(path)) if has_extra_refs else ()
+    if has_top_refs and has_extra_refs and top_refs != extra_refs:
+        raise PolicyFreezeError(
+            f"Conflicting top-level referee_families={list(top_refs)} and extra.referee_families={list(extra_refs)} in {path}"
+        )
+    referee_families = top_refs if has_top_refs else extra_refs
 
     write_scope = tuple(str(x).strip() for x in (fm.get("write_scope") or []) if str(x).strip())
     if kind == "issue" and not write_scope:
@@ -1026,6 +1062,7 @@ def parse_workflow_file(path: Path) -> WorkflowConfig:
         enable_ui_verify=bool(fm.get("enable_ui_verify", False)),
         ui_verify_url=str(fm.get("ui_verify_url") or "").strip(),
         writer_family=writer_family,
+        referee_families=referee_families,
         schedule_interval_sec=max(30, int(fm.get("schedule_interval_sec", 300))),
         routine_driver=str(fm.get("routine_driver") or "").strip(),
         delegated_cmd=str(fm.get("delegated_cmd") or "").strip(),
@@ -1050,6 +1087,34 @@ def resolve_cross_family_referee(writer_family: str) -> str:
     if referee == writer_family:
         raise AutopilotError("Referee family MUST differ from writer family")
     return referee
+
+
+def resolve_cross_family_referees(
+    writer_family: str,
+    referee_families: tuple[str, ...] | list[str] | None = None,
+) -> tuple[str, ...]:
+    """Resolve and strictly validate ordered distinct cross-family referees (NEVER allowing writer_family!)."""
+    default_ref = resolve_cross_family_referee(writer_family)
+    if not referee_families:
+        return (default_ref,)
+    if not isinstance(referee_families, (list, tuple)):
+        raise AutopilotError(f"referee_families must be a list or tuple of strings, got {type(referee_families).__name__}")
+    out: list[str] = []
+    for raw in referee_families:
+        if not isinstance(raw, str):
+            raise AutopilotError(f"referee_families entry must be str, got {type(raw).__name__}")
+        fam = raw.strip()
+        if not fam or fam not in VALID_MODEL_FAMILIES:
+            raise AutopilotError(f"Unsupported referee_family: {raw!r}")
+        if fam == writer_family:
+            raise AutopilotError(
+                f"Cross-family referee violation: referee_family {fam!r} MUST differ from writer_family {writer_family!r}"
+            )
+        if fam not in out:
+            out.append(fam)
+    if not out:
+        return (default_ref,)
+    return tuple(out)
 
 
 def extract_json_object(raw_text: str) -> dict[str, Any]:
@@ -1115,7 +1180,10 @@ def validate_referee_output(data: dict[str, Any], *, expected_round: int | None 
     defects = data["three_col_defects"]
     if not isinstance(defects, list) or not isinstance(data["uncertainties"], list):
         raise AutopilotError("Referee three_col_defects and uncertainties must be lists")
-    defect_count = int(data["defect_count"])
+    raw_dc = data["defect_count"]
+    if isinstance(raw_dc, bool) or not isinstance(raw_dc, int):
+        raise AutopilotError(f"Referee defect_count must be an integer (not bool), got {raw_dc!r}")
+    defect_count = raw_dc
     if defect_count != len(defects):
         raise AutopilotError(f"Referee defect_count={defect_count} != len(three_col_defects)={len(defects)}")
     for idx, row in enumerate(defects):
@@ -1125,6 +1193,9 @@ def validate_referee_output(data: dict[str, Any], *, expected_round: int | None 
         raise AutopilotError("Referee cannot APPROVE when defect_count > 0")
     if verdict == "REVISE" and defect_count == 0:
         raise AutopilotError("Referee REVISE must report >= 1 concrete 3-column defect")
-    if expected_round is not None and int(data["round_index"]) != expected_round:
-        raise AutopilotError(f"Referee round_index={data['round_index']} != expected_round={expected_round}")
+    raw_ri = data["round_index"]
+    if isinstance(raw_ri, bool) or not isinstance(raw_ri, int):
+        raise AutopilotError(f"Referee round_index must be an integer (not bool), got {raw_ri!r}")
+    if expected_round is not None and raw_ri != expected_round:
+        raise AutopilotError(f"Referee round_index={raw_ri} != expected_round={expected_round}")
     return data
