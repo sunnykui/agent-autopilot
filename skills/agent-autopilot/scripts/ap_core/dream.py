@@ -292,6 +292,19 @@ def _compute_system_metrics(
     ).fetchall()
     high_round_by_proj = {str(r["project_id"]): int(r["high_round_units"]) for r in wu_rework_rows}
 
+    pub_24h_rows = db._conn.execute(
+        """
+        SELECT u.project_id AS project_id, COUNT(DISTINCT h.unit_key) AS pub_units
+        FROM run_history h
+        JOIN work_units u ON u.unit_key = h.unit_key
+        WHERE h.completed_at >= ?
+          AND h.status IN ('published', 'merged', 'closed', 'done')
+        GROUP BY u.project_id
+        """,
+        (cutoff_24h,),
+    ).fetchall()
+    pub_units_24h_by_proj = {str(r["project_id"]): int(r["pub_units"] or 0) for r in pub_24h_rows}
+
     all_pids = sorted(set(proj_rows.keys()) | set(wf_by_id.keys()) | set(claims_by_proj.keys()))
     per_project: dict[str, dict[str, Any]] = {}
     min_clean = int(POLICY_MANIFEST["chef_pipeline"]["staircase_min_clean_runs"])
@@ -322,17 +335,33 @@ def _compute_system_metrics(
 
         dur_24h: list[float] = []
         productive_24h = 0
+        unit_stats_24h: dict[str, list[float]] = {}
         for c in rel_24h:
             st_dt = _parse_iso_utc(c["created_at"])
             en_dt = _parse_iso_utc(c["released_at"])
             if st_dt and en_dt and en_dt >= st_dt:
                 secs = (en_dt - st_dt).total_seconds()
                 dur_24h.append(secs)
+                uk = str(c.get("unit_key") or "")
+                if uk:
+                    unit_stats_24h.setdefault(uk, []).append(secs)
                 out_s = str(c.get("outcome") or "")
                 if secs >= 180.0 and (out_s.startswith("succeeded") or out_s == "published"):
                     productive_24h += 1
         short_cnt_24h = sum(1 for s in dur_24h if s < 180.0)
         short_spin_rate_24h = (short_cnt_24h / len(dur_24h)) if dur_24h else 0.0
+        long_runs_24h = sum(1 for s in dur_24h if s >= 180.0)
+        slot_hours_24h = sum(dur_24h) / 3600.0
+        pub_units_24h = pub_units_24h_by_proj.get(pid, 0)
+        max_unit_runs_24h = 0
+        max_unit_slot_hours_24h = 0.0
+        max_unit_key_24h = ""
+        for uk, u_durs in unit_stats_24h.items():
+            uh = sum(u_durs) / 3600.0
+            if (len(u_durs), uh) > (max_unit_runs_24h, max_unit_slot_hours_24h):
+                max_unit_runs_24h = len(u_durs)
+                max_unit_slot_hours_24h = uh
+                max_unit_key_24h = uk
 
         substantial_7d = 0
         for c in rel_7d:
@@ -386,12 +415,21 @@ def _compute_system_metrics(
             or (turns_ratio >= 2.0 and rec_med_turns >= 15.0)
         )
         rework_flag = (rev_tot >= 4 and rev_rej_rate > 0.60) or high_round_units >= 2
+        issue_zero_delivery_burn = (
+            ukind == "issue"
+            and (
+                (slot_hours_24h >= 3.0 and long_runs_24h >= 6 and pub_units_24h == 0)
+                or (max_unit_runs_24h >= 8 and max_unit_slot_hours_24h >= 3.0)
+            )
+        )
+        delegated_heavy_burn = ukind == "delegated" and slot_hours_24h >= 6.0 and long_runs_24h >= 8
         unhealthy = (
             (len(rel_7d) >= 4 and null_rate_7d >= 0.20)
             or (len(rel_7d) >= 4 and fail_rate_7d >= 0.35)
             or (len(dur_24h) >= 6 and short_spin_rate_24h >= 0.35)
             or cost_reg_flag
             or rework_flag
+            or issue_zero_delivery_burn
         )
 
         refs = resolve_cross_family_referees(wf.writer_family, wf.referee_families) if wf is not None else ()
@@ -409,6 +447,14 @@ def _compute_system_metrics(
             "timed_claims_24h": len(dur_24h),
             "short_spin_cnt_24h": short_cnt_24h,
             "short_spin_rate_24h": round(short_spin_rate_24h, 4),
+            "long_runs_24h": long_runs_24h,
+            "slot_hours_24h": round(slot_hours_24h, 2),
+            "published_units_24h": pub_units_24h,
+            "max_unit_runs_24h": max_unit_runs_24h,
+            "max_unit_slot_hours_24h": round(max_unit_slot_hours_24h, 2),
+            "max_unit_key_24h": max_unit_key_24h,
+            "issue_zero_delivery_burn": issue_zero_delivery_burn,
+            "delegated_heavy_burn": delegated_heavy_burn,
             "productive_24h": productive_24h,
             "substantial_7d": substantial_7d,
             "usage_runs_7d": len(u_list),
@@ -912,6 +958,39 @@ def run_system_efficiency_audit(
                     action_kind="enable_dual_referee",
                     action_payload={"new_referee_families": new_refs},
                 )
+
+        # 8b. North-Star throughput / time-budget burn detector (catches "all runs succeeded but 0 deliveries / runaway ceremony")
+        if pm["issue_zero_delivery_burn"] or pm["delegated_heavy_burn"]:
+            is_del = pm["kind"] == "delegated"
+            summary_txt = (
+                f"Delegated project {pid} burned {pm['slot_hours_24h']} slot-hours across {pm['long_runs_24h']} long runs "
+                f"({pm['timed_claims_24h']} total) in 24h — audit ceremony/rework overhead"
+                if is_del
+                else (
+                    f"{pid} burned {pm['slot_hours_24h']} slot-hours ({pm['long_runs_24h']} long runs) in 24h "
+                    f"with {pm['published_units_24h']} deliveries (top unit {pm['max_unit_key_24h']}: "
+                    f"{pm['max_unit_runs_24h']} runs / {pm['max_unit_slot_hours_24h']}h)"
+                )
+            )
+            add_finding(
+                project_id=pid,
+                kind="throughput_burn_stall",
+                severity="high",
+                metric_name="slot_hours_24h",
+                baseline_value=float(pm["slot_hours_24h"]),
+                summary=summary_txt,
+                evidence={
+                    "slot_hours_24h": pm["slot_hours_24h"],
+                    "long_runs_24h": pm["long_runs_24h"],
+                    "timed_claims_24h": pm["timed_claims_24h"],
+                    "published_units_24h": pm["published_units_24h"],
+                    "max_unit_key_24h": pm["max_unit_key_24h"],
+                    "max_unit_runs_24h": pm["max_unit_runs_24h"],
+                    "max_unit_slot_hours_24h": pm["max_unit_slot_hours_24h"],
+                },
+                action_kind="investigate_throughput",
+                action_payload={"command": "agent-autopilot top"},
+            )
 
     # 9. Host disk pressure & deep stale cache dirs
     if metrics["disk_used_pct"] >= 80.0:

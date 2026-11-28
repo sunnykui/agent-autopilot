@@ -8414,6 +8414,78 @@ class TestThreeFamilyCrossReviewAndTelemetry(unittest.TestCase):
         finally:
             db.close()
 
+    def test_north_star_throughput_burn_stall_detector(self) -> None:
+        """All-succeeded runs burning high slot-hours with 0 deliveries MUST fire throughput_burn_stall."""
+        import datetime as dt
+        from ap_core.dream import run_system_efficiency_audit
+
+        sroot = self.base / "ns_state"
+        sroot.mkdir(parents=True, exist_ok=True)
+        cache_r = self.base / "ns_cache"
+        cache_r.mkdir(parents=True, exist_ok=True)
+        db = AutopilotDB(sroot / "autopilot.db")
+        try:
+            ref_now = dt.datetime(2026, 11, 28, 8, 0, 0, tzinfo=dt.timezone.utc)
+            wf_burn = WorkflowConfig(project_id="p-burn", kind="issue", enabled=True, repos=("o/b",), workspace_path=str(self.base), max_in_progress=1, referee_families=("claude", "agy"))
+            wf_del = WorkflowConfig(project_id="p-del-burn", kind="delegated", enabled=True, repos=("o/d",), workspace_path=str(self.base), max_in_progress=2, extra={"delegated_multi_slot": True}, delegated_cmd="true")
+            wf_ok = WorkflowConfig(project_id="p-ok", kind="issue", enabled=True, repos=("o/o",), workspace_path=str(self.base), max_in_progress=2, referee_families=("claude", "agy"))
+            for wf in (wf_burn, wf_del, wf_ok):
+                db.upsert_project(wf)
+
+            db.ensure_work_unit(unit_key="o/b#1", project_id="p-burn", repo="o/b")
+            for u_idx in (1, 2):
+                db.ensure_work_unit(unit_key=f"o/o#{u_idx}", project_id="p-ok", repo="o/o")
+
+            with db.immediate_tx():
+                # p-burn: 7 long (35m = 2100s) succeeded runs on 1 unit => 4.08 slot-hours, 0 published deliveries
+                for i in range(1, 8):
+                    st = (ref_now - dt.timedelta(hours=10) + dt.timedelta(minutes=40 * i)).isoformat()
+                    en = (ref_now - dt.timedelta(hours=10) + dt.timedelta(minutes=40 * i, seconds=2100)).isoformat()
+                    db._conn.execute(
+                        "INSERT INTO run_claims (unit_key, project_id, repo, slot_vector_json, worker_unit_name, expected_cgroup_dir, base_sha, authorized_base_ref, authorized_head_ref, policy_version, effective_tier, frozen_write_scope_json, frozen_merge_paths_json, merge_method, unit_kind, outcome, state, created_at, released_at) VALUES (?, ?, ?, '[]', 'u', '/cg', 'sha', 'main', 'agent/1', 'v1', 'T1', '[]', '[]', 'MERGE', 'issue', 'succeeded', 'released', ?, ?)",
+                        ("o/b#1", "p-burn", "o/b", st, en),
+                    )
+                    db.record_turn_usage(turn_id=f"tb-{i}", claim_epoch=i, unit_key="o/b#1", project_id="p-burn", role="writer", family="codex", model="m", status="ok", input_tokens=100, output_tokens=50)
+
+                # p-del-burn: 10 long (45m = 2700s) succeeded delegated runs => 7.5 slot-hours
+                for i in range(1, 11):
+                    st = (ref_now - dt.timedelta(hours=12) + dt.timedelta(minutes=50 * i)).isoformat()
+                    en = (ref_now - dt.timedelta(hours=12) + dt.timedelta(minutes=50 * i, seconds=2700)).isoformat()
+                    db._conn.execute(
+                        "INSERT INTO run_claims (unit_key, project_id, repo, slot_vector_json, worker_unit_name, expected_cgroup_dir, base_sha, authorized_base_ref, authorized_head_ref, policy_version, effective_tier, frozen_write_scope_json, frozen_merge_paths_json, merge_method, unit_kind, outcome, state, created_at, released_at) VALUES (?, ?, ?, '[]', 'u', '/cg', 'sha', 'main', 'agent/d', 'v1', 'T1', '[]', '[]', 'MERGE', 'delegated', 'succeeded', 'released', ?, ?)",
+                        ("p-del-burn:delegated", "p-del-burn", "o/d", st, en),
+                    )
+                    db.record_delegated_telemetry(claim_epoch=100 + i, unit_key="p-del-burn:delegated", project_id="p-del-burn", telemetry={"family": "codex", "input_tokens": 100, "output_tokens": 50})
+
+                # p-ok: 6 runs (35m each = 3.5h) WITH 2 published deliveries => must NOT fire throughput_burn_stall!
+                for u_idx in (1, 2):
+                    uk = f"o/o#{u_idx}"
+                    db._conn.execute(
+                        "INSERT INTO run_history (run_id, project_id, unit_key, status, completed_at) VALUES (?, 'p-ok', ?, 'published', ?)",
+                        (f"rh-{u_idx}", uk, (ref_now - dt.timedelta(hours=2)).isoformat()),
+                    )
+                for i in range(1, 7):
+                    uk = f"o/o#{(i % 2) + 1}"
+                    st = (ref_now - dt.timedelta(hours=8) + dt.timedelta(minutes=40 * i)).isoformat()
+                    en = (ref_now - dt.timedelta(hours=8) + dt.timedelta(minutes=40 * i, seconds=2100)).isoformat()
+                    db._conn.execute(
+                        "INSERT INTO run_claims (unit_key, project_id, repo, slot_vector_json, worker_unit_name, expected_cgroup_dir, base_sha, authorized_base_ref, authorized_head_ref, policy_version, effective_tier, frozen_write_scope_json, frozen_merge_paths_json, merge_method, unit_kind, outcome, state, created_at, released_at) VALUES (?, ?, ?, '[]', 'u', '/cg', 'sha', 'main', 'agent/o', 'v1', 'T1', '[]', '[]', 'MERGE', 'issue', 'succeeded', 'released', ?, ?)",
+                        (uk, "p-ok", "o/o", st, en),
+                    )
+                    db.record_turn_usage(turn_id=f"to-{i}", claim_epoch=200 + i, unit_key=uk, project_id="p-ok", role="writer", family="codex", model="m", status="ok", input_tokens=100, output_tokens=50)
+
+            res = run_system_efficiency_audit(
+                db, state_root=sroot, workflows=[wf_burn, wf_del, wf_ok], host_cli_families={"codex", "claude", "agy"}, now=ref_now, readonly=True,
+                disk_usage_fn=lambda _p: (100 * 1024**3, 40 * 1024**3, 60 * 1024**3), load1_fn=lambda: 0.2, cache_root=cache_r,
+            )
+            pairs = {(f["project_id"], f["kind"]) for f in res["findings"]}
+            self.assertIn(("p-burn", "throughput_burn_stall"), pairs)
+            self.assertNotIn(("p-burn", "slot_underutilization"), pairs)
+            self.assertIn(("p-del-burn", "throughput_burn_stall"), pairs)
+            self.assertNotIn(("p-ok", "throughput_burn_stall"), pairs)
+        finally:
+            db.close()
+
 
 if __name__ == "__main__":
     unittest.main()
