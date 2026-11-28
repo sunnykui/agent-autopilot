@@ -23,7 +23,7 @@
     "configurable_models": {
       "claude_scout": "claude-sonnet-5-5",
       "claude_writer": "claude-sonnet-5-5",
-      "claude_referee": "claude-fable-5-2",
+      "claude_referee": "claude-opus-5-5",
       "codex_scout": "gpt-6.2-sol",
       "codex_writer": "gpt-6.2-sol",
       "codex_referee": "gpt-6.2-astra",
