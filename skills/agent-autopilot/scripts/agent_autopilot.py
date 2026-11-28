@@ -2040,8 +2040,27 @@ def cmd_delegated_exec(args: argparse.Namespace) -> int:
     telemetry_path: Path | None = None
     if run_dir_raw:
         with contextlib.suppress(OSError, AutopilotError):
-            rd_p = ensure_secure_dir(Path(run_dir_raw), 0o700)
-            telemetry_path = rd_p / "delegated-telemetry.json"
+            rfd_del = open_dir_nofollow(
+                Path(run_dir_raw),
+                create=True,
+                mode=0o700,
+                expected_dev=cl.get("run_dir_dev"),
+                expected_ino=cl.get("run_dir_ino"),
+                fsync_ancestors=True,
+            )
+            try:
+                st_rd = os.fstat(rfd_del)
+                db_bind = AutopilotDB(sroot / "autopilot.db")
+                try:
+                    db_bind.record_claim_run_dir_identity(
+                        int(args.claim_epoch), int(st_rd.st_dev), int(st_rd.st_ino)
+                    )
+                finally:
+                    db_bind.close()
+            finally:
+                with contextlib.suppress(OSError):
+                    os.close(rfd_del)
+            telemetry_path = Path(run_dir_raw) / "delegated-telemetry.json"
             env["AUTOPILOT_TELEMETRY_OUT"] = str(telemetry_path)
     shell_cmd = args.delegated_shell_cmd if hasattr(args, "delegated_shell_cmd") else args.cmd
     proc = subprocess.run(["/bin/bash", "-lc", shell_cmd], env=env, check=False)
@@ -2070,6 +2089,10 @@ def cmd_delegated_exec(args: argparse.Namespace) -> int:
                             )
                 except Exception:
                     pass
+                finally:
+                    with contextlib.suppress(OSError):
+                        if telemetry_path.is_file() and not telemetry_path.is_symlink():
+                            telemetry_path.unlink()
     finally:
         db2.close()
     return proc.returncode

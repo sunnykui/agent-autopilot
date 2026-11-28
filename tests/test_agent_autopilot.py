@@ -8339,7 +8339,13 @@ class TestThreeFamilyCrossReviewAndTelemetry(unittest.TestCase):
             self.assertEqual(rc_dt, 0)
             del_db_chk = AutopilotDB(del_sroot / "autopilot.db", readonly=True)
             try:
-                self.assertEqual(del_db_chk.get_claim(ce_dt)["outcome"], "succeeded")
+                cl_dt_after = del_db_chk.get_claim(ce_dt)
+                self.assertEqual(cl_dt_after["outcome"], "succeeded")
+                # Regression: delegated-exec MUST bind run_dir identity so reclaim never wedges on non-empty uncreated run_dir!
+                self.assertEqual(cl_dt_after["run_dir_state"], "bound")
+                self.assertIsNotNone(cl_dt_after["run_dir_dev"])
+                self.assertIsNotNone(cl_dt_after["run_dir_ino"])
+                self.assertFalse((rd_del / "delegated-telemetry.json").exists())
             finally:
                 del_db_chk.close()
 
