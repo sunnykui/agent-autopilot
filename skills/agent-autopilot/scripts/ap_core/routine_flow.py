@@ -471,6 +471,8 @@ def probe_delegated_zero_token(cfg: WorkflowConfig, db: AutopilotDB) -> dict[str
         if prow is not None
         else cfg.max_in_progress
     )
+    if cfg.extra.get("delegated_multi_slot") is not True:
+        cap = 1
     active_cnt = db._conn.execute(
         "SELECT COUNT(*) AS c FROM run_claims WHERE project_id = ? AND state IN ('active', 'reclaiming')",
         (cfg.project_id,),

@@ -1614,6 +1614,19 @@ def _submit_issue_worker_nonblocking(
     raise AutopilotError(f"All free lease slots flock-busy for {cfg.project_id}: {last_slot_err}")
 
 
+def _delegated_multi_slot_enabled(cfg: WorkflowConfig) -> bool:
+    """Opt-in flag proving the delegated runner supports atomic multi-slot claiming (`extra.delegated_multi_slot: true`)."""
+    return cfg.extra.get("delegated_multi_slot") is True
+
+
+_RETRYABLE_DELEGATED_SLOT_ERR_MARKERS = (
+    "is waiting_quota/resource until",
+    "already in status=",
+    "Physical lease vector busy",
+)
+_UNCERTAIN_SPAWN_RETURN_CODES = frozenset({124, 137, 143})
+
+
 def _submit_delegated_worker_nonblocking(
     *,
     cfg: WorkflowConfig,
@@ -1621,81 +1634,143 @@ def _submit_delegated_worker_nonblocking(
     state_root: Path,
     pre_resolved_gh: tuple[str, str],
 ) -> dict[str, Any]:
-    """Claim an exclusive slot for delegated projects; seal token ONLY after claim_and_reserve succeeds!"""
+    """Claim a free slot for delegated projects (single-slot by default; multi-slot when `extra.delegated_multi_slot` is true)."""
     resolved_tok, verified_login = pre_resolved_gh
-    ukey = f"{cfg.project_id}:delegated"
-    db.ensure_work_unit(unit_key=ukey, project_id=cfg.project_id, repo=cfg.repos[0] if cfg.repos else "")
-    slot_key = f"{cfg.project_id}:slot-1"
-    db.ensure_lease_slots(cfg.project_id, [slot_key], state_root / "locks")
+    legacy_ukey = f"{cfg.project_id}:delegated"
+    if db._conn.execute("SELECT 1 FROM work_units WHERE unit_key = ?", (legacy_ukey,)).fetchone() is not None:
+        legacy_scope = db.resolve_unit_scope_and_pending(legacy_ukey)
+        if legacy_scope.any_veto != 0 or legacy_scope.pending_cnt != 0:
+            raise AutopilotError(f"Delegated project {cfg.project_id} blocked by veto/pending ops on {legacy_ukey}")
 
-    uname = f"ap-delegated-{cfg.project_id}-{uuid.uuid4().hex[:6]}.service"
-    exp_cg = expected_transient_cgroup_dir(uname)
+    eff_cap = _project_effective_cap(cfg, db) if _delegated_multi_slot_enabled(cfg) else 1
+    slot_pool = [f"{cfg.project_id}:slot-{idx}" for idx in range(1, eff_cap + 1)]
+    db.ensure_lease_slots(cfg.project_id, slot_pool, state_root / "locks")
+    free_set = {
+        str(r["slot_key"])
+        for r in db._conn.execute(
+            f"SELECT slot_key FROM leases WHERE slot_key IN ({','.join('?' for _ in slot_pool)}) AND state = 'free'",
+            slot_pool,
+        ).fetchall()
+    }
+    ordered_free_slots = [sk for sk in slot_pool if sk in free_set]
+    if not ordered_free_slots:
+        raise AutopilotError(f"All lease slots busy for {cfg.project_id}: {slot_pool}")
+
     is_dedicated = bool(cfg.token_file and cfg.token_file.strip())
     tpath = str(Path(cfg.token_file.strip()).expanduser().resolve()) if is_dedicated else ""
     d_cmd = cfg.delegated_cmd or f"python3 {Path(cfg.workspace_path) / 'scripts/autopilot_run.py'}"
-    d_tag = uuid.uuid4().hex[:8]
     d_parent = ensure_secure_dir(default_cache_root() / "delegated" / cfg.project_id, 0o700)
     dp_fd = open_dir_nofollow(d_parent, create=False)
     try:
         st_dp = os.fstat(dp_fd)
     finally:
         os.close(dp_fd)
-    r_dir = d_parent / f"claim-{d_tag}"
     sealed_dir_d = ensure_sealed_tokens_dir(state_root)
-    ephem_tok_d = str(sealed_dir_d / f"delegated-{cfg.project_id}-{d_tag}.gh_token")
 
-    with _try_acquire_slot_flocks(db, [slot_key]) as slot_fds:
-        ce = db.claim_and_reserve(
-            unit_key=ukey,
-            cfg=cfg,
-            slot_keys=[slot_key],
-            worker_unit_name=uname,
-            expected_cgroup_dir=str(exp_cg),
-            base_sha="delegated",
-            authorized_head_ref=f"{cfg.branch_prefix}delegated",
-            run_dir=str(r_dir),
-            frozen_cache_dir=str(d_parent.resolve()),
-            frozen_cache_dev=int(st_dp.st_dev),
-            frozen_cache_ino=int(st_dp.st_ino),
-            bound_gh_login=verified_login,
-            ephemeral_token_file=ephem_tok_d,
-        )
-        try:
-            if ephem_tok_d:
-                _write_sealed_token_file(Path(ephem_tok_d), resolved_tok)
-            sd_proc = spawn_transient_unit_under_flock(
-                unit_name=uname,
-                cmd=[
-                    sys.executable,
-                    str(Path(__file__).resolve()),
-                    "delegated-exec",
-                    "--claim-epoch",
-                    str(ce),
-                    "--token-file",
-                    tpath,
-                    "--cmd",
-                    d_cmd,
-                ],
-                flock_fds=slot_fds,
-                wait=False,
-                unit_kind="worker",
-                extra_env=_worker_root_env(state_root),
-                timeout_overrides={"runtime_max_sec": 14400, "wrapper_sigterm_sec": 14460},
-            )
-            if sd_proc.returncode != 0:
-                raise AutopilotError(f"delegated systemd-run failed ({sd_proc.returncode}): {sd_proc.stderr.strip()}")
-        except BaseException:
-            if ephem_tok_d:
-                with contextlib.suppress(OSError):
-                    Path(ephem_tok_d).unlink(missing_ok=True)
-            raise
-        return {
-            "project_id": cfg.project_id,
-            "unit_key": ukey,
-            "claim_epoch": ce,
-            "worker_unit_name": uname,
-            "expected_cgroup_dir": str(exp_cg),
-        }
+    last_slot_err: Exception | None = None
+    for slot_key in ordered_free_slots:
+        slot_suffix = slot_key.rsplit(":", 1)[-1]
+        slot_idx = slot_suffix.rsplit("-", 1)[-1]
+        ukey = legacy_ukey if slot_suffix == "slot-1" else f"{cfg.project_id}:delegated:{slot_suffix}"
+        db.ensure_work_unit(unit_key=ukey, project_id=cfg.project_id, repo=cfg.repos[0] if cfg.repos else "")
+        uname = f"ap-delegated-{cfg.project_id}-{uuid.uuid4().hex[:6]}.service"
+        exp_cg = expected_transient_cgroup_dir(uname)
+        d_tag = uuid.uuid4().hex[:8]
+        r_dir = d_parent / f"claim-{d_tag}"
+        ephem_tok_d = str(sealed_dir_d / f"delegated-{cfg.project_id}-{d_tag}.gh_token")
+
+        with contextlib.ExitStack() as stack:
+            try:
+                slot_fds = stack.enter_context(_try_acquire_slot_flocks(db, [slot_key]))
+            except (AutopilotError, OSError) as flock_exc:
+                last_slot_err = flock_exc
+                continue
+            try:
+                ce = db.claim_and_reserve(
+                    unit_key=ukey,
+                    cfg=cfg,
+                    slot_keys=[slot_key],
+                    worker_unit_name=uname,
+                    expected_cgroup_dir=str(exp_cg),
+                    base_sha="delegated",
+                    authorized_head_ref=f"{cfg.branch_prefix}delegated",
+                    run_dir=str(r_dir),
+                    frozen_cache_dir=str(d_parent.resolve()),
+                    frozen_cache_dev=int(st_dp.st_dev),
+                    frozen_cache_ino=int(st_dp.st_ino),
+                    bound_gh_login=verified_login,
+                    ephemeral_token_file=ephem_tok_d,
+                )
+            except AutopilotError as claim_exc:
+                err_s = str(claim_exc)
+                if any(m in err_s for m in _RETRYABLE_DELEGATED_SLOT_ERR_MARKERS) or (
+                    slot_suffix != "slot-1" and "Cannot claim terminal unit" in err_s
+                ):
+                    last_slot_err = claim_exc
+                    continue
+                raise
+            definite_unstarted = False
+            try:
+                if ephem_tok_d:
+                    definite_unstarted = True
+                    _write_sealed_token_file(Path(ephem_tok_d), resolved_tok)
+                definite_unstarted = False
+                worker_env = {**_worker_root_env(state_root), "AP_DELEGATED_SLOT": slot_idx}
+                try:
+                    sd_proc = spawn_transient_unit_under_flock(
+                        unit_name=uname,
+                        cmd=[
+                            sys.executable,
+                            str(Path(__file__).resolve()),
+                            "delegated-exec",
+                            "--claim-epoch",
+                            str(ce),
+                            "--token-file",
+                            tpath,
+                            "--cmd",
+                            d_cmd,
+                        ],
+                        flock_fds=slot_fds,
+                        wait=False,
+                        unit_kind="worker",
+                        extra_env=worker_env,
+                        timeout_overrides={"runtime_max_sec": 14400, "wrapper_sigterm_sec": 14460},
+                    )
+                except (FileNotFoundError, PermissionError):
+                    definite_unstarted = True
+                    raise
+                if sd_proc.returncode != 0:
+                    definite_unstarted = (
+                        sd_proc.returncode > 0 and sd_proc.returncode not in _UNCERTAIN_SPAWN_RETURN_CODES
+                    )
+                    raise AutopilotError(f"delegated systemd-run failed ({sd_proc.returncode}): {sd_proc.stderr.strip()}")
+            except BaseException:
+                if definite_unstarted:
+                    token_removed = True
+                    if ephem_tok_d:
+                        try:
+                            Path(ephem_tok_d).unlink(missing_ok=True)
+                            token_removed = not Path(ephem_tok_d).exists()
+                        except OSError:
+                            token_removed = False
+                    if token_removed:
+                        with contextlib.suppress(AutopilotError, OSError):
+                            db.finish_reclaim_leases_free(ce, cleanup_rc=0, unit_terminated=True, worktree_clean=True)
+                    else:
+                        with contextlib.suppress(AutopilotError, OSError):
+                            with db.immediate_tx():
+                                db.begin_reclaim_claim(ce)
+                raise
+            return {
+                "project_id": cfg.project_id,
+                "unit_key": ukey,
+                "slot_key": slot_key,
+                "claim_epoch": ce,
+                "worker_unit_name": uname,
+                "expected_cgroup_dir": str(exp_cg),
+            }
+
+    raise AutopilotError(f"All free lease slots unavailable for {cfg.project_id}: {last_slot_err}")
 
 
 def _prepare_worker_pinned_paths(
@@ -2563,12 +2638,27 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
                     # Re-check the continuation cooldown under dispatcher.lock (the probe ran outside it).
                     if prb.get("reason") == "delegated_precheck_matched" and delegated_precheck_cooldown_active(fresh_wf, db):
                         continue
-                    with contextlib.suppress(AutopilotError, subprocess.SubprocessError, OSError):
-                        executed.append(
-                            _submit_delegated_worker_nonblocking(
-                                cfg=fresh_wf, db=db, state_root=sroot, pre_resolved_gh=resolved_gh_by_proj[pid]
+                    eff_cap_d = _project_effective_cap(fresh_wf, db) if _delegated_multi_slot_enabled(fresh_wf) else 1
+                    active_now = int(
+                        db._conn.execute(
+                            "SELECT COUNT(*) AS c FROM run_claims WHERE project_id = ? AND state IN ('active', 'reclaiming')",
+                            (pid,),
+                        ).fetchone()["c"]
+                    )
+                    avail_slots = max(0, eff_cap_d - active_now)
+                    cand_count = len(prb.get("candidates") or [])
+                    target_submits = (
+                        max(0, min(eff_cap_d, cand_count) - active_now) if cand_count > 0 else min(avail_slots, 1)
+                    )
+                    for _ in range(target_submits):
+                        try:
+                            executed.append(
+                                _submit_delegated_worker_nonblocking(
+                                    cfg=fresh_wf, db=db, state_root=sroot, pre_resolved_gh=resolved_gh_by_proj[pid]
+                                )
                             )
-                        )
+                        except (AutopilotError, subprocess.SubprocessError, OSError):
+                            break
 
             print(
                 json.dumps(

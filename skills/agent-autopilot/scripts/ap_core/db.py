@@ -895,7 +895,15 @@ class AutopilotDB:
                 """,
                 (unit_key, eff_pr_id, eff_pr_id, eff_pr_id, eff_pr_id),
             ).fetchall()
-            scope_units = tuple(sorted({str(r["unit_key"]) for r in scope_rows} | {unit_key}))
+            scope_set = {str(r["unit_key"]) for r in scope_rows} | {unit_key}
+            pid_str = str(urow["project_id"] or "")
+            if pid_str and (unit_key == f"{pid_str}:delegated" or unit_key.startswith(f"{pid_str}:delegated:slot-")):
+                del_rows = self._conn.execute(
+                    "SELECT unit_key FROM work_units WHERE project_id = ? AND (unit_key = ? OR unit_key LIKE ?)",
+                    (pid_str, f"{pid_str}:delegated", f"{pid_str}:delegated:slot-%"),
+                ).fetchall()
+                scope_set.update(str(r["unit_key"]) for r in del_rows)
+            scope_units = tuple(sorted(scope_set))
 
             u_marks = ",".join("?" for _ in scope_units)
             any_veto_row = self._conn.execute(
@@ -1212,6 +1220,8 @@ class AutopilotDB:
                 cap = int(prow["max_in_progress"]) if int(prow["current_step_idx"]) > 0 else min(cfg.max_in_progress, int(prow["max_in_progress"]))
             else:
                 cap = cfg.max_in_progress
+            if cfg.kind == "delegated" and cfg.extra.get("delegated_multi_slot") is not True:
+                cap = 1
             active_claims = self._conn.execute(
                 "SELECT COUNT(*) AS c FROM run_claims WHERE project_id = ? AND state IN ('active', 'reclaiming')",
                 (cfg.project_id,),

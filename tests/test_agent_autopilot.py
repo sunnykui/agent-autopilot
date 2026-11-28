@@ -7546,6 +7546,389 @@ class TestThreeFamilyCrossReviewAndTelemetry(unittest.TestCase):
         finally:
             db_dr.close()
 
+    def test_delegated_multi_slot_concurrent_claims(self) -> None:
+        """Delegated multi-slot is opt-in, skips flocked/backoff slots, enforces caps in cmd_dispatch, and cleans definite spawn failures."""
+        import argparse
+        import fcntl
+        import io
+        from unittest import mock
+
+        import agent_autopilot as ap_cli
+        from ap_core.host_guard import GlobalLimits
+
+        db = AutopilotDB(self.base / "del_multi.db")
+        sroot = self.base / "del_state"
+        sroot.mkdir(parents=True, exist_ok=True)
+        try:
+            # 1. Default (omitted or string "false") stays strictly single-slot even if promoted to cap=2.
+            for pid_leg, extra_leg in (("p-del-legacy", {}), ("p-del-strfalse", {"delegated_multi_slot": "false"})):
+                cfg_legacy = WorkflowConfig(
+                    project_id=pid_leg,
+                    kind="delegated",
+                    enabled=True,
+                    repos=("o/r",),
+                    workspace_path=str(self.base),
+                    max_in_progress=2,
+                    delegated_cmd="true",
+                    extra=extra_leg,
+                )
+                db.upsert_project(cfg_legacy)
+                db.approve_concurrency_promotion(pid_leg, force=True, target_cap=2)
+                ok_proc = subprocess.CompletedProcess(args=["systemd-run"], returncode=0, stdout="", stderr="")
+                with (
+                    mock.patch.dict(os.environ, {"AGENT_AUTOPILOT_CACHE_DIR": str(self.base / "del_cache")}),
+                    mock.patch.object(ap_cli, "spawn_transient_unit_under_flock", return_value=ok_proc),
+                ):
+                    r_leg = ap_cli._submit_delegated_worker_nonblocking(
+                        cfg=cfg_legacy, db=db, state_root=sroot, pre_resolved_gh=("ghp_testtok", "octocat")
+                    )
+                    self.assertEqual(r_leg["slot_key"], f"{pid_leg}:slot-1")
+                    self.assertEqual(r_leg["unit_key"], f"{pid_leg}:delegated")
+                    with self.assertRaises(AutopilotError):
+                        ap_cli._submit_delegated_worker_nonblocking(
+                            cfg=cfg_legacy, db=db, state_root=sroot, pre_resolved_gh=("ghp_testtok", "octocat")
+                        )
+
+            # 2. Opt-in multi-slot: slot-1 waiting_until skips cleanly to slot-2; disabling flag while slot-2 runs blocks slot-1.
+            cfg_multi = WorkflowConfig(
+                project_id="p-del-multi",
+                kind="delegated",
+                enabled=True,
+                repos=("o/r",),
+                workspace_path=str(self.base),
+                max_in_progress=2,
+                delegated_cmd="true",
+                extra={"delegated_multi_slot": True},
+            )
+            db.upsert_project(cfg_multi)
+            db.approve_concurrency_promotion("p-del-multi", force=True, target_cap=2)
+            db.ensure_work_unit(unit_key="p-del-multi:delegated", project_id="p-del-multi", repo="o/r")
+            with db.immediate_tx():
+                db._conn.execute(
+                    "UPDATE work_units SET waiting_until = '2099-01-01T00:00:00+00:00' WHERE unit_key = ?",
+                    ("p-del-multi:delegated",),
+                )
+            seen_envs: list[dict[str, str]] = []
+
+            def _capture_spawn(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+                seen_envs.append(dict(kwargs.get("extra_env") or {}))  # type: ignore[arg-type]
+                return ok_proc
+
+            with (
+                mock.patch.dict(os.environ, {"AGENT_AUTOPILOT_CACHE_DIR": str(self.base / "del_cache")}),
+                mock.patch.object(ap_cli, "spawn_transient_unit_under_flock", side_effect=_capture_spawn),
+            ):
+                r_skip = ap_cli._submit_delegated_worker_nonblocking(
+                    cfg=cfg_multi, db=db, state_root=sroot, pre_resolved_gh=("ghp_testtok", "octocat")
+                )
+                self.assertEqual(r_skip["slot_key"], "p-del-multi:slot-2")
+                self.assertEqual(r_skip["unit_key"], "p-del-multi:delegated:slot-2")
+                self.assertEqual(seen_envs[-1].get("AP_DELEGATED_SLOT"), "2")
+                # Clear slot-1 backoff and disable multi-slot while slot-2 is still active -> slot-1 MUST be blocked by cap=1!
+                with db.immediate_tx():
+                    db._conn.execute("UPDATE work_units SET waiting_until = NULL WHERE unit_key = ?", ("p-del-multi:delegated",))
+                cfg_multi_off = WorkflowConfig(
+                    project_id="p-del-multi",
+                    kind="delegated",
+                    enabled=True,
+                    repos=("o/r",),
+                    workspace_path=str(self.base),
+                    max_in_progress=2,
+                    delegated_cmd="true",
+                    extra={"delegated_multi_slot": False},
+                )
+                with self.assertRaises(AutopilotError):
+                    ap_cli._submit_delegated_worker_nonblocking(
+                        cfg=cfg_multi_off, db=db, state_root=sroot, pre_resolved_gh=("ghp_testtok", "octocat")
+                    )
+
+            # 2b. Veto on legacy `<pid>:delegated` MUST block slot-2 (never bypass veto).
+            cfg_veto = WorkflowConfig(
+                project_id="p-del-veto",
+                kind="delegated",
+                enabled=True,
+                repos=("o/r",),
+                workspace_path=str(self.base),
+                max_in_progress=2,
+                delegated_cmd="true",
+                extra={"delegated_multi_slot": True},
+            )
+            db.upsert_project(cfg_veto)
+            db.approve_concurrency_promotion("p-del-veto", force=True, target_cap=2)
+            db.ensure_work_unit(unit_key="p-del-veto:delegated", project_id="p-del-veto", repo="o/r")
+            with db.immediate_tx():
+                db._conn.execute("UPDATE work_units SET veto_pending = 1 WHERE unit_key = ?", ("p-del-veto:delegated",))
+            with (
+                mock.patch.dict(os.environ, {"AGENT_AUTOPILOT_CACHE_DIR": str(self.base / "del_cache")}),
+                mock.patch.object(ap_cli, "spawn_transient_unit_under_flock", return_value=ok_proc),
+            ):
+                with self.assertRaises(AutopilotError):
+                    ap_cli._submit_delegated_worker_nonblocking(
+                        cfg=cfg_veto, db=db, state_root=sroot, pre_resolved_gh=("ghp_testtok", "octocat")
+                    )
+
+            # 3. Definite spawn failure (rc=1) releases claim+lease and unlinks token;
+            #    rc=124 (timeout) preserves claim+token; unlink PermissionError marks reclaiming (not released).
+            cfg_fail = WorkflowConfig(
+                project_id="p-del-fail",
+                kind="delegated",
+                enabled=True,
+                repos=("o/r",),
+                workspace_path=str(self.base),
+                max_in_progress=3,
+                delegated_cmd="true",
+                extra={"delegated_multi_slot": True},
+            )
+            db.upsert_project(cfg_fail)
+            db.approve_concurrency_promotion("p-del-fail", force=True, target_cap=3)
+            fail_proc = subprocess.CompletedProcess(args=["systemd-run"], returncode=1, stdout="", stderr="boom")
+            with (
+                mock.patch.dict(os.environ, {"AGENT_AUTOPILOT_CACHE_DIR": str(self.base / "del_cache")}),
+                mock.patch.object(ap_cli, "spawn_transient_unit_under_flock", return_value=fail_proc),
+            ):
+                with self.assertRaises(AutopilotError):
+                    ap_cli._submit_delegated_worker_nonblocking(
+                        cfg=cfg_fail, db=db, state_root=sroot, pre_resolved_gh=("ghp_testtok", "octocat")
+                    )
+            fail_cl = db._conn.execute(
+                "SELECT state, ephemeral_token_file FROM run_claims WHERE project_id = 'p-del-fail' ORDER BY claim_epoch DESC LIMIT 1"
+            ).fetchone()
+            self.assertEqual(fail_cl["state"], "released")
+            self.assertFalse(Path(fail_cl["ephemeral_token_file"]).exists())
+            fail_lease = db._conn.execute("SELECT state FROM leases WHERE slot_key = 'p-del-fail:slot-1'").fetchone()
+            self.assertEqual(fail_lease["state"], "free")
+
+            # rc=124 (wrapper timeout) and negative rc=-9 (SIGKILL) MUST keep claim active and preserve sealed token.
+            rc124_proc = subprocess.CompletedProcess(args=["systemd-run"], returncode=124, stdout="", stderr="timeout")
+            with (
+                mock.patch.dict(os.environ, {"AGENT_AUTOPILOT_CACHE_DIR": str(self.base / "del_cache")}),
+                mock.patch.object(ap_cli, "spawn_transient_unit_under_flock", return_value=rc124_proc),
+            ):
+                with self.assertRaises(AutopilotError):
+                    ap_cli._submit_delegated_worker_nonblocking(
+                        cfg=cfg_fail, db=db, state_root=sroot, pre_resolved_gh=("ghp_testtok", "octocat")
+                    )
+            to_cl = db._conn.execute(
+                "SELECT state, unit_key, ephemeral_token_file FROM run_claims WHERE project_id = 'p-del-fail' ORDER BY claim_epoch DESC LIMIT 1"
+            ).fetchone()
+            self.assertEqual(to_cl["unit_key"], "p-del-fail:delegated:slot-2")
+            self.assertEqual(to_cl["state"], "active")
+            self.assertTrue(Path(to_cl["ephemeral_token_file"]).exists())
+
+            rc_sigkill = subprocess.CompletedProcess(args=["systemd-run"], returncode=-9, stdout="", stderr="killed")
+            with (
+                mock.patch.dict(os.environ, {"AGENT_AUTOPILOT_CACHE_DIR": str(self.base / "del_cache")}),
+                mock.patch.object(ap_cli, "spawn_transient_unit_under_flock", return_value=rc_sigkill),
+            ):
+                with self.assertRaises(AutopilotError):
+                    ap_cli._submit_delegated_worker_nonblocking(
+                        cfg=cfg_fail, db=db, state_root=sroot, pre_resolved_gh=("ghp_testtok", "octocat")
+                    )
+            sk_cl = db._conn.execute(
+                "SELECT state, unit_key, ephemeral_token_file FROM run_claims WHERE project_id = 'p-del-fail' ORDER BY claim_epoch DESC LIMIT 1"
+            ).fetchone()
+            self.assertEqual(sk_cl["unit_key"], "p-del-fail:delegated:slot-3")
+            self.assertEqual(sk_cl["state"], "active")
+            self.assertTrue(Path(sk_cl["ephemeral_token_file"]).exists())
+
+            # Unlink PermissionError on definite rc=1 failure MUST mark claim reclaiming (not released).
+            cfg_perm = WorkflowConfig(
+                project_id="p-del-perm",
+                kind="delegated",
+                enabled=True,
+                repos=("o/r",),
+                workspace_path=str(self.base),
+                max_in_progress=2,
+                delegated_cmd="true",
+                extra={"delegated_multi_slot": True},
+            )
+            db.upsert_project(cfg_perm)
+            db.approve_concurrency_promotion("p-del-perm", force=True, target_cap=2)
+            with (
+                mock.patch.dict(os.environ, {"AGENT_AUTOPILOT_CACHE_DIR": str(self.base / "del_cache")}),
+                mock.patch.object(ap_cli, "spawn_transient_unit_under_flock", return_value=fail_proc),
+                mock.patch.object(Path, "unlink", side_effect=PermissionError("denied")),
+            ):
+                with self.assertRaises(AutopilotError):
+                    ap_cli._submit_delegated_worker_nonblocking(
+                        cfg=cfg_perm, db=db, state_root=sroot, pre_resolved_gh=("ghp_testtok", "octocat")
+                    )
+            perm_cl = db._conn.execute(
+                "SELECT state, unit_key, ephemeral_token_file FROM run_claims WHERE project_id = 'p-del-perm' ORDER BY claim_epoch DESC LIMIT 1"
+            ).fetchone()
+            self.assertEqual(perm_cl["unit_key"], "p-del-perm:delegated")
+            self.assertEqual(perm_cl["state"], "reclaiming")
+            self.assertTrue(Path(perm_cl["ephemeral_token_file"]).exists())
+
+            # 3b. Three-slot scan: slot-1 busy, slot-2 terminal needs-human -> cleanly skips slot-2 and claims slot-3.
+            cfg_3s = WorkflowConfig(
+                project_id="p-del-3s",
+                kind="delegated",
+                enabled=True,
+                repos=("o/r",),
+                workspace_path=str(self.base),
+                max_in_progress=3,
+                delegated_cmd="true",
+                extra={"delegated_multi_slot": True},
+            )
+            db.upsert_project(cfg_3s)
+            db.approve_concurrency_promotion("p-del-3s", force=True, target_cap=3)
+            db.ensure_work_unit(unit_key="p-del-3s:delegated:slot-2", project_id="p-del-3s", repo="o/r")
+            with db.immediate_tx():
+                db._conn.execute(
+                    "UPDATE work_units SET status = 'paused', terminal_state = 'needs-human' WHERE unit_key = ?",
+                    ("p-del-3s:delegated:slot-2",),
+                )
+            with (
+                mock.patch.dict(os.environ, {"AGENT_AUTOPILOT_CACHE_DIR": str(self.base / "del_cache")}),
+                mock.patch.object(ap_cli, "spawn_transient_unit_under_flock", return_value=ok_proc),
+            ):
+                r3_1 = ap_cli._submit_delegated_worker_nonblocking(
+                    cfg=cfg_3s, db=db, state_root=sroot, pre_resolved_gh=("ghp_testtok", "octocat")
+                )
+                r3_3 = ap_cli._submit_delegated_worker_nonblocking(
+                    cfg=cfg_3s, db=db, state_root=sroot, pre_resolved_gh=("ghp_testtok", "octocat")
+                )
+            self.assertEqual(r3_1["slot_key"], "p-del-3s:slot-1")
+            self.assertEqual(r3_3["slot_key"], "p-del-3s:slot-3")
+
+            # 3c. Veto on legacy `<pid>:delegated` when 2 slots are active covers ALL slots in scope_units & stops both.
+            scope_3s = db.resolve_unit_scope_and_pending("p-del-3s:delegated")
+            self.assertIn("p-del-3s:delegated", scope_3s.scope_units)
+            self.assertIn("p-del-3s:delegated:slot-3", scope_3s.scope_units)
+
+            # 4. cmd_dispatch end-to-end: 2 candidates -> 2 slots (global cap=2) or 1 (global cap=1);
+            #    consecutive tick with 1 overlapping unstarted candidate while slot-1 is active -> 0 duplicate spawns!
+            calm_pressure = {"pressured": False, "steal_pct": 0.0, "load1": 0.1, "reason": None}
+            for gcap, expected_n, subname in ((2, 2, "disp_two"), (1, 1, "disp_one")):
+                d_sroot = self.base / f"state_{subname}"
+                d_sroot.mkdir(parents=True, exist_ok=True)
+                d_cfg = WorkflowConfig(
+                    project_id=f"p-{subname}",
+                    kind="delegated",
+                    enabled=True,
+                    repos=("o/r",),
+                    workspace_path=str(self.base),
+                    max_in_progress=2,
+                    delegated_cmd="true",
+                    extra={"delegated_multi_slot": True},
+                )
+                d_db = AutopilotDB(d_sroot / "autopilot.db")
+                try:
+                    d_db.upsert_project(d_cfg)
+                    d_db.approve_concurrency_promotion(d_cfg.project_id, force=True, target_cap=2)
+                finally:
+                    d_db.close()
+                fake_probe = {
+                    "actionable": True,
+                    "reason": "found_open_issues",
+                    "candidates": [
+                        {"repo": "o/r", "number": 1, "unit_key": "o/r#1"},
+                        {"repo": "o/r", "number": 2, "unit_key": "o/r#2"},
+                    ],
+                }
+                buf = io.StringIO()
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {
+                            "AGENT_AUTOPILOT_STATE_DIR": str(d_sroot),
+                            "AGENT_AUTOPILOT_CACHE_DIR": str(self.base / f"cache_{subname}"),
+                        },
+                    ),
+                    mock.patch.object(ap_cli, "load_all_workflows", return_value=[d_cfg]),
+                    mock.patch.object(ap_cli, "supervisor_recover_and_reconcile", return_value={}),
+                    mock.patch.object(ap_cli, "probe_project_zero_token", return_value=fake_probe),
+                    mock.patch.object(ap_cli, "_resolve_project_gh_identity_unlocked", return_value=("ghp_tok", "octocat")),
+                    mock.patch.object(ap_cli, "spawn_transient_unit_under_flock", return_value=ok_proc),
+                    mock.patch("ap_core.db.load_global_limits", return_value=GlobalLimits(max_global_in_progress=gcap)),
+                    mock.patch.object(ap_cli, "load_global_limits", return_value=GlobalLimits(max_global_in_progress=gcap)),
+                    mock.patch.object(ap_cli, "sample_host_pressure", return_value=calm_pressure),
+                    mock.patch("sys.stdout", buf),
+                ):
+                    rc = ap_cli.cmd_dispatch(argparse.Namespace(dry_run=False))
+                self.assertEqual(rc, 0)
+                out = json.loads(buf.getvalue())
+                self.assertEqual(len(out["executed"]), expected_n)
+
+            # Consecutive tick with single overlapping candidate MUST NOT spawn a duplicate second slot:
+            ov_sroot = self.base / "state_overlap"
+            ov_sroot.mkdir(parents=True, exist_ok=True)
+            ov_cfg = WorkflowConfig(
+                project_id="p-overlap",
+                kind="delegated",
+                enabled=True,
+                repos=("o/r",),
+                workspace_path=str(self.base),
+                max_in_progress=2,
+                delegated_cmd="true",
+                extra={"delegated_multi_slot": True},
+            )
+            ov_db = AutopilotDB(ov_sroot / "autopilot.db")
+            try:
+                ov_db.upsert_project(ov_cfg)
+                ov_db.approve_concurrency_promotion(ov_cfg.project_id, force=True, target_cap=2)
+            finally:
+                ov_db.close()
+            one_cand_probe = {
+                "actionable": True,
+                "reason": "found_open_issues",
+                "candidates": [{"repo": "o/r", "number": 7, "unit_key": "o/r#7"}],
+            }
+            for exp_tick in (1, 0):
+                buf_ov = io.StringIO()
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {
+                            "AGENT_AUTOPILOT_STATE_DIR": str(ov_sroot),
+                            "AGENT_AUTOPILOT_CACHE_DIR": str(self.base / "cache_overlap"),
+                        },
+                    ),
+                    mock.patch.object(ap_cli, "load_all_workflows", return_value=[ov_cfg]),
+                    mock.patch.object(ap_cli, "supervisor_recover_and_reconcile", return_value={}),
+                    mock.patch.object(ap_cli, "probe_project_zero_token", return_value=one_cand_probe),
+                    mock.patch.object(ap_cli, "_resolve_project_gh_identity_unlocked", return_value=("ghp_tok", "octocat")),
+                    mock.patch.object(ap_cli, "spawn_transient_unit_under_flock", return_value=ok_proc),
+                    mock.patch("ap_core.db.load_global_limits", return_value=GlobalLimits(max_global_in_progress=4)),
+                    mock.patch.object(ap_cli, "load_global_limits", return_value=GlobalLimits(max_global_in_progress=4)),
+                    mock.patch.object(ap_cli, "sample_host_pressure", return_value=calm_pressure),
+                    mock.patch("sys.stdout", buf_ov),
+                ):
+                    self.assertEqual(ap_cli.cmd_dispatch(argparse.Namespace(dry_run=False)), 0)
+                self.assertEqual(len(json.loads(buf_ov.getvalue())["executed"]), exp_tick)
+
+            # 5. Real OS flock on slot-1 causes automatic fallback to slot-2.
+            cfg_fl = WorkflowConfig(
+                project_id="p-del-flock",
+                kind="delegated",
+                enabled=True,
+                repos=("o/r",),
+                workspace_path=str(self.base),
+                max_in_progress=2,
+                delegated_cmd="true",
+                extra={"delegated_multi_slot": True},
+            )
+            db.upsert_project(cfg_fl)
+            db.approve_concurrency_promotion("p-del-flock", force=True, target_cap=2)
+            db.ensure_lease_slots("p-del-flock", ["p-del-flock:slot-1", "p-del-flock:slot-2"], sroot / "locks")
+            l1 = db._conn.execute("SELECT flock_path FROM leases WHERE slot_key = 'p-del-flock:slot-1'").fetchone()["flock_path"]
+            with open(l1, "a+b") as held_f:
+                fcntl.flock(held_f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                try:
+                    with (
+                        mock.patch.dict(os.environ, {"AGENT_AUTOPILOT_CACHE_DIR": str(self.base / "del_cache")}),
+                        mock.patch.object(ap_cli, "spawn_transient_unit_under_flock", return_value=ok_proc),
+                    ):
+                        r_fl = ap_cli._submit_delegated_worker_nonblocking(
+                            cfg=cfg_fl, db=db, state_root=sroot, pre_resolved_gh=("ghp_testtok", "octocat")
+                        )
+                    self.assertEqual(r_fl["slot_key"], "p-del-flock:slot-2")
+                finally:
+                    fcntl.flock(held_f.fileno(), fcntl.LOCK_UN)
+        finally:
+            db.close()
+
 
 if __name__ == "__main__":
     unittest.main()
